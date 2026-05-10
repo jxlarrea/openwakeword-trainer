@@ -1,0 +1,42 @@
+# Claude
+.claude/
+
+# Node
+node_modules/
+
+# Build artifacts (CI builds production JS for releases)
+custom_components/voice_satellite/frontend/
+custom_components/voice_satellite/tflite/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Type checking / linting
+.mypy_cache/
+.ruff_cache/
+.pylint.d/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+tmp/
