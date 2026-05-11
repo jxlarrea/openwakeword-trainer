@@ -37,6 +37,7 @@ from src.data.dataset import (
     ShardManifest,
     allocate_memmap,
     build_features_from_wavs,
+    build_features_from_wavs_parallel,
     estimate_window_count,
     save_manifest,
     write_wav,
@@ -100,6 +101,30 @@ def _save_config(run_dir: Path, cfg: TrainRunConfig) -> None:
     (run_dir / "config.json").write_text(cfg.model_dump_json(indent=2))
 
 
+def _phrases_signature(
+    phrases: list[str],
+    n_per_phrase_per_voice: int,
+    piper_voices: list,
+    use_elevenlabs: bool,
+    elevenlabs_voice_ids: list,
+) -> str:
+    """Stable hash of everything that determines what WAVs get synthesized."""
+    import hashlib
+    import json
+
+    blob = json.dumps(
+        {
+            "phrases": sorted(phrases),
+            "n": n_per_phrase_per_voice,
+            "piper": sorted(getattr(v, "voice_key", str(v)) for v in piper_voices),
+            "use_el": bool(use_elevenlabs),
+            "el": sorted(elevenlabs_voice_ids),
+        },
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha1(blob).hexdigest()[:16]
+
+
 def _generate_samples(
     phrases: list[str],
     out_dir: Path,
@@ -109,25 +134,41 @@ def _generate_samples(
 ) -> list[Path]:
     """Generate Piper + (optionally) ElevenLabs samples. Returns wav paths.
 
-    Skips generation entirely if a sentinel for this label already exists -
-    lets a failed run that completed wav generation but died later (e.g. in a
-    corpus download) restart without redoing the slow TTS phase.
+    Skips generation entirely if a sentinel for this label exists AND its
+    content matches a hash of the current phrases + voice selection. If the
+    phrase list (or voices) changed since the last run, the sentinel is
+    invalidated and synthesis re-runs.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     sentinel = out_dir / f".generated_{label}"
+    sig = _phrases_signature(
+        phrases,
+        n_per_phrase_per_voice,
+        cfg.generation.piper_voices,
+        cfg.generation.use_elevenlabs,
+        cfg.generation.elevenlabs_voice_ids,
+    )
     if sentinel.exists():
-        existing = sorted(out_dir.glob(f"*_{label}_*.wav"))
-        if existing:
+        cached = sentinel.read_text().strip()
+        if cached == sig:
+            existing = sorted(out_dir.glob(f"*_{label}_*.wav"))
+            if existing:
+                bus.log(
+                    f"Reusing {len(existing)} cached WAVs for label={label} "
+                    f"(signature match)"
+                )
+                return existing
+        else:
             bus.log(
-                f"Reusing {len(existing)} cached WAVs for label={label} "
-                f"from {out_dir} (delete {sentinel.name} to force regeneration)"
+                f"Phrases/voices changed since last run for label={label} "
+                f"- regenerating (sig {cached[:8]}.. -> {sig[:8]}..)",
+                level="warning",
             )
-            return existing
 
     written: list[Path] = []
 
     settings = get_settings()
-    piper = PiperGenerator(use_cuda=False)
+    piper = PiperGenerator(use_cuda=settings.piper_use_cuda)
 
     # Piper - parallel across a process pool.
     if cfg.generation.piper_voices:
@@ -220,9 +261,9 @@ def _generate_samples(
                 bus.progress(f"generate:elevenlabs:{label}", 1.0, detail=detail)
 
     # Drop sentinel only if we successfully reached this point without cancel.
-    # On next start with the same run_name, this lets us skip regeneration.
+    # Content = phrase-list signature so a phrase change forces regeneration.
     if not state.cancel_flag.is_set() and written:
-        sentinel.write_text(str(len(written)))
+        sentinel.write_text(sig)
 
     return written
 
@@ -300,11 +341,21 @@ def _build_features(
         f"x {aug_per} augs each"
     )
 
+    # Feature extraction uses a process pool. Each worker does augmentation
+    # + mel + embedding + window filter end-to-end; main writes the memmap.
+    workers = get_settings().resolved_generation_workers()
+    bus.log(
+        f"features:extract using {workers} worker processes "
+        f"(each with its own CUDA session)"
+    )
+
     base = 0.0
     span = len(train_pos) / total_clips
     bus.phase("features:extract", detail=f"train positives ({len(train_pos)} clips)")
-    train_cursor = build_features_from_wavs(
-        train_pos, 1, extractor, augmenter, aug_per, train_arr, train_labels, 0,
+    train_cursor = build_features_from_wavs_parallel(
+        train_pos, 1, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
+        train_arr, train_labels, 0,
+        workers=workers,
         cancel_flag=state.cancel_flag,
         progress_label="features:extract",
         progress_fraction_base=base, progress_fraction_span=span,
@@ -313,8 +364,10 @@ def _build_features(
     base += span
     span = len(train_neg) / total_clips
     bus.phase("features:extract", detail=f"train negatives ({len(train_neg)} clips)")
-    train_cursor = build_features_from_wavs(
-        train_neg, 0, extractor, augmenter, aug_per, train_arr, train_labels, train_cursor,
+    train_cursor = build_features_from_wavs_parallel(
+        train_neg, 0, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
+        train_arr, train_labels, train_cursor,
+        workers=workers,
         cancel_flag=state.cancel_flag,
         progress_label="features:extract",
         progress_fraction_base=base, progress_fraction_span=span,
@@ -323,8 +376,10 @@ def _build_features(
     base += span
     span = len(val_pos) / total_clips
     bus.phase("features:extract", detail=f"val positives ({len(val_pos)} clips)")
-    val_cursor = build_features_from_wavs(
-        val_pos, 1, extractor, augmenter, aug_per, val_arr, val_labels, 0,
+    val_cursor = build_features_from_wavs_parallel(
+        val_pos, 1, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
+        val_arr, val_labels, 0,
+        workers=workers,
         cancel_flag=state.cancel_flag,
         progress_label="features:extract",
         progress_fraction_base=base, progress_fraction_span=span,
@@ -333,8 +388,10 @@ def _build_features(
     base += span
     span = len(val_neg) / total_clips
     bus.phase("features:extract", detail=f"val negatives ({len(val_neg)} clips)")
-    val_cursor = build_features_from_wavs(
-        val_neg, 0, extractor, augmenter, aug_per, val_arr, val_labels, val_cursor,
+    val_cursor = build_features_from_wavs_parallel(
+        val_neg, 0, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
+        val_arr, val_labels, val_cursor,
+        workers=workers,
         cancel_flag=state.cancel_flag,
         progress_label="features:extract",
         progress_fraction_base=base, progress_fraction_span=span,

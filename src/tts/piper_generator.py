@@ -53,6 +53,7 @@ def _resample_to_16k(audio_int16: np.ndarray, src_sr: int) -> np.ndarray:
 # Populated per-worker after _worker_init is called.
 _WORKER_VOICES: dict[str, tuple[PiperVoice, PiperVoiceInfo]] = {}
 _WORKER_ORT_PATCHED = False
+_WORKER_USE_CUDA = False  # set in _worker_init from pool initargs
 
 
 def _worker_apply_ort_thread_cap() -> None:
@@ -95,10 +96,11 @@ def _worker_apply_ort_thread_cap() -> None:
     _WORKER_ORT_PATCHED = True
 
 
-def _worker_init() -> None:
-    """Pool initializer. Resets per-worker state."""
-    global _WORKER_VOICES
+def _worker_init(use_cuda: bool = False) -> None:
+    """Pool initializer. Resets per-worker state and remembers GPU preference."""
+    global _WORKER_VOICES, _WORKER_USE_CUDA
     _WORKER_VOICES = {}
+    _WORKER_USE_CUDA = bool(use_cuda)
     _worker_apply_ort_thread_cap()
     # Avoid noisy duplicate handlers in spawned workers.
     logging.basicConfig(level=logging.WARNING, force=True)
@@ -110,7 +112,11 @@ def _worker_load_voice(key: str) -> tuple[PiperVoice, PiperVoiceInfo]:
         return cached
     info = get_voice_info(key)
     onnx_path, cfg_path = ensure_voice_downloaded(info)
-    voice = PiperVoice.load(str(onnx_path), config_path=str(cfg_path), use_cuda=False)
+    # If CUDA was requested but the build doesn't have onnxruntime-gpu wired up,
+    # PiperVoice silently falls back to CPU - so this is a safe default.
+    voice = PiperVoice.load(
+        str(onnx_path), config_path=str(cfg_path), use_cuda=_WORKER_USE_CUDA,
+    )
     _WORKER_VOICES[key] = (voice, info)
     return voice, info
 
@@ -342,7 +348,11 @@ class PiperGenerator:
 
         # `spawn` avoids fork-with-threads pitfalls in onnxruntime / numpy.
         ctx = get_context("spawn")
-        with ctx.Pool(processes=workers, initializer=_worker_init) as pool:
+        with ctx.Pool(
+            processes=workers,
+            initializer=_worker_init,
+            initargs=(self.use_cuda,),
+        ) as pool:
             for result in pool.imap_unordered(_worker_synth, tasks, chunksize=chunksize):
                 if result is None:
                     continue

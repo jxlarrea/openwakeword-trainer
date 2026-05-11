@@ -79,19 +79,273 @@ def write_wav(path: Path, audio: np.ndarray, sample_rate: int = 16_000) -> None:
     sf.write(path, audio, sample_rate, subtype="PCM_16")
 
 
-def _pad_to_min_length(audio: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+def _pad_to_min_length(
+    audio: np.ndarray, rng: np.random.Generator
+) -> tuple[np.ndarray, int, int]:
     """Pad audio with silence so the result is at least MIN_CLIP_SAMPLES long.
 
-    The original clip is placed at a random offset; trailing samples are zeros.
-    Returns audio unchanged if it is already long enough.
+    Returns (padded_audio, speech_start_samples, speech_end_samples). Speech
+    range is the slice of the padded array that contains the original audio
+    (the rest is zero-pad). If audio was already long enough, speech spans
+    the whole array.
     """
+    audio = audio.astype(np.float32)
     if audio.size >= MIN_CLIP_SAMPLES:
-        return audio
+        return audio, 0, audio.size
     out = np.zeros(MIN_CLIP_SAMPLES, dtype=np.float32)
     max_offset = MIN_CLIP_SAMPLES - audio.size
     offset = int(rng.integers(0, max_offset + 1))
-    out[offset : offset + audio.size] = audio.astype(np.float32)
-    return out
+    out[offset : offset + audio.size] = audio
+    return out, offset, offset + audio.size
+
+
+# Each classifier window covers 16 embeddings x 8 mel-frame hop x 200 samples
+# per mel frame at 16 kHz = 25,600 samples (1.6 s). Adjacent classifier windows
+# differ by one embedding hop = 8 mel-frames = 1,600 samples (0.1 s).
+_SAMPLES_PER_CLASSIFIER_WINDOW = CLASSIFIER_WINDOW_EMBEDDINGS * 8 * 200
+_SAMPLES_PER_CLASSIFIER_HOP = 8 * 200
+
+
+def _filter_speech_windows(
+    windows: np.ndarray, speech_start: int, speech_end: int
+) -> np.ndarray:
+    """Keep only classifier-windows whose audio span overlaps the speech region.
+
+    A positive clip padded to 3 s contains long stretches of silence. Without
+    this filter, those silent windows get labeled positive and the model
+    learns to fire on silence. We keep a window if at least half of the
+    original speech is inside it; if none qualify (very short speech), we
+    fall back to the single window closest to the speech center.
+    """
+    if windows.shape[0] == 0:
+        return windows
+    speech_len = max(1, speech_end - speech_start)
+    keep: list[int] = []
+    for k in range(windows.shape[0]):
+        ws = k * _SAMPLES_PER_CLASSIFIER_HOP
+        we = ws + _SAMPLES_PER_CLASSIFIER_WINDOW
+        overlap = max(0, min(we, speech_end) - max(ws, speech_start))
+        if overlap / speech_len >= 0.5:
+            keep.append(k)
+    if not keep:
+        speech_center = (speech_start + speech_end) // 2
+        closest = max(0, min(windows.shape[0] - 1, speech_center // _SAMPLES_PER_CLASSIFIER_HOP))
+        keep = [closest]
+    return windows[keep]
+
+
+# ============================================================================
+# Worker-pool parallelism for the CPU-heavy augmentation phase.
+#
+# Audiomentations' RIR convolution, MP3 codec, pitch shift, and time stretch
+# each cost ~50-150 ms per clip and run single-threaded on CPU. Run them in a
+# spawn-based process pool; results stream back to the main process which
+# runs ONNX inference (mel + embedding) on GPU and writes to the memmap.
+# ============================================================================
+
+_WORKER_AUGMENTER = None     # populated by _augment_worker_init
+_WORKER_EXTRACTOR = None     # populated by _augment_worker_init
+
+
+def _augment_worker_init(
+    aug_cfg_dump: dict,
+    rir_dir_strs: list[str],
+    bg_dir_strs: list[str],
+    use_gpu: bool,
+) -> None:
+    """Pool initializer. Builds the augmenter and a FeatureExtractor per worker.
+
+    Each worker gets its own ORT session (CUDA or CPU) so feature extraction
+    runs end-to-end inside the worker; the parent only writes results to the
+    memmap. This removes the per-variant Python/IPC overhead that was capping
+    GPU utilization at ~18% in main-process-only mode.
+    """
+    global _WORKER_AUGMENTER, _WORKER_EXTRACTOR
+    import warnings as _warnings
+
+    from src.augment.augmenter import build_augmenter
+    from src.config_schema import AugmentationConfig
+    from src.data.features import FeatureExtractor
+
+    _warnings.filterwarnings(
+        "ignore",
+        message=".*had to be resampled from .* Hz to .* Hz.*",
+        category=UserWarning,
+    )
+
+    aug_cfg = AugmentationConfig(**aug_cfg_dump)
+    rir_dirs = [Path(p) for p in rir_dir_strs]
+    bg_dirs = [Path(p) for p in bg_dir_strs]
+    _WORKER_AUGMENTER = build_augmenter(
+        aug_cfg, rir_dirs=rir_dirs, background_noise_dirs=bg_dirs
+    )
+
+    providers = None  # auto-detect (prefers CUDA)
+    if not use_gpu:
+        providers = ["CPUExecutionProvider"]
+    _WORKER_EXTRACTOR = FeatureExtractor(providers=providers)
+
+
+def _augment_one_clip(task: dict) -> dict | None:
+    """Worker entry point: read, pad, augment N times, run ONNX, filter windows.
+
+    Returns a dict with serialized concatenated classifier-windows ready for
+    the parent to drop straight into the memmap.
+    """
+    from math import gcd as _gcd
+
+    import numpy as _np
+    import soundfile as _sf
+    from scipy.signal import resample_poly as _resample_poly
+
+    try:
+        wav_path = task["wav_path"]
+        label = int(task["label"])
+        n_augs = task["augmentations_per_clip"]
+        seed = task["seed"]
+
+        audio, sr = _sf.read(wav_path, dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sr != 16_000:
+            g = _gcd(sr, 16_000)
+            audio = _resample_poly(audio, 16_000 // g, sr // g).astype(_np.float32)
+
+        rng = _np.random.default_rng(seed)
+        audio, speech_start, speech_end = _pad_to_min_length(audio, rng)
+
+        all_windows: list[_np.ndarray] = []
+        for _ in range(n_augs):
+            try:
+                aug = _WORKER_AUGMENTER(samples=audio.astype(_np.float32), sample_rate=16_000)
+                _np.clip(aug, -1.0, 1.0, out=aug)
+            except Exception:
+                aug = audio
+            int16 = float32_to_int16(aug)
+            windows = _WORKER_EXTRACTOR.classifier_inputs(int16)
+            if label == 1:
+                windows = _filter_speech_windows(windows, speech_start, speech_end)
+            if windows.shape[0] > 0:
+                all_windows.append(windows)
+
+        if not all_windows:
+            return {"n_windows": 0, "windows_bytes": b""}
+
+        combined = _np.concatenate(all_windows, axis=0).astype(_np.float32, copy=False)
+        return {
+            "n_windows": int(combined.shape[0]),
+            "windows_bytes": combined.tobytes(),
+        }
+    except Exception:
+        return None
+
+
+def build_features_from_wavs_parallel(
+    wav_paths: list[Path],
+    label: int,
+    extractor: FeatureExtractor,                  # kept for API compat; unused
+    augmentation_cfg,                             # AugmentationConfig
+    rir_dirs: list[Path],
+    bg_dirs: list[Path],
+    augmentations_per_clip: int,
+    out_features: np.memmap,
+    out_labels: np.ndarray,
+    write_offset: int,
+    workers: int,
+    cancel_flag=None,
+    use_gpu_in_workers: bool = True,
+    progress_label: str = "features:extract",
+    progress_fraction_base: float = 0.0,
+    progress_fraction_span: float = 1.0,
+) -> int:
+    """Full end-to-end pipeline in workers (augment + mel + embedding + filter).
+
+    Main process only writes pre-computed classifier windows to the memmap.
+    With CUDA available in each worker (one CUDA context per process), this
+    keeps the GPU fed continuously rather than waiting on Python overhead in
+    a single drainer thread.
+    """
+    import time as _time
+    from multiprocessing import get_context
+
+    from src.train.progress import bus
+
+    cursor = write_offset
+    total = len(wav_paths)
+    if total == 0:
+        return cursor
+
+    tasks = [
+        {
+            "wav_path": str(p),
+            "label": label,
+            "augmentations_per_clip": augmentations_per_clip,
+            "seed": (hash((str(p), label, write_offset)) & 0xFFFFFFFF),
+        }
+        for p in wav_paths
+    ]
+
+    aug_cfg_dump = augmentation_cfg.model_dump()
+    rir_dir_strs = [str(p) for p in rir_dirs]
+    bg_dir_strs = [str(p) for p in bg_dirs]
+
+    bus.log(
+        f"features: parallel mode, {workers} workers (GPU in workers: {use_gpu_in_workers}), "
+        f"{total} clips, {augmentations_per_clip} augs each"
+    )
+
+    ctx = get_context("spawn")
+    completed = 0
+    last_progress_t = _time.monotonic()
+    feature_shape_tail = out_features.shape[1:]  # (16, 96)
+
+    with ctx.Pool(
+        processes=workers,
+        initializer=_augment_worker_init,
+        initargs=(aug_cfg_dump, rir_dir_strs, bg_dir_strs, use_gpu_in_workers),
+    ) as pool:
+        for result in pool.imap_unordered(_augment_one_clip, tasks, chunksize=2):
+            if cancel_flag is not None and cancel_flag.is_set():
+                pool.terminate()
+                break
+            completed += 1
+
+            if result is None:
+                continue
+
+            n_new = result["n_windows"]
+            if n_new == 0:
+                continue
+
+            windows_flat = np.frombuffer(result["windows_bytes"], dtype=np.float32)
+            windows = windows_flat.reshape((n_new,) + feature_shape_tail)
+
+            if cursor + n_new > out_features.shape[0]:
+                n_new = out_features.shape[0] - cursor
+                windows = windows[:n_new]
+            out_features[cursor : cursor + n_new] = windows
+            out_labels[cursor : cursor + n_new] = label
+            cursor += n_new
+
+            now = _time.monotonic()
+            if completed % 100 == 0 or (now - last_progress_t) > 5.0:
+                done_frac = completed / max(1, total)
+                global_frac = progress_fraction_base + progress_fraction_span * done_frac
+                bus.progress(
+                    progress_label,
+                    global_frac,
+                    detail=f"{completed}/{total} clips, {cursor:,} windows",
+                )
+                bus.log(
+                    f"features: {completed}/{total} clips ({100.0 * completed / total:.1f}%), "
+                    f"{cursor:,} windows written"
+                )
+                last_progress_t = now
+
+            if cursor >= out_features.shape[0]:
+                break
+
+    return cursor
 
 
 def build_features_from_wavs(
@@ -158,11 +412,19 @@ def build_features_from_wavs(
             audio = resample_poly(audio, 16_000 // g, sr // g).astype(np.float32)
 
         # Ensure each clip is long enough to produce at least one classifier window.
-        audio = _pad_to_min_length(audio, rng)
+        # Track the speech region so we can drop silent-padding windows for positives.
+        audio, speech_start, speech_end = _pad_to_min_length(audio, rng)
 
         for variant in augment_clip(audio, 16_000, augmenter, n_variants=augmentations_per_clip):
             int16 = float32_to_int16(variant)
             windows = extractor.classifier_inputs(int16)
+            # CRITICAL: for positive clips, drop classifier windows that are
+            # mostly silent padding. Without this, the model learns
+            # "silence = wake word" because each positive's 6 windows include
+            # 3-5 silence-only ones all labeled 1. Negatives keep all windows
+            # since silence-labeled-negative is a useful training signal.
+            if label == 1:
+                windows = _filter_speech_windows(windows, speech_start, speech_end)
             if windows.shape[0] == 0:
                 continue
             n_new = windows.shape[0]

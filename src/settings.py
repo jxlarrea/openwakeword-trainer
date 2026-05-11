@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # Threads per Piper worker's onnxruntime session. workers * this should be
     # near the physical core count. DGX Spark (20 cores) likes 10 * 2 = 20.
     piper_ort_threads: int = 2
+    # Run Piper TTS on CUDA (via onnxruntime-gpu). Each worker process creates
+    # its own CUDA context (~300-500 MB). Set to false on hosts without a GPU
+    # or to spare GPU memory for the feature-extraction phase.
+    piper_use_cuda: bool = True
 
     # Optional API keys (also accepted via the unprefixed env vars).
     elevenlabs_api_key: str | None = Field(default=None, alias="ELEVENLABS_API_KEY")
