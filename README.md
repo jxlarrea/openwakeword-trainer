@@ -311,6 +311,4 @@ python -m uvicorn src.main:app --reload --port 8000
 
 ## License
 
-Provided as-is by Xavier Larrea. openWakeWord, Piper, audiomentations, ONNX Runtime, and the bundled datasets each carry their own licenses; review them before redistributing trained models.
-
-Source: https://github.com/jxlarrea/openwakeword-trainer
+Provided as-is. openWakeWord, Piper, audiomentations, ONNX Runtime, and the bundled datasets each carry their own licenses; review them before redistributing trained models.
