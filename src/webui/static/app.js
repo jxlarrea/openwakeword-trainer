@@ -1,11 +1,37 @@
 // OpenWakeWord Trainer client-side app.
-// Handles: form submission, SSE event stream, audition, mic recording, model test.
 
 (function () {
   "use strict";
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+  // ---------- Auto run-name from wake word ----------
+
+  const wakeInput = $("input[name='wake_word']");
+  const runNameInput = $("#run-name-input");
+  let lastAutoRunName = "";
+
+  function slugify(s) {
+    return String(s || "")
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+  }
+
+  function applyAutoRunName() {
+    if (!wakeInput || !runNameInput) return;
+    const slug = slugify(wakeInput.value);
+    // Only overwrite if the user hasn't typed their own value.
+    if (!runNameInput.value || runNameInput.value === lastAutoRunName) {
+      runNameInput.value = slug;
+    }
+    lastAutoRunName = slug;
+  }
+  wakeInput?.addEventListener("input", applyAutoRunName);
+  // Init from server-rendered value
+  applyAutoRunName();
 
   // ---------- Voice list filtering / select-all ----------
 
@@ -29,40 +55,11 @@
     });
   });
 
-  // ---------- Audition (per voice) ----------
-
-  $$(".audition-btn").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const voiceKey = btn.dataset.voice;
-      const text = $("#audition-text")?.value?.trim() || $("input[name='wake_word']")?.value?.trim() || "hey jarvis";
-      const speakerId = $("#audition-speaker")?.value;
-      btn.disabled = true;
-      btn.textContent = "...";
-      try {
-        const res = await fetch("/api/audition/piper", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, voice_key: voiceKey, speaker_id: speakerId || null }),
-        });
-        if (!res.ok) throw new Error(await res.text());
-        const blob = await res.blob();
-        const player = $("#audition-player");
-        player.src = URL.createObjectURL(blob);
-        player.play();
-      } catch (err) {
-        alert("Audition failed: " + err.message);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "audition";
-      }
-    });
-  });
-
   // ---------- ElevenLabs voices ----------
 
   $("#load-elevenlabs-voices")?.addEventListener("click", async () => {
     const container = $("#elevenlabs-voices");
-    container.innerHTML = "loading...";
+    container.innerHTML = "<p class='hint'>loading...</p>";
     const res = await fetch("/api/voices/elevenlabs");
     const voices = await res.json();
     if (!voices.length) {
@@ -76,41 +73,104 @@
           <input type="checkbox" name="elevenlabs_voice_id" value="${v.voice_id}">
           <span class="voice-name">${v.name}</span>
           <span class="voice-meta">${v.category || ""}</span>
-          <button type="button" class="audition-el" data-voice="${v.voice_id}">audition</button>
         </label>`
       )
       .join("");
-    container.querySelectorAll(".audition-el").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const text = $("#audition-text")?.value?.trim() || "hey jarvis";
-        btn.disabled = true;
-        btn.textContent = "...";
-        try {
-          const res = await fetch("/api/audition/elevenlabs", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text, voice_id: btn.dataset.voice }),
-          });
-          if (!res.ok) throw new Error(await res.text());
-          const blob = await res.blob();
-          const player = $("#audition-player");
-          player.src = URL.createObjectURL(blob);
-          player.play();
-        } catch (err) {
-          alert("Audition failed: " + err.message);
-        } finally {
-          btn.disabled = false;
-          btn.textContent = "audition";
-        }
-      });
-    });
   });
 
   // ---------- Submit training run ----------
 
+  function clearValidationState(form) {
+    form.querySelectorAll("fieldset.invalid").forEach((fs) => fs.classList.remove("invalid"));
+    const box = $("#form-errors");
+    if (box) {
+      box.hidden = true;
+      box.innerHTML = "";
+    }
+  }
+
+  function showValidationErrors(form, errors, firstInvalidElement) {
+    const box = $("#form-errors");
+    if (!box) return;
+    box.hidden = false;
+    box.innerHTML =
+      `<strong>Fix these before starting:</strong>` +
+      `<ul>${errors.map((e) => `<li>${e}</li>`).join("")}</ul>`;
+    if (firstInvalidElement) {
+      firstInvalidElement.scrollIntoView({ behavior: "smooth", block: "center" });
+    } else {
+      box.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }
+
+  function validateTrainForm(form) {
+    clearValidationState(form);
+    const errors = [];
+    let firstInvalid = null;
+
+    // Native HTML5 first - lets the browser highlight required fields,
+    // out-of-range numbers, etc., with its built-in messages.
+    if (!form.checkValidity()) {
+      form.reportValidity();
+      const firstNative = form.querySelector(":invalid");
+      return { errors: ["Some required fields are missing or out of range."], firstInvalid: firstNative };
+    }
+
+    // Custom: at least one voice source.
+    const piperCount = form.querySelectorAll('input[name="piper_voice"]:checked').length;
+    const elUsed = form.querySelector('input[name="use_elevenlabs"]')?.checked;
+    const elCount = form.querySelectorAll('input[name="elevenlabs_voice_id"]:checked').length;
+
+    if (piperCount === 0 && !(elUsed && elCount > 0)) {
+      errors.push("Select at least one Piper voice (or enable ElevenLabs with voices).");
+      const voicesFieldset = form.querySelector(".voice-list")?.closest("fieldset");
+      voicesFieldset?.classList.add("invalid");
+      if (!firstInvalid) firstInvalid = voicesFieldset;
+    }
+
+    // Custom: at least one augmentation corpus must be on.
+    const corpusBoxes = [
+      "use_mit_rirs",
+      "use_musan_noise",
+      "use_musan_music",
+      "use_fsd50k",
+      "use_common_voice_negatives",
+    ];
+    const anyCorpus = corpusBoxes.some(
+      (name) => form.querySelector(`input[name="${name}"]`)?.checked
+    );
+    if (!anyCorpus) {
+      errors.push(
+        "Enable at least one augmentation corpus (MIT IR, MUSAN, FSD50K, or Common Voice)."
+      );
+      const corpusFieldset = form.querySelector(
+        'input[name="use_mit_rirs"]'
+      )?.closest("fieldset");
+      corpusFieldset?.classList.add("invalid");
+      if (!firstInvalid) firstInvalid = corpusFieldset;
+    }
+
+    // Custom: wake word can't be just whitespace (`required` only rejects empty).
+    const wake = form.querySelector('input[name="wake_word"]');
+    if (wake && !wake.value.trim()) {
+      errors.push("Wake word is required.");
+      wake.focus();
+      if (!firstInvalid) firstInvalid = wake;
+    }
+
+    return { errors, firstInvalid };
+  }
+
   $("#train-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const form = e.target;
+
+    const { errors, firstInvalid } = validateTrainForm(form);
+    if (errors.length) {
+      showValidationErrors(form, errors, firstInvalid);
+      return;
+    }
+
     const fd = new FormData(form);
     const payload = formToPayload(fd);
     const res = await fetch("/api/train/start", {
@@ -119,11 +179,26 @@
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
-      alert("Could not start: " + (await res.text()));
+      const body = await res.text();
+      let parsed;
+      try {
+        parsed = JSON.parse(body);
+      } catch {}
+      const msg = parsed?.detail || body;
+      showValidationErrors(form, [`Server rejected the run: ${msg}`], null);
       return;
     }
     const data = await res.json();
-    setStatus(data.status);
+    setRunState(data.status);
+  });
+
+  // Clear validation styling when the user starts fixing things.
+  $("#train-form")?.addEventListener("change", () => {
+    const form = $("#train-form");
+    if (form && $("#form-errors") && !$("#form-errors").hidden) {
+      // Re-validate quietly to clear/refresh state without scrolling.
+      clearValidationState(form);
+    }
   });
 
   $("#cancel-btn")?.addEventListener("click", async () => {
@@ -165,7 +240,7 @@
       augmentation: {
         rir_probability: vNum("rir_probability", 0.7),
         background_noise_probability: vNum("background_noise_probability", 0.7),
-        augmentations_per_clip: vNum("augmentations_per_clip", 3),
+        augmentations_per_clip: vNum("augmentations_per_clip", 5),
       },
       datasets: {
         use_mit_rirs: vBool("use_mit_rirs"),
@@ -173,31 +248,39 @@
         use_musan_music: vBool("use_musan_music"),
         use_fsd50k: vBool("use_fsd50k"),
         use_common_voice_negatives: vBool("use_common_voice_negatives"),
-        common_voice_subset: vNum("common_voice_subset", 10000),
+        common_voice_subset: vNum("common_voice_subset", 15000),
       },
       training: {
         model_type: v("model_type") || "dnn",
         layer_dim: vNum("layer_dim", 128),
         n_blocks: vNum("n_blocks", 1),
         learning_rate: vNum("learning_rate", 0.0001),
-        batch_size: vNum("batch_size", 1024),
-        max_steps: vNum("max_steps", 50000),
+        batch_size: vNum("batch_size", 2048),
+        max_steps: vNum("max_steps", 75000),
         val_every_n_steps: vNum("val_every_n_steps", 500),
-        early_stop_patience: vNum("early_stop_patience", 5),
+        early_stop_patience: vNum("early_stop_patience", 8),
         target_false_positives_per_hour: vNum("target_false_positives_per_hour", 0.2),
         seed: vNum("seed", 42),
       },
     };
   }
 
-  // ---------- SSE: live progress ----------
+  // ---------- Start/Cancel button state machine ----------
 
-  function setStatus(s) {
+  function setRunState(state) {
     const pill = $("#status-pill");
+    const startBtn = $("#start-btn");
+    const cancelBtn = $("#cancel-btn");
     if (!pill) return;
-    pill.textContent = s;
-    pill.className = "pill " + s;
+    pill.textContent = state || "idle";
+    pill.className = "pill " + (state || "");
+
+    const isRunning = state === "running";
+    if (startBtn) startBtn.style.display = isRunning ? "none" : "";
+    if (cancelBtn) cancelBtn.style.display = isRunning ? "" : "none";
   }
+
+  // ---------- SSE: live progress ----------
 
   const phaseBanner = $("#phase-banner");
   const progressBars = $("#progress-bars");
@@ -224,7 +307,8 @@
     const bar = ensureProgressBar(name);
     const pct = Math.round(frac * 100);
     bar.querySelector(".fill").style.width = pct + "%";
-    bar.querySelector(".pct").textContent = pct + "%" + (detail ? " (" + detail + ")" : "");
+    bar.querySelector(".pct").textContent =
+      pct + "%" + (detail ? " (" + detail + ")" : "");
   }
 
   function setMetric(name, value) {
@@ -280,29 +364,28 @@
   es.addEventListener("run_started", (e) => {
     const d = JSON.parse(e.data);
     appendLog("info", `Run started: ${d.run_id} (${d.wake_word})`);
-    setStatus("running");
+    setRunState("running");
   });
   es.addEventListener("complete", (e) => {
     const d = JSON.parse(e.data);
     appendLog("info", `Complete -> ${d.onnx_path}`);
-    setStatus("succeeded");
+    setRunState("succeeded");
     refreshModels();
   });
   es.addEventListener("run_error", (e) => {
     try {
       const d = JSON.parse(e.data);
       appendLog("error", d.message);
-      setStatus("failed");
+      setRunState("failed");
     } catch {}
   });
-  es.onerror = () => {
-    // EventSource connection-level error. Browser will auto-reconnect.
-    appendLog("warning", "SSE connection lost; retrying...");
-  };
   es.addEventListener("cancelled", () => {
     appendLog("warning", "Run cancelled");
-    setStatus("cancelled");
+    setRunState("cancelled");
   });
+  es.onerror = () => {
+    appendLog("warning", "SSE connection lost; retrying...");
+  };
 
   // ---------- Test panel ----------
 
@@ -310,6 +393,7 @@
     const res = await fetch("/api/models");
     const models = await res.json();
     const sel = $("#test-model");
+    if (!sel) return;
     const prev = sel.value;
     sel.innerHTML = models
       .map((m) => `<option value="${m.name}" data-size="${m.size}">${m.name}</option>`)
@@ -323,7 +407,7 @@
   function updateModelInfo() {
     const sel = $("#test-model");
     const info = $("#model-info");
-    if (!info) return;
+    if (!info || !sel) return;
     const opt = sel.options[sel.selectedIndex];
     if (!opt) {
       info.textContent = "no models yet";
@@ -333,17 +417,14 @@
     const kb = (size / 1024).toFixed(1);
     info.textContent = `${opt.value} (${kb} KB)`;
   }
-
   $("#test-model")?.addEventListener("change", updateModelInfo);
 
   $("#download-model-btn")?.addEventListener("click", () => {
-    const name = $("#test-model").value;
+    const name = $("#test-model")?.value;
     if (!name) {
       alert("No model selected.");
       return;
     }
-    // Trigger a normal browser download via the /api/models/<name> endpoint
-    // (which returns Content-Disposition: attachment).
     const a = document.createElement("a");
     a.href = `/api/models/${encodeURIComponent(name)}`;
     a.download = name;
@@ -355,14 +436,33 @@
   $("#refresh-models-btn")?.addEventListener("click", () => {
     refreshModels();
   });
-
-  // First populate on load (in case server-rendered template was empty)
   updateModelInfo();
+
+  // ---------- Mic recording with HTTPS gate ----------
 
   let mediaRecorder = null;
   let recordedChunks = [];
 
-  $("#record-btn")?.addEventListener("click", async () => {
+  const isSecure = window.isSecureContext || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+  const recordBtn = $("#record-btn");
+  const stopBtn = $("#stop-record-btn");
+  const micHint = $("#mic-hint");
+
+  if (!isSecure) {
+    if (recordBtn) {
+      recordBtn.disabled = true;
+      recordBtn.title = "Microphone recording requires HTTPS (or localhost).";
+    }
+    if (micHint) {
+      micHint.textContent = "mic disabled - HTTPS required";
+      micHint.classList.add("failed");
+    }
+  } else if (micHint) {
+    micHint.textContent = "mic ready";
+  }
+
+  recordBtn?.addEventListener("click", async () => {
+    if (!isSecure) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaRecorder = new MediaRecorder(stream);
@@ -377,25 +477,28 @@
         stream.getTracks().forEach((t) => t.stop());
       };
       mediaRecorder.start();
-      $("#record-btn").disabled = true;
-      $("#stop-record-btn").disabled = false;
+      recordBtn.disabled = true;
+      stopBtn.disabled = false;
+      if (micHint) micHint.textContent = "recording...";
     } catch (err) {
       alert("Mic access failed: " + err.message);
     }
   });
 
-  $("#stop-record-btn")?.addEventListener("click", () => {
+  stopBtn?.addEventListener("click", () => {
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
       mediaRecorder.stop();
     }
-    $("#record-btn").disabled = false;
-    $("#stop-record-btn").disabled = true;
+    recordBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (micHint) micHint.textContent = "mic ready";
   });
 
   $("#test-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    if (!fd.get("audio") || (fd.get("audio") instanceof File && fd.get("audio").size === 0)) {
+    const f = fd.get("audio");
+    if (!f || (f instanceof File && f.size === 0)) {
       alert("Pick a file or record from mic first.");
       return;
     }
@@ -432,14 +535,13 @@
     if (r.score_curve.length) {
       const cv = document.createElement("canvas");
       cv.width = 800; cv.height = 120; cv.style.maxWidth = "100%";
+      cv.style.gridColumn = "1 / -1";
       out.appendChild(cv);
       const ctx = cv.getContext("2d");
       ctx.fillStyle = "#06090e"; ctx.fillRect(0, 0, cv.width, cv.height);
-      // threshold line
       const thY = cv.height - r.threshold * cv.height;
       ctx.strokeStyle = "#d29922"; ctx.beginPath();
       ctx.moveTo(0, thY); ctx.lineTo(cv.width, thY); ctx.stroke();
-      // curve
       ctx.strokeStyle = "#58a6ff"; ctx.beginPath();
       const n = r.score_curve.length;
       r.score_curve.forEach((p, i) => {
@@ -451,6 +553,9 @@
     }
   }
 
-  // initial poll for status
-  fetch("/api/train/status").then((r) => r.json()).then((s) => setStatus(s.status));
+  // ---------- Initial state sync ----------
+
+  fetch("/api/train/status")
+    .then((r) => r.json())
+    .then((s) => setRunState(s.status));
 })();

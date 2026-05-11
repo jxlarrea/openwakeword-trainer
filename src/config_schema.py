@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class VoiceSelection(BaseModel):
@@ -119,6 +119,35 @@ class TrainRunConfig(BaseModel):
         if not v:
             raise ValueError("wake_word is required")
         return v
+
+    @model_validator(mode="after")
+    def _check_inputs_sane(self) -> "TrainRunConfig":
+        """Reject configs that can't possibly produce a usable training dataset."""
+        # At least one voice source.
+        n_piper = len(self.generation.piper_voices)
+        n_eleven = (
+            len(self.generation.elevenlabs_voice_ids)
+            if self.generation.use_elevenlabs
+            else 0
+        )
+        if n_piper == 0 and n_eleven == 0:
+            raise ValueError(
+                "Select at least one Piper voice (or enable ElevenLabs with voices)."
+            )
+
+        # At least one augmentation corpus.
+        any_corpus = (
+            self.datasets.use_mit_rirs
+            or self.datasets.use_musan_noise
+            or self.datasets.use_musan_music
+            or self.datasets.use_fsd50k
+            or self.datasets.use_common_voice_negatives
+        )
+        if not any_corpus:
+            raise ValueError(
+                "Enable at least one augmentation corpus (MIT IR, MUSAN, FSD50K, or Common Voice)."
+            )
+        return self
 
     def slug(self) -> str:
         return "".join(c if c.isalnum() else "_" for c in self.wake_word.lower()).strip("_")

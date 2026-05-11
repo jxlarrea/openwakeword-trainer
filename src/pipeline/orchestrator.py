@@ -148,6 +148,7 @@ def _generate_samples(
             f"Piper {label}: {target_total} synths across {workers} workers"
         )
         i = 0
+        last_log_t = time.monotonic()
         for sample in piper.iter_parallel(tasks, workers=workers):
             wav_path = out_dir / f"piper_{label}_{i:07d}.wav"
             write_wav(wav_path, sample.audio, sample.sample_rate)
@@ -159,6 +160,16 @@ def _generate_samples(
                     i / max(1, target_total),
                     detail=f"{i}/{target_total}",
                 )
+            # Heartbeat log every ~10s so the live-log keeps ticking on long
+            # generation passes (Piper adversarial is often 100k+ synths).
+            now = time.monotonic()
+            if (now - last_log_t) > 10.0:
+                rate = i / max(1.0, now - state.started_at) if state.started_at else 0
+                bus.log(
+                    f"Piper {label}: {i:,}/{target_total:,} synths "
+                    f"({100.0 * i / max(1, target_total):.1f}%, ~{rate:.1f}/s avg)"
+                )
+                last_log_t = now
             if state.cancel_flag.is_set():
                 # Breaking out of the iterator closes the pool via __exit__.
                 break

@@ -28,6 +28,16 @@ html, body {
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
+code {
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ---------------- Header ---------------- */
+
 .topbar {
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: center; justify-content: space-between;
@@ -36,7 +46,30 @@ a:hover { text-decoration: underline; }
   border-bottom: 1px solid var(--border);
 }
 .topbar h1 { font-size: 18px; margin: 0; }
-.topbar nav a { margin-left: 18px; font-size: 13px; color: var(--muted); }
+
+.topbar-right { display: flex; align-items: center; gap: 14px; }
+
+.github-link {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.1s;
+}
+.github-link:hover {
+  text-decoration: none;
+  background: #2a3140;
+  border-color: var(--accent);
+}
+.github-link svg { display: block; }
+
+.byline { color: var(--muted); font-size: 12px; }
+
+/* ---------------- Layout ---------------- */
 
 main {
   max-width: 1100px;
@@ -72,23 +105,71 @@ fieldset legend {
   letter-spacing: 0.04em;
 }
 
+/* Default label: block container. Text content flows inline (so "Wake word *"
+ * stays on one line), inputs/hints stack underneath via their own display rules. */
 label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  display: block;
   font-size: 13px;
   color: var(--muted);
-  margin-bottom: 8px;
+  margin-bottom: 12px;
 }
+
+/* Inline labels for checkbox rows. */
 label.inline {
-  flex-direction: row;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
-  margin-right: 16px;
+  margin: 0;
+  color: var(--text);
 }
-label .hint, small {
+label.inline input[type="checkbox"],
+label.inline input[type="radio"] {
+  width: auto;
+  margin: 0;
+}
+
+/* Wrapper used for "checkbox + hint" pairs so the hint sits cleanly below
+ * the checkbox row, aligned with the label text. */
+.check-row {
+  margin-bottom: 12px;
+}
+.check-row .hint {
+  display: block;
+  margin-left: 26px;
+  margin-top: 2px;
+}
+
+/* Subtle hint text under each field. Always block so it lands on its own line. */
+.hint {
+  display: block;
   color: var(--muted);
   font-size: 11px;
+  line-height: 1.35;
+  margin-top: 4px;
+}
+
+.req { color: var(--bad); font-weight: 600; margin-left: 2px; }
+
+/* Validation error summary shown above the Start button. */
+.form-errors {
+  background: rgba(248, 81, 73, 0.08);
+  border: 1px solid var(--bad);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-top: 16px;
+  color: var(--bad);
+  font-size: 13px;
+}
+.form-errors ul {
+  margin: 4px 0 0;
+  padding-left: 20px;
+}
+.form-errors li { margin: 2px 0; }
+
+/* Highlight a fieldset that failed custom validation. */
+fieldset.invalid {
+  border-color: var(--bad);
+  box-shadow: 0 0 0 1px rgba(248, 81, 73, 0.25);
 }
 
 input, textarea, select {
@@ -99,20 +180,55 @@ input, textarea, select {
   padding: 8px 10px;
   font-size: 13px;
   font-family: inherit;
+  width: 100%;
+  display: block;
+  margin-top: 4px;
 }
 input:focus, textarea:focus, select:focus {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
 }
 
-textarea { resize: vertical; min-height: 80px; }
+textarea {
+  resize: vertical;
+  min-height: 100px;
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+/* Phrase boxes: textarea fills the column */
+.phrase-box {
+  display: flex;
+  flex-direction: column;
+}
+.phrase-box textarea {
+  flex: 1;
+  width: 100%;
+  min-height: 160px;
+}
+
+/* ---------------- Grids ---------------- */
 
 .grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 14px;
 }
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
 .span-2 { grid-column: span 2; }
+
+@media (max-width: 800px) {
+  .grid, .grid-2 { grid-template-columns: 1fr; }
+  .span-2 { grid-column: span 1; }
+}
+
+/* ---------------- Buttons ---------------- */
 
 button {
   cursor: pointer;
@@ -125,19 +241,30 @@ button {
   border: 1px solid var(--border);
   transition: background 0.1s;
 }
-button:hover { background: #2a3140; }
+button:hover:not(:disabled) { background: #2a3140; }
 button.primary { background: var(--accent); color: #0e1116; border-color: var(--accent); }
-button.primary:hover { background: #79b8ff; }
+button.primary:hover:not(:disabled) { background: #79b8ff; }
 button.danger { background: var(--bad); color: #fff; border-color: var(--bad); }
-button.danger:hover { filter: brightness(1.1); }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.danger:hover:not(:disabled) { filter: brightness(1.1); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .actions {
   display: flex; gap: 12px; align-items: center; margin-top: 16px;
+  flex-wrap: wrap;
+}
+.test-actions { margin-top: 8px; margin-bottom: 8px; }
+
+/* In the test section, the upload-row grid sits between two .test-actions rows;
+ * give it breathing room from the preceding row. */
+#test-form .actions + .grid {
+  margin-top: 18px;
 }
 
+/* ---------------- Status pill ---------------- */
+
 .pill {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
   padding: 4px 10px;
   border-radius: 999px;
   background: var(--panel-2);
@@ -145,12 +272,18 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   font-size: 12px;
   border: 1px solid var(--border);
 }
-.pill.running { background: var(--warn); color: #0e1116; }
-.pill.succeeded { background: var(--good); color: #0e1116; }
-.pill.failed, .pill.cancelled { background: var(--bad); color: #fff; }
+.pill.running { background: var(--warn); color: #0e1116; border-color: var(--warn); }
+.pill.succeeded { background: var(--good); color: #0e1116; border-color: var(--good); }
+.pill.failed, .pill.cancelled { background: var(--bad); color: #fff; border-color: var(--bad); }
+
+/* ---------------- Voice list ---------------- */
 
 .voice-controls {
   display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px;
+  align-items: center;
+}
+.voice-controls input[type="search"] {
+  flex: 1 1 200px;
 }
 .voice-list {
   max-height: 320px; overflow: auto;
@@ -161,7 +294,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .voice-row {
   display: grid;
-  grid-template-columns: 24px 1fr auto auto;
+  grid-template-columns: 24px 1fr auto;
   align-items: center;
   gap: 10px;
   padding: 4px 8px;
@@ -171,8 +304,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .voice-row:hover { background: rgba(255,255,255,0.03); }
 .voice-row .voice-meta { color: var(--muted); font-size: 11px; }
-.voice-row .audition-btn { padding: 3px 8px; font-size: 11px; }
 .voice-row.hidden { display: none; }
+
+/* ---------------- Progress + log ---------------- */
 
 .phase {
   background: var(--panel-2);
@@ -213,7 +347,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .metric-tile .value { font-size: 16px; font-weight: 600; }
 
 #log {
-  max-height: 280px; overflow: auto;
+  max-height: 340px; overflow: auto;
   background: #06090e;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -226,9 +360,13 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 #log .l-warning { color: var(--warn); }
 #log .l-error { color: var(--bad); }
 
+/* ---------------- Test panel ---------------- */
+
 #test-result {
   margin-top: 14px;
-  display: grid; gap: 8px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
 }
 .score-bar {
   height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden;
