@@ -104,19 +104,46 @@ def build_features_from_wavs(
     out_labels: np.ndarray,
     write_offset: int,
     cancel_flag=None,
+    progress_label: str = "features:extract",
+    progress_fraction_base: float = 0.0,
+    progress_fraction_span: float = 1.0,
 ) -> int:
     """Read each wav, augment + extract features, write to the memmap.
 
     Returns the new write_offset. Polls cancel_flag (a threading.Event) every
-    clip so the orchestrator can interrupt long extraction passes.
+    clip so the orchestrator can interrupt long extraction passes. Emits
+    progress + log events through the EventBus every 50 clips so the Web UI
+    sees the phase advancing.
     """
+    import time as _time
+
     from src.augment.augmenter import augment_clip
+    from src.train.progress import bus
 
     cursor = write_offset
     rng = np.random.default_rng(write_offset + label)
-    for path in wav_paths:
+    total = len(wav_paths)
+    last_progress_t = _time.monotonic()
+
+    for clip_idx, path in enumerate(wav_paths):
         if cancel_flag is not None and cancel_flag.is_set():
             break
+
+        # Periodic progress + log, every 50 clips or 5 seconds (whichever first).
+        now = _time.monotonic()
+        if clip_idx > 0 and (clip_idx % 50 == 0 or (now - last_progress_t) > 5.0):
+            done_frac = clip_idx / max(1, total)
+            global_frac = progress_fraction_base + progress_fraction_span * done_frac
+            bus.progress(
+                progress_label,
+                global_frac,
+                detail=f"{clip_idx}/{total} clips, {cursor:,} windows",
+            )
+            bus.log(
+                f"features: {clip_idx}/{total} clips processed "
+                f"({cursor:,} windows written)"
+            )
+            last_progress_t = now
         try:
             audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
         except Exception as exc:

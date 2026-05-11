@@ -282,33 +282,54 @@ def _build_features(
     train_labels = np.zeros(train_capacity, dtype=np.uint8)
     val_labels = np.zeros(val_capacity, dtype=np.uint8)
 
-    bus.phase("features:extract", detail="train positives")
+    # Split the global progress bar across 4 sub-passes weighted by clip count.
+    total_clips = max(1, len(train_pos) + len(train_neg) + len(val_pos) + len(val_neg))
+    bus.log(
+        f"features:extract starting - {total_clips:,} source clips "
+        f"x {aug_per} augs each"
+    )
+
+    base = 0.0
+    span = len(train_pos) / total_clips
+    bus.phase("features:extract", detail=f"train positives ({len(train_pos)} clips)")
     train_cursor = build_features_from_wavs(
         train_pos, 1, extractor, augmenter, aug_per, train_arr, train_labels, 0,
         cancel_flag=state.cancel_flag,
+        progress_label="features:extract",
+        progress_fraction_base=base, progress_fraction_span=span,
     )
-    bus.progress("features:extract", 0.25)
 
-    bus.phase("features:extract", detail="train negatives")
+    base += span
+    span = len(train_neg) / total_clips
+    bus.phase("features:extract", detail=f"train negatives ({len(train_neg)} clips)")
     train_cursor = build_features_from_wavs(
         train_neg, 0, extractor, augmenter, aug_per, train_arr, train_labels, train_cursor,
         cancel_flag=state.cancel_flag,
+        progress_label="features:extract",
+        progress_fraction_base=base, progress_fraction_span=span,
     )
-    bus.progress("features:extract", 0.5)
 
-    bus.phase("features:extract", detail="val positives")
+    base += span
+    span = len(val_pos) / total_clips
+    bus.phase("features:extract", detail=f"val positives ({len(val_pos)} clips)")
     val_cursor = build_features_from_wavs(
         val_pos, 1, extractor, augmenter, aug_per, val_arr, val_labels, 0,
         cancel_flag=state.cancel_flag,
+        progress_label="features:extract",
+        progress_fraction_base=base, progress_fraction_span=span,
     )
-    bus.progress("features:extract", 0.75)
 
-    bus.phase("features:extract", detail="val negatives")
+    base += span
+    span = len(val_neg) / total_clips
+    bus.phase("features:extract", detail=f"val negatives ({len(val_neg)} clips)")
     val_cursor = build_features_from_wavs(
         val_neg, 0, extractor, augmenter, aug_per, val_arr, val_labels, val_cursor,
         cancel_flag=state.cancel_flag,
+        progress_label="features:extract",
+        progress_fraction_base=base, progress_fraction_span=span,
     )
-    bus.progress("features:extract", 1.0)
+    bus.progress("features:extract", 1.0,
+                 detail=f"done - train {train_cursor:,} windows, val {val_cursor:,} windows")
 
     # Truncate to actual cursor and re-create memmaps + labels at exact size.
     train_arr.flush()

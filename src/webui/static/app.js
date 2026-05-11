@@ -310,8 +310,54 @@
     const res = await fetch("/api/models");
     const models = await res.json();
     const sel = $("#test-model");
-    sel.innerHTML = models.map((m) => `<option value="${m.name}">${m.name}</option>`).join("");
+    const prev = sel.value;
+    sel.innerHTML = models
+      .map((m) => `<option value="${m.name}" data-size="${m.size}">${m.name}</option>`)
+      .join("");
+    if (prev && [...sel.options].some((o) => o.value === prev)) {
+      sel.value = prev;
+    }
+    updateModelInfo();
   }
+
+  function updateModelInfo() {
+    const sel = $("#test-model");
+    const info = $("#model-info");
+    if (!info) return;
+    const opt = sel.options[sel.selectedIndex];
+    if (!opt) {
+      info.textContent = "no models yet";
+      return;
+    }
+    const size = Number(opt.getAttribute("data-size") || 0);
+    const kb = (size / 1024).toFixed(1);
+    info.textContent = `${opt.value} (${kb} KB)`;
+  }
+
+  $("#test-model")?.addEventListener("change", updateModelInfo);
+
+  $("#download-model-btn")?.addEventListener("click", () => {
+    const name = $("#test-model").value;
+    if (!name) {
+      alert("No model selected.");
+      return;
+    }
+    // Trigger a normal browser download via the /api/models/<name> endpoint
+    // (which returns Content-Disposition: attachment).
+    const a = document.createElement("a");
+    a.href = `/api/models/${encodeURIComponent(name)}`;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+
+  $("#refresh-models-btn")?.addEventListener("click", () => {
+    refreshModels();
+  });
+
+  // First populate on load (in case server-rendered template was empty)
+  updateModelInfo();
 
   let mediaRecorder = null;
   let recordedChunks = [];
