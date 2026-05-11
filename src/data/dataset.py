@@ -103,16 +103,20 @@ def build_features_from_wavs(
     out_features: np.memmap,
     out_labels: np.ndarray,
     write_offset: int,
+    cancel_flag=None,
 ) -> int:
     """Read each wav, augment + extract features, write to the memmap.
 
-    Returns the new write_offset.
+    Returns the new write_offset. Polls cancel_flag (a threading.Event) every
+    clip so the orchestrator can interrupt long extraction passes.
     """
     from src.augment.augmenter import augment_clip
 
     cursor = write_offset
     rng = np.random.default_rng(write_offset + label)
     for path in wav_paths:
+        if cancel_flag is not None and cancel_flag.is_set():
+            break
         try:
             audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
         except Exception as exc:

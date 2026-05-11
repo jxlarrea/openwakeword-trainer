@@ -52,12 +52,54 @@ def _resample_to_16k(audio_int16: np.ndarray, src_sr: int) -> np.ndarray:
 
 # Populated per-worker after _worker_init is called.
 _WORKER_VOICES: dict[str, tuple[PiperVoice, PiperVoiceInfo]] = {}
+_WORKER_ORT_PATCHED = False
+
+
+def _worker_apply_ort_thread_cap() -> None:
+    """Cap onnxruntime intra-op threads on the session Piper is about to create.
+
+    Without this cap, every Piper worker's onnxruntime session spawns one
+    thread per physical core, so N workers x N cores threads collide on a
+    fixed number of cores. The cap (default 2) keeps total active threads
+    near the physical core count when paired with the default worker count.
+
+    Implemented as a monkey-patch of ``onnxruntime.InferenceSession.__init__``
+    because Piper does not expose a ``SessionOptions`` knob. Runs once per
+    worker process.
+    """
+    global _WORKER_ORT_PATCHED
+    if _WORKER_ORT_PATCHED:
+        return
+
+    import os
+
+    import onnxruntime as ort
+
+    n_threads = int(os.environ.get("OWW_PIPER_ORT_THREADS", "2"))
+    if n_threads <= 0:
+        _WORKER_ORT_PATCHED = True
+        return
+
+    _orig_init = ort.InferenceSession.__init__
+
+    def _patched_init(self, *args, sess_options=None, providers=None, **kwargs):  # noqa: ANN001
+        if sess_options is None:
+            sess_options = ort.SessionOptions()
+        # Only set if the caller hasn't customized threading already.
+        if sess_options.intra_op_num_threads == 0:
+            sess_options.intra_op_num_threads = n_threads
+            sess_options.inter_op_num_threads = 1
+        return _orig_init(self, *args, sess_options=sess_options, providers=providers, **kwargs)
+
+    ort.InferenceSession.__init__ = _patched_init
+    _WORKER_ORT_PATCHED = True
 
 
 def _worker_init() -> None:
     """Pool initializer. Resets per-worker state."""
     global _WORKER_VOICES
     _WORKER_VOICES = {}
+    _worker_apply_ort_thread_cap()
     # Avoid noisy duplicate handlers in spawned workers.
     logging.basicConfig(level=logging.WARNING, force=True)
 

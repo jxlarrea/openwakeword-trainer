@@ -109,7 +109,38 @@ def download_mit_rirs(progress: ProgressCallback | None = None) -> Path:
 
 # -------- MUSAN --------
 
-MUSAN_URL = "https://us.openslr.org/resources/17/musan.tar.gz"
+# Mirror list - tried in order. us.openslr.org has had recurring TLS cert
+# hostname-mismatch errors; www.openslr.org and the TRMAL mirror are usually
+# fine. Add more here as fallbacks if needed.
+MUSAN_URLS = [
+    "https://www.openslr.org/resources/17/musan.tar.gz",
+    "https://openslr.trmal.net/resources/17/musan.tar.gz",
+    "https://us.openslr.org/resources/17/musan.tar.gz",
+]
+
+
+def _download_with_mirror_failover(
+    urls: list[str],
+    dest: Path,
+    progress: ProgressCallback | None,
+    name: str,
+) -> None:
+    """Try each URL in order; first one that succeeds wins."""
+    last_exc: Exception | None = None
+    for url in urls:
+        try:
+            logger.info("Trying mirror %s", url)
+            _download_with_progress(url, dest, progress, name=name)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Mirror failed (%s): %s", url, exc)
+            last_exc = exc
+            dest.unlink(missing_ok=True)
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            tmp.unlink(missing_ok=True)
+    raise RuntimeError(
+        f"All mirrors failed for {name}: {[str(u) for u in urls]}"
+    ) from last_exc
 
 
 def download_musan(progress: ProgressCallback | None = None) -> Path:
@@ -120,7 +151,7 @@ def download_musan(progress: ProgressCallback | None = None) -> Path:
     target.mkdir(parents=True, exist_ok=True)
     archive = target / "musan.tar.gz"
     logger.info("Downloading MUSAN to %s", archive)
-    _download_with_progress(MUSAN_URL, archive, progress, name="musan")
+    _download_with_mirror_failover(MUSAN_URLS, archive, progress, name="musan")
     logger.info("Extracting MUSAN")
     if progress:
         progress("musan", 0.95)
@@ -133,42 +164,153 @@ def download_musan(progress: ProgressCallback | None = None) -> Path:
 
 
 # -------- FSD50K --------
+#
+# We pull from the Fhrozen/FSD50k HF mirror instead of the canonical Zenodo
+# source. Zenodo serves FSD50K as a 6-part split zip (dev) + 2-part split zip
+# (eval) over a slow CDN (~1-5 MB/s typical). Hugging Face's CDN is dramatically
+# faster (50-100 MB/s with threaded parallelism), and the Fhrozen mirror hosts
+# the audio as individual WAVs under clips/dev/ and clips/eval/ - no zip
+# spanning, no merge step, no `zip` utility dependency.
 
-FSD50K_BASE = "https://zenodo.org/records/4060432/files"
-FSD50K_PARTS = [
-    "FSD50K.dev_audio.zip",
-    "FSD50K.eval_audio.zip",
-    "FSD50K.ground_truth.zip",
-]
+FSD50K_HF_REPO = "Fhrozen/FSD50k"
 
 
 def download_fsd50k(
     progress: ProgressCallback | None = None,
-    parts: Iterable[str] = FSD50K_PARTS,
+    cancel_flag=None,
 ) -> Path:
-    """Download FSD50K dev + eval audio + labels.
+    """Download FSD50K dev + eval audio from a HF mirror.
 
-    NOTE: dev_audio is a multi-part zip on Zenodo (z01..z05 + .zip). Zenodo also
-    serves a single `FSD50K.dev_audio.zip` reconstruction; we use that.
+    Hugging Face rate-limits anonymous / free-tier accounts to 5000 resolver
+    requests per 5 minutes (~16.67/sec). With 51k tiny WAVs the bottleneck is
+    HTTP round-trip latency, not bandwidth. Strategy:
+
+    1. Enumerate the file list once via the dataset_info API.
+    2. Pre-filter files already on disk (free, no HF call - enables cheap resume).
+    3. Download remaining files in a ThreadPoolExecutor with 4 workers.
+       4 workers x ~3 files/sec/worker = ~12 files/sec, under the limit.
+    4. Each worker retries on 429 with exponential backoff.
+
+    Resumes cleanly on cancel/restart.
     """
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import requests
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import (
+        HfHubHTTPError,
+        LocalEntryNotFoundError,
+    )
+
     target = get_settings().fsd50k_dir
     if _is_complete(target):
         return target
     target.mkdir(parents=True, exist_ok=True)
 
-    parts = list(parts)
-    n = len(parts)
-    for i, name in enumerate(parts):
-        url = f"{FSD50K_BASE}/{name}"
-        archive = target / name
-        logger.info("Downloading %s", url)
-        _download_with_progress(url, archive, progress, name=f"fsd50k:{name}")
-        logger.info("Extracting %s", name)
-        _extract_archive(archive, target)
-        archive.unlink(missing_ok=True)
+    token = get_settings().hf_token
+
+    logger.info("Enumerating files in %s ...", FSD50K_HF_REPO)
+    api = HfApi(token=token)
+    info = api.dataset_info(FSD50K_HF_REPO, token=token)
+
+    def _wanted(rfilename: str) -> bool:
+        return rfilename.startswith(("clips/dev/", "clips/eval/", "labels/", "metadata/"))
+
+    files = [s.rfilename for s in info.siblings if _wanted(s.rfilename)]
+    total = len(files)
+
+    # Pre-skip existing files; this is the "cheap resume" path.
+    to_download: list[str] = []
+    for f in files:
+        local = target / f
+        if not local.exists() or local.stat().st_size == 0:
+            to_download.append(f)
+
+    already_have = total - len(to_download)
+    logger.info(
+        "FSD50K: %d/%d already cached; %d files to download",
+        already_have, total, len(to_download),
+    )
+
+    if progress:
+        progress("fsd50k", already_have / max(1, total))
+
+    if not to_download:
+        _mark_complete(target)
         if progress:
-            progress("fsd50k", (i + 1) / n)
+            progress("fsd50k", 1.0)
+        return target
+
+    completed = already_have
+    state_lock = threading.Lock()
+    last_progress_t = time.monotonic()
+
+    def _download_one(fname: str) -> None:
+        nonlocal completed, last_progress_t
+        if cancel_flag is not None and cancel_flag.is_set():
+            return
+        retries = 0
+        while True:
+            if cancel_flag is not None and cancel_flag.is_set():
+                return
+            try:
+                hf_hub_download(
+                    repo_id=FSD50K_HF_REPO,
+                    repo_type="dataset",
+                    filename=fname,
+                    local_dir=str(target),
+                    token=token,
+                )
+                with state_lock:
+                    completed += 1
+                    now = time.monotonic()
+                    if completed % 200 == 0 or (now - last_progress_t) > 5.0:
+                        if progress:
+                            progress("fsd50k", completed / max(1, total))
+                        last_progress_t = now
+                        logger.info(
+                            "FSD50K: %d/%d files (%.1f%%)",
+                            completed, total, 100.0 * completed / total,
+                        )
+                return
+            except (
+                HfHubHTTPError,
+                LocalEntryNotFoundError,
+                requests.exceptions.RequestException,
+                ConnectionError,
+                TimeoutError,
+            ) as exc:
+                msg = str(exc)
+                retries += 1
+                if retries > 20:
+                    raise
+                # Longer wait for explicit rate-limit; shorter for generic transients.
+                if "429" in msg or "Too Many Requests" in msg or "rate" in msg.lower():
+                    wait = min(300, 60 * retries)
+                    reason = "rate-limited"
+                else:
+                    wait = min(60, 5 * retries)
+                    reason = "transient error"
+                logger.warning(
+                    "FSD50K %s on %s (retry %d/20, wait %ds): %s",
+                    reason, fname, retries, wait, type(exc).__name__,
+                )
+                time.sleep(wait)
+                continue
+
+    # 4 workers stays comfortably under the 16.67 req/sec rate-limit ceiling
+    # even when small WAVs come back in ~200 ms each.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        # pool.map raises on first failure once consumed; consume to propagate.
+        for _ in pool.map(_download_one, to_download):
+            pass
+
     _mark_complete(target)
+    if progress:
+        progress("fsd50k", 1.0)
+    logger.info("FSD50K download complete: %d files at %s", completed, target)
     return target
 
 
@@ -332,15 +474,22 @@ def ensure_corpora(
     use_common_voice: bool,
     common_voice_subset: int = 10_000,
     progress: ProgressCallback | None = None,
+    cancel_flag=None,
 ) -> dict[str, Path]:
     """Download whichever corpora the run config asks for."""
     out: dict[str, Path] = {}
     if use_mit_rirs:
         out["mit_rirs"] = download_mit_rirs(progress)
+    if cancel_flag is not None and cancel_flag.is_set():
+        return out
     if use_musan:
         out["musan"] = download_musan(progress)
+    if cancel_flag is not None and cancel_flag.is_set():
+        return out
     if use_fsd50k:
-        out["fsd50k"] = download_fsd50k(progress)
+        out["fsd50k"] = download_fsd50k(progress, cancel_flag=cancel_flag)
+    if cancel_flag is not None and cancel_flag.is_set():
+        return out
     if use_common_voice:
         out["common_voice"] = download_common_voice_subset(common_voice_subset, progress=progress)
     return out

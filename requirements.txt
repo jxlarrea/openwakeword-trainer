@@ -14,6 +14,9 @@ elevenlabs==2.46.0
 
 # Audio I/O + augmentation
 audiomentations==0.43.1
+# Default backend for audiomentations.Mp3Compression in v0.42+; without it the
+# transform raises and the whole Compose chain falls back to original audio.
+fast-mp3-augment==0.2.0
 soundfile==0.12.1
 librosa==0.10.2.post1
 pydub==0.25.1

@@ -107,8 +107,23 @@ def _generate_samples(
     n_per_phrase_per_voice: int,
     label: str,
 ) -> list[Path]:
-    """Generate Piper + (optionally) ElevenLabs samples. Returns wav paths."""
+    """Generate Piper + (optionally) ElevenLabs samples. Returns wav paths.
+
+    Skips generation entirely if a sentinel for this label already exists -
+    lets a failed run that completed wav generation but died later (e.g. in a
+    corpus download) restart without redoing the slow TTS phase.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / f".generated_{label}"
+    if sentinel.exists():
+        existing = sorted(out_dir.glob(f"*_{label}_*.wav"))
+        if existing:
+            bus.log(
+                f"Reusing {len(existing)} cached WAVs for label={label} "
+                f"from {out_dir} (delete {sentinel.name} to force regeneration)"
+            )
+            return existing
+
     written: list[Path] = []
 
     settings = get_settings()
@@ -193,6 +208,11 @@ def _generate_samples(
                 detail = f"{j}/{target_total}" + (f" ({skipped} skipped)" if skipped else "")
                 bus.progress(f"generate:elevenlabs:{label}", 1.0, detail=detail)
 
+    # Drop sentinel only if we successfully reached this point without cancel.
+    # On next start with the same run_name, this lets us skip regeneration.
+    if not state.cancel_flag.is_set() and written:
+        sentinel.write_text(str(len(written)))
+
     return written
 
 
@@ -264,25 +284,29 @@ def _build_features(
 
     bus.phase("features:extract", detail="train positives")
     train_cursor = build_features_from_wavs(
-        train_pos, 1, extractor, augmenter, aug_per, train_arr, train_labels, 0
+        train_pos, 1, extractor, augmenter, aug_per, train_arr, train_labels, 0,
+        cancel_flag=state.cancel_flag,
     )
     bus.progress("features:extract", 0.25)
 
     bus.phase("features:extract", detail="train negatives")
     train_cursor = build_features_from_wavs(
-        train_neg, 0, extractor, augmenter, aug_per, train_arr, train_labels, train_cursor
+        train_neg, 0, extractor, augmenter, aug_per, train_arr, train_labels, train_cursor,
+        cancel_flag=state.cancel_flag,
     )
     bus.progress("features:extract", 0.5)
 
     bus.phase("features:extract", detail="val positives")
     val_cursor = build_features_from_wavs(
-        val_pos, 1, extractor, augmenter, aug_per, val_arr, val_labels, 0
+        val_pos, 1, extractor, augmenter, aug_per, val_arr, val_labels, 0,
+        cancel_flag=state.cancel_flag,
     )
     bus.progress("features:extract", 0.75)
 
     bus.phase("features:extract", detail="val negatives")
     val_cursor = build_features_from_wavs(
-        val_neg, 0, extractor, augmenter, aug_per, val_arr, val_labels, val_cursor
+        val_neg, 0, extractor, augmenter, aug_per, val_arr, val_labels, val_cursor,
+        cancel_flag=state.cancel_flag,
     )
     bus.progress("features:extract", 1.0)
 
@@ -416,6 +440,7 @@ def _run(cfg: TrainRunConfig) -> None:
             use_common_voice=cfg.datasets.use_common_voice_negatives,
             common_voice_subset=cfg.datasets.common_voice_subset,
             progress=lambda name, frac: bus.progress(f"download:{name}", frac),
+            cancel_flag=state.cancel_flag,
         )
         bus.log(f"Corpora ready: {list(corpora.keys())}")
 

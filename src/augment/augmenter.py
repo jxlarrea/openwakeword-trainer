@@ -18,6 +18,7 @@ This pipeline is mono, 16 kHz, float32 in [-1, 1].
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,15 @@ from audiomentations import (
 from src.config_schema import AugmentationConfig
 
 logger = logging.getLogger(__name__)
+
+# audiomentations spams a UserWarning per FSD50K clip ("had to be resampled
+# from 44100 Hz to 16000 Hz") - it's informational, the actual resampling works
+# fine, and FSD50K is 100% 44.1 kHz so every load triggers it.
+warnings.filterwarnings(
+    "ignore",
+    message=".*had to be resampled from .* Hz to .* Hz.*",
+    category=UserWarning,
+)
 
 
 def build_augmenter(
@@ -151,10 +161,16 @@ def collect_background_noise_dirs(
         if d.exists():
             out.append(d)
     if use_fsd50k:
+        # Two layouts supported:
+        #   - HF mirror (Fhrozen/FSD50k):   clips/dev, clips/eval
+        #   - Zenodo legacy:                 FSD50K.dev_audio, FSD50K.eval_audio
+        # First match that has any wavs wins.
         for cand in (
+            settings.fsd50k_dir / "clips" / "dev",
+            settings.fsd50k_dir / "clips" / "eval",
             settings.fsd50k_dir / "FSD50K.dev_audio",
             settings.fsd50k_dir / "FSD50K.eval_audio",
         ):
-            if cand.exists():
+            if cand.exists() and any(cand.glob("*.wav")):
                 out.append(cand)
     return out

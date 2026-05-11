@@ -18,6 +18,13 @@ def configure_logging(level: str = "INFO") -> None:
     root.addHandler(handler)
     root.setLevel(level.upper())
 
+    # Also forward INFO+ records to the EventBus so the Web UI live-log shows
+    # downloader / orchestrator messages without each module having to call
+    # bus.log() explicitly.
+    from src.train.progress import BusLoggingHandler
+
+    root.addHandler(BusLoggingHandler(level=logging.INFO))
+
     # Tame chatty libraries.
     for noisy in ("urllib3", "filelock", "huggingface_hub", "datasets", "matplotlib"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

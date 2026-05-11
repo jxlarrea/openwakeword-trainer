@@ -29,8 +29,11 @@ class Settings(BaseSettings):
     data_dir: Path = Path("/data")
 
     # Workers
-    generation_workers: int = 0  # 0 -> os.cpu_count()
+    generation_workers: int = 0  # 0 -> min(10, cpu_count)
     dataloader_workers: int = 0  # 0 -> min(8, cpu_count)
+    # Threads per Piper worker's onnxruntime session. workers * this should be
+    # near the physical core count. DGX Spark (20 cores) likes 10 * 2 = 20.
+    piper_ort_threads: int = 2
 
     # Optional API keys (also accepted via the unprefixed env vars).
     elevenlabs_api_key: str | None = Field(default=None, alias="ELEVENLABS_API_KEY")
@@ -89,11 +92,10 @@ class Settings(BaseSettings):
             p.mkdir(parents=True, exist_ok=True)
 
     def resolved_generation_workers(self) -> int:
-        # Cap at 8 by default: each Piper worker has its own onnxruntime
-        # session that internally spawns more threads. More than 8 processes
-        # causes thread thrashing on most hosts (including DGX Spark's
-        # 20-core Grace CPU). Set OWW_GENERATION_WORKERS explicitly to override.
-        return self.generation_workers or min(8, max(1, (os.cpu_count() or 2)))
+        # Capped default of 10 pairs with OWW_PIPER_ORT_THREADS=2 to match the
+        # DGX Spark's 20 physical cores exactly (10 workers x 2 ort threads).
+        # Override OWW_GENERATION_WORKERS to scale on smaller / larger hosts.
+        return self.generation_workers or min(10, max(1, (os.cpu_count() or 2)))
 
     def resolved_dataloader_workers(self) -> int:
         return self.dataloader_workers or min(8, max(1, (os.cpu_count() or 2)))

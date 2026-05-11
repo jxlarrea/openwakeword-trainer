@@ -107,3 +107,39 @@ def _safe_put_nowait(q: asyncio.Queue, ev: Event) -> None:
 
 # Module-level singleton. Imported by both the training pipeline and the SSE route.
 bus = EventBus()
+
+
+# ----------------------------------------------------------------------------- #
+# Logging bridge: forward Python log records into the EventBus.
+# ----------------------------------------------------------------------------- #
+
+# Loggers whose records should NOT be forwarded to the UI (access logs etc).
+_NOISY_LOGGER_PREFIXES = (
+    "uvicorn",
+    "starlette",
+    "watchfiles",
+    "asyncio",
+)
+
+
+class BusLoggingHandler(logging.Handler):
+    """Logging handler that publishes records to the in-process EventBus.
+
+    Lets every src.* module use `logger.info(...)` and have those lines show up
+    in the Web UI's live-log panel without each call site explicitly calling
+    bus.log().
+    """
+
+    def __init__(self, level: int = logging.INFO) -> None:
+        super().__init__(level=level)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if any(record.name.startswith(p) for p in _NOISY_LOGGER_PREFIXES):
+                return
+            msg = record.getMessage()
+            # Prefix the logger name so the UI shows where the message came from.
+            short_name = record.name.replace("src.", "")
+            bus.log(f"[{short_name}] {msg}", level=record.levelname.lower())
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
