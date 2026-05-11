@@ -31,6 +31,11 @@ from src.data.features import (
 
 logger = logging.getLogger(__name__)
 
+# Pad short clips to this many samples (3 s at 16 kHz). The openWakeWord
+# classifier window covers ~1.28 s, so we need clips at least ~2 s to yield even
+# one window. Padding with silence on both sides also adds positional variability.
+MIN_CLIP_SAMPLES = 16_000 * 3
+
 
 @dataclass
 class ShardManifest:
@@ -45,7 +50,13 @@ class FeatureMemmapDataset(Dataset):
 
     def __init__(self, features_path: Path, labels_path: Path) -> None:
         labels = np.load(labels_path, mmap_mode="r")
-        n = labels.shape[0]
+        n = int(labels.shape[0])
+        if n == 0:
+            raise RuntimeError(
+                f"Empty dataset shard at {features_path}. "
+                "No classifier-windows were produced - check that audio clips are long enough "
+                "(>= 2 s) and that augmentations are not silencing them."
+            )
         self.features = np.memmap(
             features_path,
             dtype=np.float32,
@@ -68,6 +79,21 @@ def write_wav(path: Path, audio: np.ndarray, sample_rate: int = 16_000) -> None:
     sf.write(path, audio, sample_rate, subtype="PCM_16")
 
 
+def _pad_to_min_length(audio: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Pad audio with silence so the result is at least MIN_CLIP_SAMPLES long.
+
+    The original clip is placed at a random offset; trailing samples are zeros.
+    Returns audio unchanged if it is already long enough.
+    """
+    if audio.size >= MIN_CLIP_SAMPLES:
+        return audio
+    out = np.zeros(MIN_CLIP_SAMPLES, dtype=np.float32)
+    max_offset = MIN_CLIP_SAMPLES - audio.size
+    offset = int(rng.integers(0, max_offset + 1))
+    out[offset : offset + audio.size] = audio.astype(np.float32)
+    return out
+
+
 def build_features_from_wavs(
     wav_paths: list[Path],
     label: int,
@@ -85,6 +111,7 @@ def build_features_from_wavs(
     from src.augment.augmenter import augment_clip
 
     cursor = write_offset
+    rng = np.random.default_rng(write_offset + label)
     for path in wav_paths:
         try:
             audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
@@ -98,6 +125,9 @@ def build_features_from_wavs(
             from scipy.signal import resample_poly
             g = gcd(sr, 16_000)
             audio = resample_poly(audio, 16_000 // g, sr // g).astype(np.float32)
+
+        # Ensure each clip is long enough to produce at least one classifier window.
+        audio = _pad_to_min_length(audio, rng)
 
         for variant in augment_clip(audio, 16_000, augmenter, n_variants=augmentations_per_clip):
             int16 = float32_to_int16(variant)
@@ -120,9 +150,13 @@ def build_features_from_wavs(
     return cursor
 
 
-def estimate_window_count(n_clips: int, augmentations_per_clip: int, avg_windows_per_clip: int = 8) -> int:
-    """Conservative estimate of how many classifier-windows a clip set will yield."""
-    return n_clips * augmentations_per_clip * avg_windows_per_clip
+def estimate_window_count(n_clips: int, augmentations_per_clip: int, avg_windows_per_clip: int = 6) -> int:
+    """Conservative estimate of how many classifier-windows a clip set will yield.
+
+    With clips padded to MIN_CLIP_SAMPLES (3 s) and 12.5 ms mel hop:
+      ~240 mel-frames -> 21 embedding windows -> 6 classifier-windows per clip.
+    """
+    return max(1, n_clips * augmentations_per_clip * avg_windows_per_clip)
 
 
 def allocate_memmap(path: Path, n_windows: int) -> tuple[np.memmap, Path]:

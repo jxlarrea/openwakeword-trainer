@@ -31,7 +31,11 @@ services:
       TORCH_HOME: /data/cache/torch
       XDG_CACHE_HOME: /data/cache
     volumes:
-      - oww_data:/data
+      # Default: named docker volume (portable, no host setup).
+      # Override OWW_DATA_DIR_HOST in .env to point at a host bind-mount path
+      # (e.g. /opt/models/openwakeword-trainer) when you want the corpora to
+      # live somewhere specific on the host.
+      - ${OWW_DATA_DIR_HOST:-oww_data}:/data
       # Live-mount source for dev. Comment out for prod / immutable images.
       - ./src:/app/src:ro
     deploy:

@@ -116,42 +116,51 @@ def get_voice_info(key: str) -> PiperVoiceInfo:
 
 
 def ensure_voice_downloaded(info: PiperVoiceInfo) -> tuple[Path, Path]:
-    """Download the voice's ONNX and JSON config if not already cached."""
+    """Download the voice's ONNX and JSON config if not already cached.
+
+    hf_hub_download returns a symlink under the snapshot tree pointing at a
+    blob in the cache. We resolve to the blob and copy it to the flat layout
+    /data/piper_voices/<voice_key>/<filename> that the rest of the code expects.
+    """
+    import shutil
+
     settings = get_settings()
     target_dir = settings.voices_dir / info.key
     target_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = str(settings.voices_dir / ".hf_cache")
 
     onnx_dst = target_dir / Path(info.onnx_path_in_repo).name
     cfg_dst = target_dir / Path(info.config_path_in_repo).name
 
+    def _stale(p: Path) -> bool:
+        # is_symlink returns True for broken symlinks; exists() returns False.
+        return p.is_symlink() and not p.exists()
+
+    if _stale(onnx_dst):
+        onnx_dst.unlink()
+    if _stale(cfg_dst):
+        cfg_dst.unlink()
+
     if not onnx_dst.exists():
         logger.info("Downloading Piper voice %s (onnx)", info.key)
-        downloaded = hf_hub_download(
-            repo_id=VOICES_REPO,
-            filename=info.onnx_path_in_repo,
-            cache_dir=str(settings.voices_dir / ".hf_cache"),
-        )
-        Path(downloaded).replace(onnx_dst) if Path(downloaded).is_file() and not onnx_dst.exists() else None
-        if not onnx_dst.exists():
-            # hf_hub_download already cached it; symlink to expected path
-            try:
-                onnx_dst.symlink_to(downloaded)
-            except OSError:
-                import shutil
-                shutil.copy(downloaded, onnx_dst)
+        src = Path(
+            hf_hub_download(
+                repo_id=VOICES_REPO,
+                filename=info.onnx_path_in_repo,
+                cache_dir=cache_dir,
+            )
+        ).resolve()
+        shutil.copy(src, onnx_dst)
 
     if not cfg_dst.exists():
         logger.info("Downloading Piper voice %s (config)", info.key)
-        downloaded = hf_hub_download(
-            repo_id=VOICES_REPO,
-            filename=info.config_path_in_repo,
-            cache_dir=str(settings.voices_dir / ".hf_cache"),
-        )
-        if not cfg_dst.exists():
-            try:
-                cfg_dst.symlink_to(downloaded)
-            except OSError:
-                import shutil
-                shutil.copy(downloaded, cfg_dst)
+        src = Path(
+            hf_hub_download(
+                repo_id=VOICES_REPO,
+                filename=info.config_path_in_repo,
+                cache_dir=cache_dir,
+            )
+        ).resolve()
+        shutil.copy(src, cfg_dst)
 
     return onnx_dst, cfg_dst

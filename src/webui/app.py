@@ -288,6 +288,7 @@ def _form_to_config_payload(form) -> dict:
             return default
 
     positive_phrases = [p.strip() for p in (form.get("positive_phrases", "") or "").splitlines() if p.strip()]
+    negative_phrases = [p.strip() for p in (form.get("negative_phrases", "") or "").splitlines() if p.strip()]
     voice_keys = form.getlist("piper_voice") if hasattr(form, "getlist") else form.get("piper_voice", [])
     if isinstance(voice_keys, str):
         voice_keys = [voice_keys]
@@ -301,7 +302,9 @@ def _form_to_config_payload(form) -> dict:
         "generation": {
             "positive_phrases": positive_phrases,
             "n_positive_per_phrase_per_voice": _int("n_positive_per_phrase_per_voice", 4),
-            "n_adversarial_phrases": _int("n_adversarial_phrases", 2000),
+            "negative_phrases": negative_phrases,
+            "n_negative_per_phrase_per_voice": _int("n_negative_per_phrase_per_voice", 4),
+            "n_adversarial_phrases": _int("n_adversarial_phrases", 3000),
             "n_adversarial_per_phrase_per_voice": _int("n_adversarial_per_phrase_per_voice", 1),
             "piper_voices": [{"voice_key": k} for k in voice_keys],
             "use_elevenlabs": _bool("use_elevenlabs"),

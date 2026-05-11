@@ -114,22 +114,26 @@ def _generate_samples(
     settings = get_settings()
     piper = PiperGenerator(use_cuda=False)
 
-    # Piper
+    # Piper - parallel across a process pool.
     if cfg.generation.piper_voices:
-        bus.phase(f"generate:piper:{label}", detail=f"{len(phrases)} phrases")
-        i = 0
-        target_total = (
-            len(cfg.generation.piper_voices)
-            * len(phrases)
-            * n_per_phrase_per_voice
-        )
-        for sample in piper.iter_samples(
+        tasks = piper.build_tasks(
             phrases=phrases,
             voice_selections=cfg.generation.piper_voices,
             n_per_phrase_per_voice=n_per_phrase_per_voice,
             cfg=cfg.generation,
             seed=hash((cfg.wake_word, label)) & 0xFFFFFFFF,
-        ):
+        )
+        target_total = len(tasks)
+        workers = settings.resolved_generation_workers()
+        bus.phase(
+            f"generate:piper:{label}",
+            detail=f"{len(phrases)} phrases, {target_total} synths, {workers} workers",
+        )
+        bus.log(
+            f"Piper {label}: {target_total} synths across {workers} workers"
+        )
+        i = 0
+        for sample in piper.iter_parallel(tasks, workers=workers):
             wav_path = out_dir / f"piper_{label}_{i:07d}.wav"
             write_wav(wav_path, sample.audio, sample.sample_rate)
             written.append(wav_path)
@@ -141,7 +145,16 @@ def _generate_samples(
                     detail=f"{i}/{target_total}",
                 )
             if state.cancel_flag.is_set():
+                # Breaking out of the iterator closes the pool via __exit__.
                 break
+        # Final progress emit so the UI shows 100% even when:
+        #   - some synths failed silently (i < target_total)
+        #   - the last batch did not hit the i % 25 == 0 boundary
+        # If the run was cancelled, leave the bar at its last partial value.
+        if not state.cancel_flag.is_set():
+            skipped = target_total - i
+            detail = f"{i}/{target_total}" + (f" ({skipped} skipped)" if skipped else "")
+            bus.progress(f"generate:piper:{label}", 1.0, detail=detail)
 
     # ElevenLabs (optional)
     if cfg.generation.use_elevenlabs and cfg.generation.elevenlabs_voice_ids:
@@ -175,6 +188,10 @@ def _generate_samples(
                     )
                 if state.cancel_flag.is_set():
                     break
+            if not state.cancel_flag.is_set():
+                skipped = target_total - j
+                detail = f"{j}/{target_total}" + (f" ({skipped} skipped)" if skipped else "")
+                bus.progress(f"generate:elevenlabs:{label}", 1.0, detail=detail)
 
     return written
 
@@ -344,21 +361,48 @@ def _run(cfg: TrainRunConfig) -> None:
         if state.cancel_flag.is_set():
             raise RuntimeError("cancelled")
 
-        # 2. Adversarial / negative phrases
+        # 2a. Hard negatives (user-supplied phrases the model must NOT trigger on).
+        # Synthesized with the same emphasis as positives so the model strongly
+        # learns to reject them.
+        negative_wavs: list[Path] = []
+        hard_negative_phrases = cfg.generation.negative_phrases or []
+        if hard_negative_phrases:
+            bus.phase(
+                "generate:hard_negatives",
+                detail=f"{len(hard_negative_phrases)} phrases",
+            )
+            negative_wavs.extend(
+                _generate_samples(
+                    hard_negative_phrases,
+                    run_dir / "wavs" / "negative",
+                    cfg,
+                    cfg.generation.n_negative_per_phrase_per_voice,
+                    label="hard_neg",
+                )
+            )
+            bus.log(f"Hard-negative WAVs generated: {len(negative_wavs)}")
+
+        if state.cancel_flag.is_set():
+            raise RuntimeError("cancelled")
+
+        # 2b. Auto-generated adversarial phrases (phonetic neighbors + generic
+        # conversational pool). These broaden the negative distribution.
         adv_phrases = build_adversarial_phrases(
             cfg.wake_word,
             cfg.generation.n_adversarial_phrases,
             seed=cfg.training.seed,
         )
         bus.phase("generate:adversarial", detail=f"{len(adv_phrases)} phrases")
-        negative_wavs = _generate_samples(
-            adv_phrases,
-            run_dir / "wavs" / "negative",
-            cfg,
-            cfg.generation.n_adversarial_per_phrase_per_voice,
-            label="neg",
+        negative_wavs.extend(
+            _generate_samples(
+                adv_phrases,
+                run_dir / "wavs" / "negative",
+                cfg,
+                cfg.generation.n_adversarial_per_phrase_per_voice,
+                label="adv",
+            )
         )
-        bus.log(f"Adversarial WAVs generated: {len(negative_wavs)}")
+        bus.log(f"Total negative WAVs (hard + adversarial): {len(negative_wavs)}")
 
         if state.cancel_flag.is_set():
             raise RuntimeError("cancelled")

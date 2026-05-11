@@ -54,6 +54,14 @@ class ModelTester:
             g = gcd(sample_rate, 16_000)
             audio_float32 = resample_poly(audio_float32, 16_000 // g, sample_rate // g).astype(np.float32)
 
+        # Pad short clips up to 3 s so we can produce at least one classifier
+        # window. Shorter inputs would otherwise return an empty score curve.
+        MIN_SAMPLES = 16_000 * 3
+        if audio_float32.size < MIN_SAMPLES:
+            padded = np.zeros(MIN_SAMPLES, dtype=np.float32)
+            padded[: audio_float32.size] = audio_float32.astype(np.float32)
+            audio_float32 = padded
+
         int16 = float32_to_int16(audio_float32)
         windows = self._extractor.classifier_inputs(int16)
         if windows.shape[0] == 0:

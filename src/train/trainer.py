@@ -65,6 +65,8 @@ def _make_loader(
     else:
         shuffle = True
 
+    # drop_last only on training: validation needs every sample, and small
+    # smoke-test val sets would otherwise be entirely dropped.
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -72,7 +74,7 @@ def _make_loader(
         shuffle=shuffle and sampler is None,
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=True,
+        drop_last=weighted,
         persistent_workers=workers > 0,
     )
 
@@ -97,7 +99,13 @@ def _evaluate(
             all_probs.append(p.detach().cpu().numpy())
             all_labels.append(y.detach().cpu().numpy())
     if not all_probs:
-        return {"loss": math.nan, "accuracy": 0.0, "recall_at_p95": 0.0, "fp_per_hour": 0.0}
+        return {
+            "loss": math.nan,
+            "accuracy": 0.0,
+            "recall_at_p95": 0.0,
+            "fp_per_hour": 0.0,
+            "threshold": 0.5,
+        }
     probs = np.concatenate(all_probs)
     labels = np.concatenate(all_labels)
     preds = (probs > 0.5).astype(np.int64)

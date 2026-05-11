@@ -150,7 +150,12 @@
           .map((s) => s.trim())
           .filter(Boolean),
         n_positive_per_phrase_per_voice: vNum("n_positive_per_phrase_per_voice", 4),
-        n_adversarial_phrases: vNum("n_adversarial_phrases", 2000),
+        negative_phrases: String(v("negative_phrases"))
+          .split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        n_negative_per_phrase_per_voice: vNum("n_negative_per_phrase_per_voice", 4),
+        n_adversarial_phrases: vNum("n_adversarial_phrases", 3000),
         n_adversarial_per_phrase_per_voice: vNum("n_adversarial_per_phrase_per_voice", 1),
         piper_voices: piperVoices,
         use_elevenlabs: vBool("use_elevenlabs"),

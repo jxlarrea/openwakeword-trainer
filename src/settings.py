@@ -89,7 +89,11 @@ class Settings(BaseSettings):
             p.mkdir(parents=True, exist_ok=True)
 
     def resolved_generation_workers(self) -> int:
-        return self.generation_workers or max(1, (os.cpu_count() or 2))
+        # Cap at 8 by default: each Piper worker has its own onnxruntime
+        # session that internally spawns more threads. More than 8 processes
+        # causes thread thrashing on most hosts (including DGX Spark's
+        # 20-core Grace CPU). Set OWW_GENERATION_WORKERS explicitly to override.
+        return self.generation_workers or min(8, max(1, (os.cpu_count() or 2)))
 
     def resolved_dataloader_workers(self) -> int:
         return self.dataloader_workers or min(8, max(1, (os.cpu_count() or 2)))

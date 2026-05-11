@@ -20,8 +20,22 @@ class GenerationConfig(BaseModel):
         default_factory=list,
         description="Phrases that should trigger the wake word. Usually variants of the wake word itself.",
     )
+    # Defaults tuned for the DGX Spark (GB10, 128 GB unified memory). Smaller
+    # hosts may want to reduce sample volume and batch size.
     n_positive_per_phrase_per_voice: int = 4
-    n_adversarial_phrases: int = 2000
+
+    # User-supplied hard negatives - phrases the model must NOT trigger on.
+    # Typical use: paste false-triggers observed in production
+    # (e.g. "hey google", "hey man"). Each is synthesized on every selected
+    # voice with the same emphasis as positives so the model strongly learns
+    # to reject them.
+    negative_phrases: list[str] = Field(
+        default_factory=list,
+        description="Hard-negative phrases observed to false-trigger. Same emphasis as positives.",
+    )
+    n_negative_per_phrase_per_voice: int = 4
+
+    n_adversarial_phrases: int = 3000
     n_adversarial_per_phrase_per_voice: int = 1
 
     piper_voices: list[VoiceSelection] = Field(default_factory=list)
@@ -57,7 +71,7 @@ class AugmentationConfig(BaseModel):
     gain_min_db: float = -12.0
     gain_max_db: float = 3.0
     mp3_compression_probability: float = 0.2
-    augmentations_per_clip: int = 3  # multiplies dataset size
+    augmentations_per_clip: int = 5  # multiplies dataset size (DGX Spark default)
 
 
 class DatasetConfig(BaseModel):
@@ -68,21 +82,22 @@ class DatasetConfig(BaseModel):
     use_musan_music: bool = True
     use_fsd50k: bool = True
     use_common_voice_negatives: bool = True
-    common_voice_subset: int = 10000  # cap streaming take
+    common_voice_subset: int = 15000  # DGX Spark default
 
 
 class TrainingConfig(BaseModel):
     """Classifier head + optimizer."""
 
+    # DGX Spark defaults: large batch, longer schedule, more patience.
     model_type: Literal["dnn", "rnn"] = "dnn"
     layer_dim: int = 128
     n_blocks: int = 1
     learning_rate: float = 1e-4
-    batch_size: int = 1024
-    max_steps: int = 50_000
+    batch_size: int = 2048
+    max_steps: int = 75_000
     val_every_n_steps: int = 500
     target_false_positives_per_hour: float = 0.2
-    early_stop_patience: int = 5
+    early_stop_patience: int = 8
     seed: int = 42
 
 

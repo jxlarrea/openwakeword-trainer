@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import requests
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from tqdm import tqdm
 
 from src.settings import get_settings
@@ -100,7 +100,6 @@ def download_mit_rirs(progress: ProgressCallback | None = None) -> Path:
         repo_id=MIT_RIRS_HF_REPO,
         repo_type="dataset",
         local_dir=str(target),
-        local_dir_use_symlinks=False,
     )
     if progress:
         progress("mit_rirs", 1.0)
@@ -173,68 +172,153 @@ def download_fsd50k(
     return target
 
 
-# -------- Common Voice 17 (streamed) --------
+# -------- Common Voice (direct tarball, no datasets library) --------
+#
+# The official mozilla-foundation/common_voice_17_0 dataset relies on a legacy
+# loading script that the modern `datasets` library no longer auto-resolves
+# under streaming=True. Community mirrors (fsicoli/...) also ship scripts that
+# are rejected by HF's parquet auto-converter. We therefore bypass `datasets`
+# entirely: pull tar shards directly via huggingface_hub, decode MP3 clips
+# with librosa+ffmpeg, and write 16 kHz mono WAVs.
+#
+# Mirror layout (verified): audio/<lang>/train/<lang>_train_<idx>.tar
 
-COMMON_VOICE_REPO = "mozilla-foundation/common_voice_17_0"
+COMMON_VOICE_MIRROR = "fsicoli/common_voice_17_0"
+
+
+def _decode_audio_blob_ffmpeg(blob: bytes, target_sr: int = 16_000) -> "np.ndarray | None":
+    """Decode an in-memory audio blob (MP3/OPUS/WAV/...) to mono float32 PCM.
+
+    Uses ffmpeg via subprocess. Fast and works for every container format.
+    Returns None on decode failure.
+    """
+    import subprocess
+
+    import numpy as np
+
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", "pipe:0",
+                "-f", "f32le",
+                "-ar", str(target_sr),
+                "-ac", "1",
+                "pipe:1",
+            ],
+            input=blob,
+            capture_output=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if not proc.stdout:
+        return None
+    return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
 def download_common_voice_subset(
     n_samples: int,
     language: str = "en",
     progress: ProgressCallback | None = None,
+    max_tars: int = 4,
 ) -> Path:
-    """Stream a subset of Common Voice clips and write them as 16 kHz wavs.
+    """Download ~n_samples Common Voice clips as 16 kHz mono WAVs.
 
-    Streaming avoids downloading the full ~80 GB English split. Caller needs an
-    HF token with the Common Voice ToS accepted (settings.hf_token).
+    Pulls tar shards from a community mirror, decodes each clip via ffmpeg, and
+    writes WAVs. Stops after writing ``n_samples`` files OR after fetching
+    ``max_tars`` shards (whichever comes first) - the cap prevents a runaway
+    when a shard yields zero decodable clips.
     """
-    import numpy as np
-    import soundfile as sf
-    from datasets import load_dataset
+    import tarfile
 
-    target = get_settings().common_voice_dir / language
+    import soundfile as sf
+
+    settings = get_settings()
+    target = settings.common_voice_dir / language
     if _is_complete(target):
         return target
     target.mkdir(parents=True, exist_ok=True)
 
-    settings = get_settings()
     token = settings.hf_token
+    if not token:
+        raise RuntimeError(
+            "Common Voice download requires HF_TOKEN in .env (or the env)."
+        )
 
-    logger.info("Streaming %d Common Voice clips (%s)", n_samples, language)
-    ds = load_dataset(
-        COMMON_VOICE_REPO,
-        language,
-        split="train",
-        streaming=True,
-        token=token,
-        trust_remote_code=True,
+    logger.info(
+        "Downloading up to %d Common Voice clips (%s) from %s (max_tars=%d)",
+        n_samples, language, COMMON_VOICE_MIRROR, max_tars,
     )
+    if progress:
+        progress("common_voice", 0.01)
 
+    audio_exts = (".mp3", ".opus", ".wav", ".flac", ".ogg")
     written = 0
     pbar = tqdm(total=n_samples, desc=f"common_voice:{language}")
-    for row in ds:
+
+    for tar_idx in range(max_tars):
         if written >= n_samples:
             break
-        audio = row.get("audio")
-        if not audio or audio.get("array") is None:
-            continue
-        arr = np.asarray(audio["array"], dtype=np.float32)
-        sr = int(audio.get("sampling_rate", 16_000))
-        if sr != 16_000:
-            from scipy.signal import resample_poly
-            from math import gcd
-            g = gcd(sr, 16_000)
-            arr = resample_poly(arr, 16_000 // g, sr // g).astype(np.float32)
-        out_path = target / f"cv_{written:07d}.wav"
-        sf.write(out_path, arr, 16_000, subtype="PCM_16")
-        written += 1
-        pbar.update(1)
-        if progress and written % 50 == 0:
-            progress("common_voice", written / max(1, n_samples))
+
+        tar_in_repo = f"audio/{language}/train/{language}_train_{tar_idx}.tar"
+        try:
+            tar_local = hf_hub_download(
+                repo_id=COMMON_VOICE_MIRROR,
+                filename=tar_in_repo,
+                repo_type="dataset",
+                token=token,
+                cache_dir=str(settings.common_voice_dir / ".hf_cache"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "No more CV shards available at tar_idx=%d (%s).", tar_idx, exc,
+            )
+            break
+
+        decoded_in_tar = 0
+        with tarfile.open(tar_local, "r") as tf:
+            for member in tf:
+                if written >= n_samples:
+                    break
+                if not member.isfile():
+                    continue
+                if not member.name.lower().endswith(audio_exts):
+                    continue
+                fobj = tf.extractfile(member)
+                if not fobj:
+                    continue
+                audio = _decode_audio_blob_ffmpeg(fobj.read())
+                if audio is None or audio.size < 16_000 // 2:  # < 0.5 s
+                    continue
+                out_path = target / f"cv_{written:07d}.wav"
+                sf.write(out_path, audio, 16_000, subtype="PCM_16")
+                written += 1
+                decoded_in_tar += 1
+                pbar.update(1)
+                if progress and written % 50 == 0:
+                    progress("common_voice", written / max(1, n_samples))
+        logger.info("Tar %d yielded %d clips", tar_idx, decoded_in_tar)
+        if decoded_in_tar == 0:
+            logger.warning(
+                "Tar %d yielded zero decodable clips. Stopping to avoid runaway downloads.",
+                tar_idx,
+            )
+            break
+
     pbar.close()
+    if written == 0:
+        raise RuntimeError(
+            "Common Voice downloader wrote zero clips - check HF_TOKEN, that "
+            f"https://huggingface.co/datasets/{COMMON_VOICE_MIRROR} is reachable, "
+            "and that ffmpeg is installed."
+        )
     _mark_complete(target)
     if progress:
         progress("common_voice", 1.0)
+    logger.info("Wrote %d Common Voice clips to %s", written, target)
     return target
 
 

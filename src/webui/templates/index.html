@@ -27,6 +27,17 @@
     </fieldset>
 
     <fieldset>
+      <legend>Negative phrases (hard negatives)</legend>
+      <textarea name="negative_phrases" rows="4"
+        placeholder="One phrase per line. Phrases the model must NOT trigger on, e.g. observed false-positives like 'hey google' or 'hey man'."></textarea>
+      <p class="hint">
+        Each is synthesized on every selected voice with the same emphasis as positives, so the
+        model strongly learns to reject them. Leave empty if you have not seen any false-triggers
+        in production yet.
+      </p>
+    </fieldset>
+
+    <fieldset>
       <legend>Piper voices (English)</legend>
       <div class="voice-controls">
         <button type="button" id="select-all-voices">Select all</button>
@@ -77,13 +88,13 @@
           <input type="number" name="n_positive_per_phrase_per_voice" value="4" min="1" max="32">
         </label>
         <label>Adversarial phrases
-          <input type="number" name="n_adversarial_phrases" value="2000" min="100" max="20000">
+          <input type="number" name="n_adversarial_phrases" value="3000" min="100" max="20000">
         </label>
         <label>Adversarial per phrase per voice
           <input type="number" name="n_adversarial_per_phrase_per_voice" value="1" min="1" max="8">
         </label>
         <label>Augmentations per clip
-          <input type="number" name="augmentations_per_clip" value="3" min="1" max="10">
+          <input type="number" name="augmentations_per_clip" value="5" min="1" max="10">
         </label>
       </div>
     </fieldset>
@@ -96,7 +107,7 @@
       <label class="inline"><input type="checkbox" name="use_fsd50k" checked> FSD50K background sounds</label>
       <label class="inline"><input type="checkbox" name="use_common_voice_negatives" checked> Common Voice negatives</label>
       <label>Common Voice subset size
-        <input type="number" name="common_voice_subset" value="10000" min="500" max="200000">
+        <input type="number" name="common_voice_subset" value="15000" min="500" max="200000">
       </label>
     </fieldset>
 
@@ -128,19 +139,19 @@
           <input type="number" name="n_blocks" value="1" min="1" max="6">
         </label>
         <label>Learning rate
-          <input type="number" name="learning_rate" value="0.0001" min="0.000001" max="0.01" step="0.00001">
+          <input type="number" name="learning_rate" value="0.0001" min="0.000001" max="0.01" step="any">
         </label>
         <label>Batch size
-          <input type="number" name="batch_size" value="1024" min="32" max="8192">
+          <input type="number" name="batch_size" value="2048" min="32" max="8192">
         </label>
         <label>Max steps
-          <input type="number" name="max_steps" value="50000" min="500" max="500000">
+          <input type="number" name="max_steps" value="75000" min="500" max="500000">
         </label>
         <label>Validate every N steps
           <input type="number" name="val_every_n_steps" value="500" min="50" max="10000">
         </label>
         <label>Early stop patience
-          <input type="number" name="early_stop_patience" value="5" min="1" max="50">
+          <input type="number" name="early_stop_patience" value="8" min="1" max="50">
         </label>
         <label>Target FP/hr
           <input type="number" name="target_false_positives_per_hour" value="0.2" min="0" max="10" step="0.05">

@@ -11,7 +11,10 @@
 # x86_64 host:               docker compose up trainer
 
 ARG CUDA_VERSION=12.8.0
-ARG UBUNTU_VERSION=24.04
+# Ubuntu 22.04 (Python 3.10 default) is used because tflite-runtime - a hard
+# dependency of openwakeword - has no aarch64 wheel past Python 3.11. On 24.04
+# the default Python is 3.12 and the pip install fails on the DGX Spark.
+ARG UBUNTU_VERSION=22.04
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS base
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -24,13 +27,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # System deps. libsndfile + ffmpeg are required for audiomentations / soundfile / mp3 augmentation.
 # espeak-ng is required by Piper for phoneme generation. git+curl needed for HF downloads.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-venv python3.12-dev python3-pip \
+        python3.10 python3.10-venv python3.10-dev python3-pip \
         build-essential pkg-config \
         ffmpeg libsndfile1 libsox-fmt-all sox \
         espeak-ng \
         curl ca-certificates git tini \
-    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
-    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Use a venv so PEP 668 (externally-managed) doesn't bite us on Ubuntu 24.04
