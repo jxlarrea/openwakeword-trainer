@@ -1,12 +1,5 @@
-<h1>
-  <p align="center">
-  <img
-    src="https://raw.githubusercontent.com/jxlarrea/openwakeword-trainer/refs/heads/main/src/assets/icon.png"
-    alt="Logo"
-    width="48"  
-    align="top"
-  /> OpenWakeWord Trainer
-  </p>
+<h1 align="center" style="border-bottom: none">
+   <img alt="OpenWakeWord Trainer" src="https://raw.githubusercontent.com/jxlarrea/openwakeword-trainer/refs/heads/main/src/assets/logo.png" width="650" />
 </h1>
 
 <p align="center">
