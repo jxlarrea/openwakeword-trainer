@@ -109,7 +109,7 @@ The top navigation has three pages:
 
 Basic training flow:
 
-1. Open **Trainer** and create or select a wake-word session (e.g. `hey jarvis`). The session id becomes the stable run/model id (`hey_jarvis`).
+1. Open **Trainer** and create or select a wake-word session. The session name is an arbitrary stable id such as `ok_nabu_v2`; the wake word is the actual phrase to detect, such as `ok nabu`.
 2. Paste positive phrases (5 to 10 spelling/pronunciation variants of the wake word).
 3. Optionally paste negative phrases (false-triggers observed in production).
 4. Review voices. High/medium Piper voices and the best Kokoro voices are selected by default; click **Select all** if you want every available voice.
@@ -235,7 +235,7 @@ Plan for 120 GB+ on a healthy `/data` mount if you enable all corpora and keep s
 
 The header includes three primary pages:
 
-- **Trainer** (`/`): session selection, run configuration, start/cancel, persistent progress, metrics, logs, and live system telemetry.
+- **Trainer** (`/`): session selection/creation, run configuration, start/cancel, persistent progress, metrics, logs, and live system telemetry.
 - **Tester** (`/tester`): exported model downloads and audio scoring.
 - **System** (`/system`): session inventory, disk usage, and cleanup actions.
 
@@ -244,15 +244,16 @@ The header includes three primary pages:
 #### Session
 
 - **Wake-word session** selects an existing durable run. Existing `/data/runs/<id>` directories with `session.json` or `config.json` appear here.
-- **Create session** asks for the wake word once. The trainer slugifies it (`ok nabu` -> `ok_nabu`) and uses that as the stable run/model id.
+- **Create session** asks for two values: a session name and the actual wake word. The session name becomes the stable cache/model id (`ok_nabu_v2`), while the wake word remains the phrase the model should detect (`ok nabu`).
+- Explicit session names cannot overwrite an existing session. Create a new name for each experiment so older models remain available for comparison.
 - **Delete session** removes `/data/runs/<session_id>`, `/data/models/<session_id>.onnx`, and `/data/models/<session_id>.zip`.
 - Selecting a session fills the form with the last saved config and shows its cache/model status.
 - While any training run is active, session creation/deletion is locked so two sessions cannot train at the same time.
 
 #### Configure training run
 
-- **Wake word** is set by the session and kept read-only so cached data stays attached to the correct wake word.
-- **Run name** is the session id and is also read-only. This keeps the output model, package, and run directory stable across retries.
+- **Wake word** is set when the session is created and kept read-only so cached data stays attached to the correct phrase.
+- **Session / model name** is the session id and is also read-only. This keeps the output model, package, and run directory stable across retries.
 - **Positive phrases** (left column) are TTS'd as positive samples. 5 to 10 spelling variants is the sweet spot. Empty defaults to the wake word itself.
 - **Negative phrases (hard negatives)** (right column) are TTS'd as **negative** samples with the same emphasis as positives. Paste any false-trigger phrases you observed in production. This is the most important knob for v2+ models.
 - **Piper voices**: high/medium voices are selected by default; select all, none, or high-quality-only as needed. Use the search box to narrow. Multi-speaker voices like `en_US-libritts-high` cover hundreds of speakers per voice.

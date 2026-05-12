@@ -14,6 +14,7 @@
   const sessionSelect = $("#session-select");
   const createSessionBtn = $("#create-session-btn");
   const deleteSessionBtn = $("#delete-session-btn");
+  const newSessionName = $("#new-session-name");
   const newSessionWakeWord = $("#new-session-wake-word");
   const sessionSummary = $("#session-summary");
   const configCard = $("#config");
@@ -68,6 +69,7 @@
 
   function setSessionControlsLocked(locked) {
     if (sessionSelect) sessionSelect.disabled = locked;
+    if (newSessionName) newSessionName.disabled = locked;
     if (newSessionWakeWord) newSessionWakeWord.disabled = locked;
     if (createSessionBtn) createSessionBtn.disabled = locked;
     if (deleteSessionBtn) deleteSessionBtn.disabled = locked || !currentSession;
@@ -193,7 +195,7 @@
     if (deleteSessionBtn) deleteSessionBtn.disabled = runStatus === "running";
     if (sessionSummary) {
       sessionSummary.textContent =
-        `${session.wake_word} (${session.id}) - cache ${fmtBytes(session.size_bytes || 0)}` +
+        `${session.id} - wake word "${session.wake_word}" - cache ${fmtBytes(session.size_bytes || 0)}` +
         (session.has_model ? " - model ready" : "");
     }
   }
@@ -206,7 +208,7 @@
     sessions.forEach((s) => {
       const opt = document.createElement("option");
       opt.value = s.id;
-      opt.textContent = `${s.wake_word}${s.has_model ? " - model ready" : ""}`;
+      opt.textContent = `${s.id} - ${s.wake_word}${s.has_model ? " - model ready" : ""}`;
       sessionSelect.appendChild(opt);
     });
     if (selectId) {
@@ -232,7 +234,12 @@
 
   sessionSelect?.addEventListener("change", (e) => loadSession(e.target.value));
   createSessionBtn?.addEventListener("click", async () => {
+    const sessionName = newSessionName?.value?.trim();
     const wake = newSessionWakeWord?.value?.trim();
+    if (!sessionName) {
+      newSessionName?.focus();
+      return;
+    }
     if (!wake) {
       newSessionWakeWord?.focus();
       return;
@@ -240,20 +247,21 @@
     const res = await fetch("/api/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ wake_word: wake }),
+      body: JSON.stringify({ session_id: sessionName, wake_word: wake }),
     });
     if (!res.ok) {
       alert(await res.text());
       return;
     }
     const session = await res.json();
+    if (newSessionName) newSessionName.value = "";
     if (newSessionWakeWord) newSessionWakeWord.value = "";
     await refreshSessions(session.id);
   });
   deleteSessionBtn?.addEventListener("click", async () => {
     if (!currentSession) return;
     const ok = confirm(
-      `Delete session "${currentSession.wake_word}" and all cached WAVs/features/checkpoints?`
+      `Delete session "${currentSession.id}" for wake word "${currentSession.wake_word}" and all cached WAVs/features/checkpoints?`
     );
     if (!ok) return;
     const res = await fetch(`/api/sessions/${encodeURIComponent(currentSession.id)}`, {
@@ -1094,7 +1102,7 @@
         if (sessionSelect) sessionSelect.value = s.run_id;
         await loadSession(s.run_id);
         if (sessionSummary) {
-          sessionSummary.textContent = `${s.wake_word || s.run_id} (${s.run_id}) - training in progress`;
+          sessionSummary.textContent = `${s.run_id} - wake word "${s.wake_word || s.run_id}" - training in progress`;
         }
       }
       progressRunId = s.progress?.run_id || s.run_id || progressRunId;

@@ -8,14 +8,17 @@
       <select id="session-select">
         <option value="">Create or select a session...</option>
         {% for s in sessions %}
-          <option value="{{ s.id }}">{{ s.wake_word }}{% if s.has_model %} - model ready{% endif %}</option>
+          <option value="{{ s.id }}">{{ s.id }} - {{ s.wake_word }}{% if s.has_model %} - model ready{% endif %}</option>
         {% endfor %}
       </select>
       <small class="hint">A session owns the cached WAVs, features, checkpoints, and model for one wake word.</small>
     </label>
     <div class="session-actions">
-      <label>New session
-        <input type="text" id="new-session-wake-word" placeholder="new wake word, e.g. hey jarvis">
+      <label>New session name
+        <input type="text" id="new-session-name" placeholder="e.g. ok_nabu_v2">
+      </label>
+      <label>Wake word
+        <input type="text" id="new-session-wake-word" placeholder="e.g. ok nabu">
       </label>
       <button type="button" class="primary" id="create-session-btn">Create session</button>
       <button type="button" class="danger" id="delete-session-btn" disabled>Delete session</button>
@@ -33,12 +36,12 @@
       <label>Wake word <span class="req">*</span>
         <input type="text" name="wake_word" id="wake-word-input" required readonly placeholder="Select a session first"
                value="{{ state.wake_word or '' }}">
-        <small class="hint">Set when the session is created.</small>
+        <small class="hint">The phrase the model should detect. Set when the session is created.</small>
       </label>
-      <label>Run name
+      <label>Session / model name
         <input type="text" name="run_name" id="run-name-input"
                placeholder="session id" readonly>
-        <small class="hint">Stable session/model id. Cached data is reused under this name.</small>
+        <small class="hint">Stable id for cached data and exported artifacts. Example: ok_nabu_v2.</small>
       </label>
     </div>
 

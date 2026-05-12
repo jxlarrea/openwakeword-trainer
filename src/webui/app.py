@@ -201,7 +201,11 @@ def register_routes(api: APIRouter) -> None:
             raise HTTPException(status_code=409, detail="Cannot create a session while training is running.")
         payload = await request.json()
         try:
-            return create_session((payload or {}).get("wake_word", ""))
+            payload = payload or {}
+            return create_session(
+                payload.get("wake_word", ""),
+                payload.get("session_id") or payload.get("session_name"),
+            )
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

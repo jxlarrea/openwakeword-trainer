@@ -74,12 +74,19 @@ def _config_for_session(wake_word: str, session_id: str) -> dict[str, Any]:
     }
 
 
-def create_session(wake_word: str) -> dict[str, Any]:
+def create_session(wake_word: str, session_id: str | None = None) -> dict[str, Any]:
     wake_word = wake_word.strip()
-    sid = slugify(wake_word)
-    if not wake_word or not sid:
+    explicit_session_id = session_id is not None and bool(str(session_id).strip())
+    sid = slugify(session_id or wake_word)
+    if not wake_word:
         raise ValueError("Wake word is required")
+    if not sid:
+        raise ValueError("Session name is required")
     path = session_dir(sid)
+    if explicit_session_id and (
+        (path / "session.json").exists() or (path / "config.json").exists()
+    ):
+        raise ValueError(f"Session '{sid}' already exists. Select it from the session list instead.")
     path.mkdir(parents=True, exist_ok=True)
     now = time.time()
     existing = _read_json(path / "session.json") or {}

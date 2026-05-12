@@ -46,9 +46,14 @@ code {
   background: rgb(1, 4, 9);
   border-bottom: 1px solid var(--border);
 }
-.brand { display: flex; align-items: center; gap: 10px; }
-.brand-icon { width: 28px; height: 28px; border-radius: 6px; }
-.topbar h1 { font-size: 18px; margin: 0; }
+.brand { display: flex; align-items: center; min-width: 0; }
+.brand-logo {
+  display: block;
+  width: auto;
+  height: 40px;
+  max-width: min(360px, 48vw);
+  object-fit: contain;
+}
 
 .main-nav {
   display: flex;
@@ -138,12 +143,13 @@ body.run-active #progress {
 }
 .session-actions {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto auto;
-  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
   align-items: end;
 }
 .session-actions button {
-  min-height: 36px;
+  width: 100%;
+  min-height: 40px;
   white-space: nowrap;
 }
 .session-summary {
