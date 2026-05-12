@@ -1,10 +1,23 @@
-# OpenWakeWord Trainer
+<h1>
+  <p align="center">
+  <img
+    src="https://raw.githubusercontent.com/jxlarrea/openwakeword-trainer/refs/heads/main/src/assets/icon.png"
+    alt="Logo"
+    width="48"  
+    align="top"
+  /> OpenWakeWord Trainer
+  </p>
+</h1>
+
+<p align="center">
+<img src="https://img.shields.io/github/stars/jxlarrea/openwakeword-trainer?style=for-the-badge&label=Stars&color=yellow" alt="Stars">
+<a href="https://github.com/jxlarrea/openwakeword-trainer/releases"><img src="https://shields.io/github/v/release/jxlarrea/openwakeword-trainer?style=for-the-badge&color=purple" alt="version"></a>
+<a href="https://buymeacoffee.com/jxlarrea"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
+</p>
 
 A Dockerized, GPU-accelerated trainer for [openWakeWord](https://github.com/dscripka/openWakeWord) custom models with a Web UI. Generates synthetic positives and hard negatives with [Piper](https://github.com/OHF-Voice/piper1-gpl) (and optional ElevenLabs voices), pulls real-world augmentation corpora (MIT IR Survey, MUSAN, FSD50K, Common Voice), uses the official openWakeWord ACAV100M/validation negative feature banks, trains a small classifier head on top of Google's frozen speech-embedding model, and exports an ONNX model that drops into the openWakeWord runtime.
 
 Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but the same image runs on any NVIDIA host with CUDA 12.8 drivers.
-
-![by Xavier Larrea](https://img.shields.io/badge/by-Xavier%20Larrea-blue)
 
 ## Highlights
 
