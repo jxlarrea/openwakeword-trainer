@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section id="test" class="card">
+  <h2>Tester</h2>
+  <form id="test-form">
+    <div class="grid">
+      <label class="span-2">Model
+        <select id="test-model" name="model_name" required>
+          {% for m in models %}
+            <option
+              value="{{ m.name }}"
+              data-size="{{ m.size }}"
+              data-package-name="{{ m.package_name or '' }}"
+              data-package-size="{{ m.package_size or '' }}"
+            >{{ m.name }}</option>
+          {% endfor %}
+        </select>
+        <small class="hint">Trained models live at <code>/data/models/&lt;name&gt;.onnx</code>.</small>
+      </label>
+      <label>Threshold
+        <input type="number" id="test-threshold" name="threshold" value="0.5" min="0" max="1" step="0.01">
+        <small class="hint">Score above this triggers a detection. Lower = more sensitive.</small>
+      </label>
+    </div>
+
+    <div class="actions test-actions">
+      <button type="button" id="download-model-btn" class="primary">Download .onnx</button>
+      <button type="button" id="download-package-btn" class="primary">Download package</button>
+      <button type="button" id="refresh-models-btn">Refresh list</button>
+      <span id="model-info" class="pill"></span>
+    </div>
+
+    <div class="grid">
+      <label class="span-2">Upload audio (wav, mp3, flac)
+        <input type="file" id="test-audio-file" name="audio" accept="audio/*">
+        <small class="hint">Or record below.</small>
+      </label>
+    </div>
+
+    <div class="actions test-actions">
+      <button type="button" id="record-btn" class="primary">Record from mic</button>
+      <button type="button" id="stop-record-btn" class="danger" disabled>Stop recording</button>
+      <button type="submit" class="primary">Run test on selected audio</button>
+      <span id="mic-hint" class="pill"></span>
+    </div>
+  </form>
+  <div id="test-result"></div>
+</section>
+
+{% endblock %}

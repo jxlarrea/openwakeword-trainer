@@ -15,7 +15,7 @@
 <a href="https://buymeacoffee.com/jxlarrea"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 </p>
 
-A Dockerized, GPU-accelerated trainer for [openWakeWord](https://github.com/dscripka/openWakeWord) custom models with a Web UI. Generates synthetic positives and hard negatives with [Piper](https://github.com/OHF-Voice/piper1-gpl) (and optional ElevenLabs voices), pulls real-world augmentation corpora (MIT IR Survey, BUT ReverbDB, MUSAN, FSD50K, Common Voice), uses the official openWakeWord ACAV100M/validation negative feature banks, trains a small classifier head on top of Google's frozen speech-embedding model, and exports an ONNX model that drops into the openWakeWord runtime.
+A Dockerized, GPU-accelerated trainer for [openWakeWord](https://github.com/dscripka/openWakeWord) custom models with a Web UI. Generates synthetic positives and hard negatives with [Piper](https://github.com/OHF-Voice/piper1-gpl), high-quality local positives with [Kokoro](https://github.com/hexgrad/kokoro), and optional ElevenLabs voices, pulls real-world augmentation corpora (MIT IR Survey, BUT ReverbDB, MUSAN, FSD50K, Common Voice), uses the official openWakeWord ACAV100M/validation negative feature banks, trains a small classifier head on top of Google's frozen speech-embedding model, and exports an ONNX model that drops into the openWakeWord runtime.
 
 Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but the same image runs on any NVIDIA host with CUDA 12.8 drivers.
 
@@ -23,11 +23,13 @@ Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but th
 
 - **GPU end-to-end.** Feature extraction (Google speech-embedding ONNX) runs on the GPU via `onnxruntime-gpu` (public wheel on amd64, source-built on aarch64). PyTorch trains the classifier head on the same device.
 - **Parallel TTS.** Piper synthesis runs across a process pool (10 workers x 2 ORT threads on DGX Spark by default) so generating ~100k clips takes ~20 min instead of ~4 hours.
+- **Kokoro positives.** Kokoro is enabled by default as an additive high-quality local TTS source for positive wake-word phrases.
 - **Session-based workflow.** Create or select a wake-word session first. A session owns `/data/runs/<session_id>`, so cached WAVs, features, checkpoints, config, and model naming are reused on later visits.
 - **Resumable pipeline.** Every long phase drops sentinels: WAV generation is cached per session, corpora downloads are sentinel-marked, feature extraction checkpoints completed clips, and re-running a failed run skips work that was already done.
 - **Far-field tablet robustness.** BUT ReverbDB RIRs plus tablet far-field augmentation are enabled by default to simulate distant/off-axis single-mic capture, muffling, low level, early reflections, and light device compression.
 - **Hard-negative iteration.** Paste false-triggers you saw in production into the "Negative phrases" field; they get synthesized with the same emphasis as positives so the next model strongly rejects them.
 - **Official negative feature banks.** ACAV100M generic negatives are added to training, and the official openWakeWord validation negatives are used for FP/hr calibration.
+- **Quality-first defaults.** The default UI settings are tuned from tablet testing to produce high-quality, low-false-positive models without extra knob turning.
 - **False-positive guarded export.** The trainer calibrates the validated threshold into the exported ONNX and refuses to publish models that miss the configured recall/FP/hr gates.
 - **Live progress.** Web UI shows phase banner, multiple progress bars, validation metrics, and a streaming log fed by every module's `logger.info` calls.
 - **Live system telemetry.** CPU, RAM, GPU utilization, GPU temperature, and VRAM (when reported by `nvidia-smi`) stream into the progress panel.
@@ -80,7 +82,7 @@ Open http://localhost:8000.
 1. Create or select a wake-word session (e.g. `hey jarvis`). The session id becomes the stable run/model id (`hey_jarvis`).
 2. Paste positive phrases (5 to 10 spelling/pronunciation variants of the wake word).
 3. Optionally paste negative phrases (false-triggers observed in production).
-4. Pick voices. Click **Select all** or **High quality only**.
+4. Pick voices. High/medium Piper voices and the best Kokoro voices are selected by default; click **Select all** if you want every available voice.
 5. Confirm augmentation corpora. The openWakeWord ACAV100M, validation feature bank, BUT ReverbDB, and tablet far-field augmentation are enabled by default and strongly recommended for tablet deployments.
 6. Click **Start training**. Live progress and system telemetry stream into the panel below.
 7. When done, click **Download .onnx** in section 4. The model also stays at `/opt/models/openwakeword-trainer/models/<session_id>.onnx` on the host (or inside the docker volume if you didn't set `OWW_DATA_DIR_HOST`).
@@ -187,7 +189,7 @@ Inside `/data`:
 | BUT ReverbDB RIR-only release | ~9 GB download, larger after extraction |
 | MUSAN (noise + music + speech) | ~26 GB |
 | FSD50K dev + eval (clips/) | ~34 GB |
-| Common Voice subset (15k clips) | ~3-5 GB |
+| Common Voice subset (20k clips) | ~4-6 GB |
 | openWakeWord ACAV100M feature bank | ~17 GB |
 | openWakeWord validation feature bank | ~177 MB |
 | Cached Piper voice models | ~120 MB per multi-speaker voice, ~60 MB per single-speaker |
@@ -211,7 +213,8 @@ Plan for 120 GB+ on a healthy `/data` mount if you enable all corpora and keep s
 - **Run name** is the session id and is also read-only. This keeps the output model and run directory stable across retries.
 - **Positive phrases** (left column) are TTS'd as positive samples. 5 to 10 spelling variants is the sweet spot. Empty defaults to the wake word itself.
 - **Negative phrases (hard negatives)** (right column) are TTS'd as **negative** samples with the same emphasis as positives. Paste any false-trigger phrases you observed in production. This is the most important knob for v2+ models.
-- **Piper voices**: select all, none, or high-quality-only. Use the search box to narrow. Multi-speaker voices like `en_US-libritts-high` cover hundreds of speakers per voice.
+- **Piper voices**: high/medium voices are selected by default; select all, none, or high-quality-only as needed. Use the search box to narrow. Multi-speaker voices like `en_US-libritts-high` cover hundreds of speakers per voice.
+- **Kokoro voices**: enabled by default for positive phrases. Use **Best quality** to keep only the strongest Kokoro voices if you want less synthesis volume.
 - **ElevenLabs** (only if `ELEVENLABS_API_KEY` is set in `.env`): adds external voice diversity. Note: costs per character; recommended only for positive phrases.
 - **Sample volume**: per-phrase reps, adversarial-pool size, augmentations-per-clip. Defaults are tuned for DGX Spark.
 - **Augmentation corpora**: each toggle has a hint. At least one corpus must be enabled. BUT ReverbDB adds measured far-field room impulse responses. ACAV100M adds generic negative training windows; the openWakeWord validation bank is used for low-FP threshold calibration.
@@ -237,6 +240,10 @@ The Start button is hidden while a run is in progress, and the Cancel button is 
 - **Record from mic** is disabled unless the page is served over HTTPS or from `localhost` (browser API requirement). The pill shows "mic disabled - HTTPS required" when it cannot run.
 - **Run test** uploads the audio, scores it through the selected model, and shows max / mean score, detection count, and a score curve chart.
 
+## Example trained models
+
+The `trained-models/` folder contains ONNX models trained with this project. Use them as examples of the exported artifact format, or copy one into your openWakeWord runtime to test it directly.
+
 ## Hard-negative iteration workflow
 
 The intended dev loop for a production-quality model:
@@ -261,10 +268,14 @@ The trainer optimizes for low false positives, not just low validation loss:
 
 - Negative samples are weighted more heavily than positives.
 - Negatives that currently score above the hard-negative threshold receive extra loss weight.
-- After normal early stop, the trainer mines the top-scoring false-positive windows from the training shard and fine-tunes on them.
+- Weighted BCE is normalized by total sample weight so changing class weights does not also change the effective learning rate.
+- Post-training hard-negative fine-tuning is available but disabled by default; the base loss already applies moderate hard-negative pressure during normal training.
 - Validation reports both `recall@p95` and `recall@targetFP`.
 - Export is refused unless the best checkpoint meets the configured minimum recall and FP/hr requirements.
+- The shipped default export gate is `0.5` FP/hr with `0.62` minimum recall at that target FP rate.
+- Low-quality runs still produce logs and diagnostics, but they are not exported or published as usable models.
 - The selected operating threshold is baked into the exported ONNX so a runtime threshold of `0.5` maps to the validated threshold.
+- Successful runs publish both `/data/models/<session>.onnx` and `/data/models/<session>.zip`. The zip contains the ONNX model, `training_config.json`, `checkpoint.pt`, and `checkpoint_metadata.json`.
 
 ## HTTP endpoints
 
@@ -306,6 +317,7 @@ All settable via `.env` in the repo root. Defaults are in `src/settings.py` and 
 | `OWW_PIPER_USE_CUDA` | true | Run Piper TTS on GPU |
 | `OWW_PIPER_MAX_TASKS_PER_CHILD` | 250 | Recycle Piper workers periodically to release native/CUDA memory |
 | `OWW_PIPER_RELEASE_AFTER_SYNTH` | false | Strict per-synth Piper cache release; much slower |
+| `OWW_KOKORO_DEVICE` | cuda | Torch device for Kokoro TTS; CUDA uses Kokoro's custom STFT path to avoid complex-kernel JIT issues on newer GPUs |
 | `OWW_DATALOADER_WORKERS` | 0 (auto: `min(8, cpu_count)`) | PyTorch DataLoader workers |
 | `HF_TOKEN` | (none) | Hugging Face token; required for Common Voice |
 | `ELEVENLABS_API_KEY` | (none) | Optional, unlocks ElevenLabs voices |
@@ -314,13 +326,14 @@ Defaults pair `workers * threads = 20` to match DGX Spark's 20 Grace cores exact
 
 ## Tuning for quality
 
-Defaults are tuned for "extremely high quality" on the DGX Spark. Further knobs:
+Defaults are tuned for high-quality, low-false-positive models on the DGX Spark, including noisy/far-field tablet use. Further knobs:
 
 - **More voices, more accents.** Toggle every English Piper voice. Enable ElevenLabs (`ELEVENLABS_API_KEY`) for additional accent variations.
+- **Use Kokoro for natural positives.** Kokoro is on by default with 2 positive renders per phrase/voice. Enable Kokoro hard negatives only for short, important false-trigger phrases.
 - **More augmentations per clip.** Bump from 5 to 8. Each WAV becomes more variants, forcing the classifier to learn channel-invariant cues. Linearly grows feature-extraction time.
 - **Tablet / far-field deployments.** BUT ReverbDB, Tablet far-field augmentation, `RIR p = 0.9`, and 6 augmentations per clip are the defaults. Increase tablet far-field probability toward `0.8` for harsher off-axis environments.
 - **More adversarial phrases.** From 3,000 to 10,000+. The main failure mode of a wake-word classifier is firing on phonetically-similar phrases.
-- **More Common Voice.** 15k is enough to learn "real human speech is not the wake word"; 50k+ helps with rare-accent generalization.
+- **More Common Voice.** 20k is the default speech-negative pool; 50k+ helps with rare-accent generalization.
 - **Keep ACAV100M and validation negatives enabled.** They are the biggest generic false-positive guardrail and make FP/hr calibration meaningful.
 - **Higher batch size** on big GPUs (DGX Spark handles 4096+).
 

@@ -176,7 +176,6 @@ class CombinedFeatureDataset(Dataset):
                 part[valid] += source_base
                 if valid.any():
                     source_base = int(part[valid].max()) + 1
-            part[labels == 0] = -1
             source_parts.append(part)
         self.source_ids = np.concatenate(source_parts)
 

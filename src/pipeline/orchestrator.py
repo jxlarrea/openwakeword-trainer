@@ -19,6 +19,7 @@ import logging
 import hashlib
 import threading
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -55,6 +56,7 @@ from src.settings import get_settings
 from src.train.progress import bus
 from src.train.trainer import train as run_training
 from src.tts.elevenlabs_generator import ElevenLabsGenerator
+from src.tts.kokoro_generator import KokoroGenerator
 from src.tts.piper_generator import PiperGenerator
 
 logger = logging.getLogger(__name__)
@@ -109,6 +111,38 @@ def _save_config(run_dir: Path, cfg: TrainRunConfig) -> None:
     (run_dir / "config.json").write_text(cfg.model_dump_json(indent=2))
 
 
+def _write_model_package(
+    *,
+    run_id: str,
+    run_dir: Path,
+    final_onnx_path: Path,
+    result_path: Path,
+    package_path: Path,
+) -> Path:
+    """Create a portable zip with the model, exact config, and checkpoint."""
+
+    package_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = package_path.with_suffix(package_path.suffix + ".tmp")
+    tmp_path.unlink(missing_ok=True)
+
+    checkpoint_path = run_dir / "best.pt"
+    config_path = run_dir / "config.json"
+    if not checkpoint_path.exists():
+        raise RuntimeError(f"Cannot package model; missing checkpoint {checkpoint_path}")
+    if not config_path.exists():
+        raise RuntimeError(f"Cannot package model; missing config {config_path}")
+
+    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(final_onnx_path, arcname=f"{run_id}.onnx")
+        zf.write(config_path, arcname="training_config.json")
+        zf.write(checkpoint_path, arcname="checkpoint.pt")
+        if result_path.exists():
+            zf.write(result_path, arcname="checkpoint_metadata.json")
+
+    tmp_path.replace(package_path)
+    return package_path
+
+
 def _phrases_signature(
     phrases: list[str],
     n_per_phrase_per_voice: int,
@@ -149,6 +183,27 @@ def _generate_samples(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     sentinel = out_dir / f".generated_{label}"
+    existing_patterns = (f"piper_{label}_*.wav", f"el_{label}_*.wav")
+
+    def existing_wavs() -> list[Path]:
+        files: list[Path] = []
+        for pattern in existing_patterns:
+            files.extend(out_dir.glob(pattern))
+        return sorted(files)
+
+    def purge_existing_wavs(reason: str) -> None:
+        old = existing_wavs()
+        if old:
+            bus.log(
+                f"Removing {len(old):,} stale cached WAVs for label={label} ({reason})",
+                level="warning",
+            )
+        for old_wav in old:
+            try:
+                old_wav.unlink()
+            except FileNotFoundError:
+                pass
+
     sig = _phrases_signature(
         phrases,
         n_per_phrase_per_voice,
@@ -156,38 +211,93 @@ def _generate_samples(
         cfg.generation.use_elevenlabs,
         cfg.generation.elevenlabs_voice_ids,
     )
-    if sentinel.exists():
-        cached = sentinel.read_text().strip()
-        if cached == sig:
-            existing = sorted(out_dir.glob(f"*_{label}_*.wav"))
-            if existing:
-                bus.log(
-                    f"Reusing {len(existing)} cached WAVs for label={label} "
-                    f"(signature match)"
-                )
-                return existing
-        else:
-            bus.log(
-                f"Phrases/voices changed since last run for label={label} "
-                f"- regenerating (sig {cached[:8]}.. -> {sig[:8]}..)",
-                level="warning",
-            )
-
-    written: list[Path] = []
 
     settings = get_settings()
     piper = PiperGenerator(use_cuda=settings.piper_use_cuda)
-
-    # Piper - parallel across a process pool.
-    if cfg.generation.piper_voices:
-        tasks = piper.build_tasks(
+    piper_tasks = (
+        piper.build_tasks(
             phrases=phrases,
             voice_selections=cfg.generation.piper_voices,
             n_per_phrase_per_voice=n_per_phrase_per_voice,
             cfg=cfg.generation,
             seed=hash((cfg.wake_word, label)) & 0xFFFFFFFF,
         )
-        target_total = len(tasks)
+        if cfg.generation.piper_voices
+        else []
+    )
+    expected_total = len(piper_tasks)
+    if (
+        cfg.generation.use_elevenlabs
+        and cfg.generation.elevenlabs_voice_ids
+        and settings.elevenlabs_api_key
+    ):
+        expected_total += (
+            len(cfg.generation.elevenlabs_voice_ids)
+            * len(phrases)
+            * n_per_phrase_per_voice
+        )
+
+    if sentinel.exists():
+        cached = sentinel.read_text().strip()
+        if cached == sig:
+            existing = existing_wavs()
+            if existing and len(existing) == expected_total:
+                bus.log(
+                    f"Reusing {len(existing)} cached WAVs for label={label} "
+                    f"(signature match)"
+                )
+                return existing
+            if existing:
+                if len(existing) > expected_total:
+                    stale = existing[expected_total:]
+                    bus.log(
+                        f"Trimming {len(stale):,} extra cached WAVs for label={label} "
+                        f"(expected {expected_total:,}, found {len(existing):,})",
+                        level="warning",
+                    )
+                    for old_wav in stale:
+                        try:
+                            old_wav.unlink()
+                        except FileNotFoundError:
+                            pass
+                    existing = existing_wavs()
+                    if len(existing) == expected_total:
+                        return existing
+                purge_existing_wavs(
+                    f"expected {expected_total:,}, found {len(existing):,}"
+                )
+        else:
+            bus.log(
+                f"Phrases/voices changed since last run for label={label} "
+                f"- regenerating (sig {cached[:8]}.. -> {sig[:8]}..)",
+                level="warning",
+            )
+            purge_existing_wavs("signature changed")
+    else:
+        purge_existing_wavs("missing signature")
+
+    written: list[Path] = []
+
+    def write_sample_metadata(wav_path: Path, sample, engine: str) -> None:
+        metadata_path = wav_path.with_suffix(".json")
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "engine": engine,
+                    "label": label,
+                    "text": sample.text,
+                    "voice": sample.voice,
+                    "sample_rate": sample.sample_rate,
+                    "metadata": sample.metadata,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+
+    # Piper - parallel across a process pool.
+    if piper_tasks:
+        target_total = len(piper_tasks)
         workers = settings.resolved_generation_workers()
         bus.phase(
             f"generate:piper:{label}",
@@ -199,9 +309,10 @@ def _generate_samples(
         i = 0
         loop_start_t = time.monotonic()
         last_log_t = loop_start_t
-        for sample in piper.iter_parallel(tasks, workers=workers):
+        for sample in piper.iter_parallel(piper_tasks, workers=workers):
             wav_path = out_dir / f"piper_{label}_{i:07d}.wav"
             write_wav(wav_path, sample.audio, sample.sample_rate)
+            write_sample_metadata(wav_path, sample, "piper")
             written.append(wav_path)
             i += 1
             if i % 25 == 0:
@@ -257,6 +368,7 @@ def _generate_samples(
             ):
                 wav_path = out_dir / f"el_{label}_{j:07d}.wav"
                 write_wav(wav_path, sample.audio, sample.sample_rate)
+                write_sample_metadata(wav_path, sample, "elevenlabs")
                 written.append(wav_path)
                 j += 1
                 if j % 10 == 0:
@@ -275,7 +387,189 @@ def _generate_samples(
     # Drop sentinel only if we successfully reached this point without cancel.
     # Content = phrase-list signature so a phrase change forces regeneration.
     if not state.cancel_flag.is_set() and written:
+        if len(written) < expected_total:
+            bus.log(
+                f"Generated {len(written):,}/{expected_total:,} WAVs for label={label}; "
+                "leaving cache unsatisfied so the next run can retry missing synths.",
+                level="warning",
+            )
+            sentinel.unlink(missing_ok=True)
+            return written
         sentinel.write_text(sig)
+
+    return written
+
+
+def _kokoro_signature(
+    phrases: list[str],
+    n_per_phrase_per_voice: int,
+    voices: list[str],
+    cfg: TrainRunConfig,
+) -> str:
+    import hashlib
+    import json
+
+    blob = json.dumps(
+        {
+            "phrases": sorted(phrases),
+            "n": n_per_phrase_per_voice,
+            "voices": sorted(voices),
+            "speed_min": cfg.generation.kokoro_speed_min,
+            "speed_max": cfg.generation.kokoro_speed_max,
+        },
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha1(blob).hexdigest()[:16]
+
+
+def _generate_kokoro_samples(
+    phrases: list[str],
+    out_dir: Path,
+    cfg: TrainRunConfig,
+    n_per_phrase_per_voice: int,
+    label: str,
+    kokoro: KokoroGenerator | None = None,
+) -> list[Path]:
+    """Generate Kokoro samples with a separate cache sentinel from Piper."""
+    if not cfg.generation.use_kokoro or not cfg.generation.kokoro_voices:
+        return []
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / f".generated_kokoro_{label}"
+    sig = _kokoro_signature(
+        phrases,
+        n_per_phrase_per_voice,
+        cfg.generation.kokoro_voices,
+        cfg,
+    )
+    target_total = (
+        len(phrases)
+        * len(cfg.generation.kokoro_voices)
+        * n_per_phrase_per_voice
+    )
+    if sentinel.exists():
+        cached = sentinel.read_text().strip()
+        if cached == sig:
+            existing = sorted(out_dir.glob(f"kokoro_{label}_*.wav"))
+            if existing and len(existing) == target_total:
+                bus.log(
+                    f"Reusing {len(existing)} cached Kokoro WAVs for label={label} "
+                    f"(signature match)"
+                )
+                return existing
+            if existing:
+                if len(existing) > target_total:
+                    stale = existing[target_total:]
+                    bus.log(
+                        f"Trimming {len(stale):,} extra cached Kokoro WAVs for label={label} "
+                        f"(expected {target_total:,}, found {len(existing):,})",
+                        level="warning",
+                    )
+                    for old_wav in stale:
+                        try:
+                            old_wav.unlink()
+                        except FileNotFoundError:
+                            pass
+                    existing = sorted(out_dir.glob(f"kokoro_{label}_*.wav"))
+                    if len(existing) == target_total:
+                        return existing
+                bus.log(
+                    f"Removing {len(existing):,} stale cached Kokoro WAVs for label={label} "
+                    f"(expected {target_total:,})",
+                    level="warning",
+                )
+                for old_wav in existing:
+                    try:
+                        old_wav.unlink()
+                    except FileNotFoundError:
+                        pass
+        else:
+            bus.log(
+                f"Kokoro phrases/voices changed since last run for label={label} "
+                f"- regenerating (sig {cached[:8]}.. -> {sig[:8]}..)",
+                level="warning",
+            )
+
+    for old_wav in out_dir.glob(f"kokoro_{label}_*.wav"):
+        try:
+            old_wav.unlink()
+        except FileNotFoundError:
+            pass
+
+    written: list[Path] = []
+    if target_total <= 0:
+        return written
+
+    bus.phase(
+        f"generate:kokoro:{label}",
+        detail=(
+            f"{len(phrases)} phrases, {len(cfg.generation.kokoro_voices)} voices, "
+            f"{target_total} synths"
+        ),
+    )
+    bus.log(f"Kokoro {label}: {target_total} synths")
+    kokoro = kokoro or KokoroGenerator()
+    i = 0
+    loop_start_t = time.monotonic()
+    last_log_t = loop_start_t
+    import hashlib
+
+    seed = int(hashlib.sha1(f"{cfg.wake_word}|{label}|kokoro".encode()).hexdigest()[:8], 16)
+    for sample in kokoro.iter_samples(
+        phrases=phrases,
+        voice_keys=cfg.generation.kokoro_voices,
+        n_per_phrase_per_voice=n_per_phrase_per_voice,
+        cfg=cfg.generation,
+        seed=seed,
+    ):
+        wav_path = out_dir / f"kokoro_{label}_{i:07d}.wav"
+        write_wav(wav_path, sample.audio, sample.sample_rate)
+        wav_path.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "engine": "kokoro",
+                    "label": label,
+                    "text": sample.text,
+                    "voice": sample.voice,
+                    "sample_rate": sample.sample_rate,
+                    "metadata": sample.metadata,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        written.append(wav_path)
+        i += 1
+        if i % 10 == 0:
+            bus.progress(
+                f"generate:kokoro:{label}",
+                i / max(1, target_total),
+                detail=f"{i}/{target_total}",
+            )
+        now = time.monotonic()
+        if (now - last_log_t) > 10.0:
+            elapsed = max(1.0, now - loop_start_t)
+            rate = i / elapsed
+            bus.log(
+                f"Kokoro {label}: {i:,}/{target_total:,} synths "
+                f"({100.0 * i / max(1, target_total):.1f}%, ~{rate:.1f}/s avg)"
+            )
+            last_log_t = now
+        if state.cancel_flag.is_set():
+            break
+
+    if not state.cancel_flag.is_set():
+        skipped = target_total - i
+        detail = f"{i}/{target_total}" + (f" ({skipped} skipped)" if skipped else "")
+        bus.progress(f"generate:kokoro:{label}", 1.0, detail=detail)
+        if i >= target_total and written:
+            sentinel.write_text(sig)
+        elif written:
+            bus.log(
+                f"Kokoro {label}: generated {i:,}/{target_total:,}; "
+                "leaving cache unsatisfied so the next run can retry missing synths.",
+                level="warning",
+            )
 
     return written
 
@@ -898,6 +1192,11 @@ def _run(cfg: TrainRunConfig) -> None:
 
         # 2. Positive phrases
         positive_phrases = cfg.generation.positive_phrases or [cfg.wake_word]
+        kokoro = (
+            KokoroGenerator()
+            if cfg.generation.use_kokoro and cfg.generation.kokoro_voices
+            else None
+        )
         bus.phase("generate:positive", detail=f"{len(positive_phrases)} phrases")
         positive_wavs = _generate_samples(
             positive_phrases,
@@ -905,6 +1204,16 @@ def _run(cfg: TrainRunConfig) -> None:
             cfg,
             cfg.generation.n_positive_per_phrase_per_voice,
             label="pos",
+        )
+        positive_wavs.extend(
+            _generate_kokoro_samples(
+                positive_phrases,
+                run_dir / "wavs" / "positive",
+                cfg,
+                cfg.generation.n_kokoro_positive_per_phrase_per_voice,
+                label="pos",
+                kokoro=kokoro,
+            )
         )
         bus.log(f"Positive WAVs generated: {len(positive_wavs)}")
 
@@ -942,6 +1251,17 @@ def _run(cfg: TrainRunConfig) -> None:
                     label="hard_neg",
                 )
             )
+            if cfg.generation.use_kokoro_for_negatives:
+                negative_wavs.extend(
+                    _generate_kokoro_samples(
+                        hard_negative_phrases,
+                        run_dir / "wavs" / "negative",
+                        cfg,
+                        cfg.generation.n_kokoro_negative_per_phrase_per_voice,
+                        label="hard_neg",
+                        kokoro=kokoro,
+                    )
+                )
             bus.log(f"Hard-negative WAVs generated: {len(negative_wavs)}")
 
         if state.cancel_flag.is_set():
@@ -1016,7 +1336,9 @@ def _run(cfg: TrainRunConfig) -> None:
         copy2(result.onnx_path, final_path)
         state.onnx_path = final_path
 
-        (run_dir / "result.json").write_text(
+        result_path = run_dir / "result.json"
+        package_path = settings.models_dir / f"{run_id}.zip"
+        result_path.write_text(
             json.dumps(
                 {
                     "run_id": run_id,
@@ -1030,14 +1352,23 @@ def _run(cfg: TrainRunConfig) -> None:
                     "recommended_threshold": 0.5,
                     "best_step": result.best_step,
                     "onnx_path": str(final_path),
+                    "package_path": str(package_path),
                     "history": result.history,
                 },
                 indent=2,
             )
         )
+        _write_model_package(
+            run_id=run_id,
+            run_dir=run_dir,
+            final_onnx_path=final_path,
+            result_path=result_path,
+            package_path=package_path,
+        )
+        bus.log(f"Packaged model artifact -> {package_path}")
 
         state.status = "succeeded"
-        bus.complete(run_id=run_id, onnx_path=str(final_path))
+        bus.complete(run_id=run_id, onnx_path=str(final_path), package_path=str(package_path))
     except Exception as exc:
         if state.cancel_flag.is_set():
             state.status = "cancelled"

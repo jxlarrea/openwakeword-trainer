@@ -68,7 +68,7 @@
       <div class="voice-list">
         {% for v in voices %}
           <label class="voice-row" data-quality="{{ v.quality }}" data-key="{{ v.key }}">
-            <input type="checkbox" name="piper_voice" value="{{ v.key }}" checked>
+            <input type="checkbox" name="piper_voice" value="{{ v.key }}"{% if v.quality in ["high", "medium"] %} checked{% endif %}>
             <span class="voice-name">{{ v.key }}</span>
             <span class="voice-meta">{{ v.quality }} | {{ v.n_speakers }} spk | {{ v.sample_rate }} Hz</span>
           </label>
@@ -77,6 +77,47 @@
         {% endfor %}
       </div>
       <small class="hint">More voices = more accent / pitch diversity in training data. Multi-speaker voices (libritts) cover hundreds of speakers each.</small>
+    </fieldset>
+
+    <fieldset>
+      <legend>Kokoro voices (English)</legend>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="use_kokoro" checked> Use Kokoro for positive phrases</label>
+        <small class="hint">Higher-quality local TTS. Adds natural positive examples while Piper keeps broad voice coverage.</small>
+      </div>
+      <div class="voice-controls">
+        <button type="button" id="select-all-kokoro">Select all</button>
+        <button type="button" id="select-none-kokoro">Clear</button>
+        <button type="button" id="select-best-kokoro">Best quality</button>
+      </div>
+      <div class="voice-list">
+        {% for v in kokoro_voices %}
+          <label class="voice-row" data-quality="{{ v.quality }}" data-key="{{ v.key }}">
+            <input type="checkbox" name="kokoro_voice" value="{{ v.key }}"{% if v.key in default_kokoro_voice_keys %} checked{% endif %}>
+            <span class="voice-name">{{ v.key }}</span>
+            <span class="voice-meta">{{ v.accent }} | {{ v.gender }} | grade {{ v.quality }}</span>
+          </label>
+        {% endfor %}
+      </div>
+      <div class="grid">
+        <label>Kokoro positives per phrase per voice
+          <input type="number" name="n_kokoro_positive_per_phrase_per_voice" value="2" min="0" max="16" required>
+          <small class="hint">Extra high-quality renders per phrase/voice. 2 is enough when Piper is also enabled.</small>
+        </label>
+        <label>Kokoro speed min
+          <input type="number" name="kokoro_speed_min" value="0.9" min="0.5" max="2" step="0.05" required>
+        </label>
+        <label>Kokoro speed max
+          <input type="number" name="kokoro_speed_max" value="1.1" min="0.5" max="2" step="0.05" required>
+        </label>
+      </div>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="use_kokoro_for_negatives"> Use Kokoro for hard negatives</label>
+        <small class="hint">Optional. Keep off unless your hard negatives are short and important.</small>
+      </div>
+      <label>Kokoro hard negatives per phrase per voice
+        <input type="number" name="n_kokoro_negative_per_phrase_per_voice" value="1" min="0" max="8" required>
+      </label>
     </fieldset>
 
     <fieldset>
@@ -161,7 +202,7 @@
         <small class="hint">Official negative validation feature bank for FP/hr calibration.</small>
       </div>
       <label>Common Voice subset size
-        <input type="number" name="common_voice_subset" value="15000" min="500" max="200000" required>
+        <input type="number" name="common_voice_subset" value="20000" min="500" max="200000" required>
         <small class="hint">How many Common Voice clips to fetch. 10-20k is plenty.</small>
       </label>
     </fieldset>
@@ -203,7 +244,7 @@
           <small class="hint">Hidden layer width. 128 is plenty for wake-word detection.</small>
         </label>
         <label>FC blocks
-          <input type="number" name="n_blocks" value="1" min="1" max="6" required>
+          <input type="number" name="n_blocks" value="3" min="1" max="6" required>
           <small class="hint">Extra fully-connected blocks. Increase for harder wake words.</small>
         </label>
         <label>Learning rate
@@ -214,8 +255,36 @@
           <input type="number" name="batch_size" value="2048" min="32" max="8192" required>
           <small class="hint">Training batch size. DGX Spark handles 2048+ easily.</small>
         </label>
+        <label>Positive sample fraction
+          <input type="number" name="positive_sample_fraction" value="0.35" min="0.01" max="0.95" step="0.01" required>
+          <small class="hint">Fraction of each weighted training batch drawn from positives.</small>
+        </label>
+        <label>Negative loss weight
+          <input type="number" name="negative_loss_weight" value="3" min="0" max="100" step="0.1" required>
+          <small class="hint">How strongly ordinary negatives are penalized during training.</small>
+        </label>
+        <label>Hard-negative loss weight
+          <input type="number" name="hard_negative_loss_weight" value="2" min="0" max="100" step="0.1" required>
+          <small class="hint">Extra multiplier for negatives currently scoring above the hard-negative threshold.</small>
+        </label>
+        <label>Hard-negative threshold
+          <input type="number" name="hard_negative_threshold" value="0.7" min="0" max="1" step="0.01" required>
+          <small class="hint">Only negatives scoring above this receive extra hard-negative loss.</small>
+        </label>
+        <label>Hard-negative mining top K
+          <input type="number" name="hard_negative_mining_top_k" value="50000" min="0" max="500000" step="1000" required>
+          <small class="hint">Number of highest-scoring training negatives mined after base training.</small>
+        </label>
+        <label>Hard-negative fine-tune steps
+          <input type="number" name="hard_negative_finetune_steps" value="0" min="0" max="100000" step="500" required>
+          <small class="hint">Set to 0 to skip the post-training hard-negative fine-tune.</small>
+        </label>
+        <label>Hard-negative fine-tune positive fraction
+          <input type="number" name="hard_negative_finetune_positive_fraction" value="0.5" min="0.01" max="0.95" step="0.01" required>
+          <small class="hint">Positive fraction used only during mined hard-negative fine-tuning.</small>
+        </label>
         <label>Max steps
-          <input type="number" name="max_steps" value="75000" min="500" max="500000" required>
+          <input type="number" name="max_steps" value="200000" min="500" max="500000" required>
           <small class="hint">Hard cap on training steps. Early-stop usually kicks in well before this.</small>
         </label>
         <label>Validate every N steps
@@ -223,12 +292,20 @@
           <small class="hint">How often to run validation + check early-stop.</small>
         </label>
         <label>Early stop patience
-          <input type="number" name="early_stop_patience" value="8" min="1" max="50" required>
+          <input type="number" name="early_stop_patience" value="30" min="1" max="50" required>
           <small class="hint">Stop after this many evals without recall@p95 improvement.</small>
         </label>
         <label>Target FP/hr
-          <input type="number" name="target_false_positives_per_hour" value="0.2" min="0" max="10" step="0.05" required>
+          <input type="number" name="target_false_positives_per_hour" value="0.5" min="0" max="10" step="0.05" required>
           <small class="hint">Stop training early if val FP/hr drops below this with good recall.</small>
+        </label>
+        <label>Minimum recall for export
+          <input type="number" name="min_recall_at_target_fp_for_export" value="0.62" min="0" max="1" step="0.01" required>
+          <small class="hint">Required validation recall at the target FP/hr before publishing an ONNX model.</small>
+        </label>
+        <label>Early stop minimum steps
+          <input type="number" name="early_stop_min_steps" value="30000" min="500" max="200000" step="500" required>
+          <small class="hint">Training will not early-stop before this step count.</small>
         </label>
         <label>Seed
           <input type="number" name="seed" value="42" required>
@@ -260,47 +337,6 @@
     <summary>Live log</summary>
     <pre id="log"></pre>
   </details>
-</section>
-
-<section id="test" class="card">
-  <h2>3. Test a trained model</h2>
-  <form id="test-form">
-    <div class="grid">
-      <label class="span-2">Model
-        <select id="test-model" name="model_name" required>
-          {% for m in models %}
-            <option value="{{ m.name }}" data-size="{{ m.size }}">{{ m.name }}</option>
-          {% endfor %}
-        </select>
-        <small class="hint">Trained models live at <code>/data/models/&lt;name&gt;.onnx</code>.</small>
-      </label>
-      <label>Threshold
-        <input type="number" id="test-threshold" name="threshold" value="0.5" min="0" max="1" step="0.01">
-        <small class="hint">Score above this triggers a detection. Lower = more sensitive.</small>
-      </label>
-    </div>
-
-    <div class="actions test-actions">
-      <button type="button" id="download-model-btn" class="primary">Download .onnx</button>
-      <button type="button" id="refresh-models-btn">Refresh list</button>
-      <span id="model-info" class="pill"></span>
-    </div>
-
-    <div class="grid">
-      <label class="span-2">Upload audio (wav, mp3, flac)
-        <input type="file" id="test-audio-file" name="audio" accept="audio/*">
-        <small class="hint">Or record below.</small>
-      </label>
-    </div>
-
-    <div class="actions test-actions">
-      <button type="button" id="record-btn" class="primary">Record from mic</button>
-      <button type="button" id="stop-record-btn" class="danger" disabled>Stop recording</button>
-      <button type="submit" class="primary">Run test on selected audio</button>
-      <span id="mic-hint" class="pill"></span>
-    </div>
-  </form>
-  <div id="test-result"></div>
 </section>
 
 {% endblock %}

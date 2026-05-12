@@ -15,6 +15,11 @@
       <img src="/assets/icon.png" alt="" class="brand-icon">
       <h1>OpenWakeWord Trainer</h1>
     </div>
+    <nav class="main-nav" aria-label="Primary">
+      <a href="/" class="{% if active_page == 'trainer' %}active{% endif %}">Trainer</a>
+      <a href="/tester" class="{% if active_page == 'tester' %}active{% endif %}">Tester</a>
+      <a href="/system" class="{% if active_page == 'system' %}active{% endif %}">System</a>
+    </nav>
     <div class="topbar-right">
       <a class="github-link" href="https://github.com/jxlarrea/openwakeword-trainer"
          target="_blank" rel="noopener" title="View source on GitHub">

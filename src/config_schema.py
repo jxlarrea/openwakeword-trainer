@@ -39,6 +39,13 @@ class GenerationConfig(BaseModel):
     n_adversarial_per_phrase_per_voice: int = 1
 
     piper_voices: list[VoiceSelection] = Field(default_factory=list)
+    use_kokoro: bool = True
+    kokoro_voices: list[str] = Field(default_factory=list)
+    n_kokoro_positive_per_phrase_per_voice: int = 2
+    use_kokoro_for_negatives: bool = False
+    n_kokoro_negative_per_phrase_per_voice: int = 1
+    kokoro_speed_min: float = 0.9
+    kokoro_speed_max: float = 1.1
     use_elevenlabs: bool = False
     elevenlabs_voice_ids: list[str] = Field(default_factory=list)
     elevenlabs_model: str = "eleven_multilingual_v2"
@@ -85,7 +92,7 @@ class DatasetConfig(BaseModel):
     use_musan_music: bool = True
     use_fsd50k: bool = True
     use_common_voice_negatives: bool = True
-    common_voice_subset: int = 15000  # DGX Spark default
+    common_voice_subset: int = 20000  # DGX Spark default
     use_openwakeword_negative_features: bool = True
     use_openwakeword_validation_features: bool = True
 
@@ -96,23 +103,23 @@ class TrainingConfig(BaseModel):
     # DGX Spark defaults: large batch, longer schedule, more patience.
     model_type: Literal["dnn", "rnn"] = "dnn"
     layer_dim: int = 128
-    n_blocks: int = 1
+    n_blocks: int = 3
     learning_rate: float = 1e-4
     batch_size: int = 2048
-    positive_sample_fraction: float = 0.20
-    negative_loss_weight: float = 8.0
-    hard_negative_loss_weight: float = 4.0
-    hard_negative_threshold: float = 0.10
+    positive_sample_fraction: float = 0.35
+    negative_loss_weight: float = 3.0
+    hard_negative_loss_weight: float = 2.0
+    hard_negative_threshold: float = 0.70
     hard_negative_mining_top_k: int = 50_000
-    hard_negative_finetune_steps: int = 10_000
-    hard_negative_finetune_positive_fraction: float = 0.35
-    max_steps: int = 75_000
+    hard_negative_finetune_steps: int = 0
+    hard_negative_finetune_positive_fraction: float = 0.50
+    max_steps: int = 200_000
     val_every_n_steps: int = 500
-    target_false_positives_per_hour: float = 0.2
+    target_false_positives_per_hour: float = 0.5
     min_recall_at_p95_for_export: float = 0.80
-    min_recall_at_target_fp_for_export: float = 0.75
-    early_stop_min_steps: int = 15_000
-    early_stop_patience: int = 8
+    min_recall_at_target_fp_for_export: float = 0.62
+    early_stop_min_steps: int = 30_000
+    early_stop_patience: int = 30
     seed: int = 42
 
 
@@ -140,14 +147,19 @@ class TrainRunConfig(BaseModel):
         """Reject configs that can't possibly produce a usable training dataset."""
         # At least one voice source.
         n_piper = len(self.generation.piper_voices)
+        n_kokoro = (
+            len(self.generation.kokoro_voices)
+            if self.generation.use_kokoro
+            else 0
+        )
         n_eleven = (
             len(self.generation.elevenlabs_voice_ids)
             if self.generation.use_elevenlabs
             else 0
         )
-        if n_piper == 0 and n_eleven == 0:
+        if n_piper == 0 and n_kokoro == 0 and n_eleven == 0:
             raise ValueError(
-                "Select at least one Piper voice (or enable ElevenLabs with voices)."
+                "Select at least one Piper, Kokoro, or ElevenLabs voice."
             )
 
         # At least one augmentation corpus.

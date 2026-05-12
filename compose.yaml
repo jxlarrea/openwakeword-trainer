@@ -36,6 +36,9 @@ services:
       HF_HOME: /data/cache/huggingface
       TORCH_HOME: /data/cache/torch
       XDG_CACHE_HOME: /data/cache
+      # Kokoro uses CUDA by default. The trainer enables Kokoro's custom STFT
+      # path to avoid Torch complex-kernel JIT issues on newer GPUs.
+      OWW_KOKORO_DEVICE: ${OWW_KOKORO_DEVICE:-cuda}
     volumes:
       # Default: named docker volume (portable, no host setup).
       # Override OWW_DATA_DIR_HOST in .env to point at a host bind-mount path

@@ -46,6 +46,15 @@
     return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
   }
 
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
   function setFormEnabled(enabled) {
     const canEdit = enabled && runStatus !== "running";
     configCard?.classList.toggle("disabled-card", !canEdit);
@@ -80,6 +89,12 @@
         return;
       }
       el.disabled = false;
+    });
+  }
+
+  function setSystemControlsEnabled(enabled) {
+    $$("#system-page button, #system-session-rows button").forEach((el) => {
+      el.disabled = !enabled;
     });
   }
 
@@ -126,6 +141,18 @@
     $$("#config input[name='elevenlabs_voice_id']").forEach((cb) => {
       cb.checked = (gen.elevenlabs_voice_ids || []).includes(cb.value);
     });
+    setChecked(form, "use_kokoro", gen.use_kokoro !== false);
+    const savedKokoroVoices = gen.kokoro_voices || [];
+    $$("#config input[name='kokoro_voice']").forEach((cb) => {
+      cb.checked =
+        savedKokoroVoices.length === 0 ||
+        savedKokoroVoices.includes(cb.value);
+    });
+    setValue(form, "n_kokoro_positive_per_phrase_per_voice", gen.n_kokoro_positive_per_phrase_per_voice);
+    setChecked(form, "use_kokoro_for_negatives", gen.use_kokoro_for_negatives);
+    setValue(form, "n_kokoro_negative_per_phrase_per_voice", gen.n_kokoro_negative_per_phrase_per_voice);
+    setValue(form, "kokoro_speed_min", gen.kokoro_speed_min);
+    setValue(form, "kokoro_speed_max", gen.kokoro_speed_max);
 
     setValue(form, "augmentations_per_clip", aug.augmentations_per_clip);
     setValue(form, "rir_probability", aug.rir_probability);
@@ -148,10 +175,19 @@
     setValue(form, "n_blocks", tr.n_blocks);
     setValue(form, "learning_rate", tr.learning_rate);
     setValue(form, "batch_size", tr.batch_size);
+    setValue(form, "positive_sample_fraction", tr.positive_sample_fraction);
+    setValue(form, "negative_loss_weight", tr.negative_loss_weight);
+    setValue(form, "hard_negative_loss_weight", tr.hard_negative_loss_weight);
+    setValue(form, "hard_negative_threshold", tr.hard_negative_threshold);
+    setValue(form, "hard_negative_mining_top_k", tr.hard_negative_mining_top_k);
+    setValue(form, "hard_negative_finetune_steps", tr.hard_negative_finetune_steps);
+    setValue(form, "hard_negative_finetune_positive_fraction", tr.hard_negative_finetune_positive_fraction);
     setValue(form, "max_steps", tr.max_steps);
     setValue(form, "val_every_n_steps", tr.val_every_n_steps);
     setValue(form, "early_stop_patience", tr.early_stop_patience);
+    setValue(form, "early_stop_min_steps", tr.early_stop_min_steps);
     setValue(form, "target_false_positives_per_hour", tr.target_false_positives_per_hour);
+    setValue(form, "min_recall_at_target_fp_for_export", tr.min_recall_at_target_fp_for_export);
     setValue(form, "seed", tr.seed);
 
     if (deleteSessionBtn) deleteSessionBtn.disabled = runStatus === "running";
@@ -249,6 +285,19 @@
       cb.checked = q === "high" || q === "medium";
     });
   });
+  $("#select-all-kokoro")?.addEventListener("click", () => {
+    $$("#config input[name='kokoro_voice']").forEach((cb) => (cb.checked = true));
+  });
+  $("#select-none-kokoro")?.addEventListener("click", () => {
+    $$("#config input[name='kokoro_voice']").forEach((cb) => (cb.checked = false));
+  });
+  $("#select-best-kokoro")?.addEventListener("click", () => {
+    const best = new Set(["A", "A-", "B-", "C+"]);
+    $$("#config .voice-row input[name='kokoro_voice']").forEach((cb) => {
+      const q = cb.closest(".voice-row")?.dataset.quality || "";
+      cb.checked = best.has(q);
+    });
+  });
   $("#voice-filter")?.addEventListener("input", (e) => {
     const q = e.target.value.toLowerCase().trim();
     $$("#config .voice-row").forEach((row) => {
@@ -319,11 +368,13 @@
 
     // Custom: at least one voice source.
     const piperCount = form.querySelectorAll('input[name="piper_voice"]:checked').length;
+    const kokoroUsed = form.querySelector('input[name="use_kokoro"]')?.checked;
+    const kokoroCount = form.querySelectorAll('input[name="kokoro_voice"]:checked').length;
     const elUsed = form.querySelector('input[name="use_elevenlabs"]')?.checked;
     const elCount = form.querySelectorAll('input[name="elevenlabs_voice_id"]:checked').length;
 
-    if (piperCount === 0 && !(elUsed && elCount > 0)) {
-      errors.push("Select at least one Piper voice (or enable ElevenLabs with voices).");
+    if (piperCount === 0 && !(kokoroUsed && kokoroCount > 0) && !(elUsed && elCount > 0)) {
+      errors.push("Select at least one Piper, Kokoro, or ElevenLabs voice.");
       const voicesFieldset = form.querySelector(".voice-list")?.closest("fieldset");
       voicesFieldset?.classList.add("invalid");
       if (!firstInvalid) firstInvalid = voicesFieldset;
@@ -397,6 +448,7 @@
       return;
     }
     const data = await res.json();
+    resetProgressUi(data.run_id || payload.session_id || null);
     hasRunProgress = true;
     setRunState(data.status);
     if (data.status === "running") scrollToTop();
@@ -433,6 +485,7 @@
     const vBool = (k) => fd.get(k) !== null;
     const piperVoices = fd.getAll("piper_voice").map((k) => ({ voice_key: k }));
     const elVoices = fd.getAll("elevenlabs_voice_id");
+    const kokoroVoices = fd.getAll("kokoro_voice");
     return {
       wake_word: String(v("wake_word")).trim(),
       session_id: String(v("session_id")).trim(),
@@ -451,6 +504,13 @@
         n_adversarial_phrases: vNum("n_adversarial_phrases", 3000),
         n_adversarial_per_phrase_per_voice: vNum("n_adversarial_per_phrase_per_voice", 1),
         piper_voices: piperVoices,
+        use_kokoro: vBool("use_kokoro"),
+        kokoro_voices: kokoroVoices,
+        n_kokoro_positive_per_phrase_per_voice: vNum("n_kokoro_positive_per_phrase_per_voice", 2),
+        use_kokoro_for_negatives: vBool("use_kokoro_for_negatives"),
+        n_kokoro_negative_per_phrase_per_voice: vNum("n_kokoro_negative_per_phrase_per_voice", 1),
+        kokoro_speed_min: vNum("kokoro_speed_min", 0.9),
+        kokoro_speed_max: vNum("kokoro_speed_max", 1.1),
         use_elevenlabs: vBool("use_elevenlabs"),
         elevenlabs_voice_ids: elVoices,
         elevenlabs_model: String(v("elevenlabs_model")) || "eleven_multilingual_v2",
@@ -471,18 +531,27 @@
         use_common_voice_negatives: vBool("use_common_voice_negatives"),
         use_openwakeword_negative_features: vBool("use_openwakeword_negative_features"),
         use_openwakeword_validation_features: vBool("use_openwakeword_validation_features"),
-        common_voice_subset: vNum("common_voice_subset", 15000),
+        common_voice_subset: vNum("common_voice_subset", 20000),
       },
       training: {
         model_type: v("model_type") || "dnn",
         layer_dim: vNum("layer_dim", 128),
-        n_blocks: vNum("n_blocks", 1),
+        n_blocks: vNum("n_blocks", 3),
         learning_rate: vNum("learning_rate", 0.0001),
         batch_size: vNum("batch_size", 2048),
-        max_steps: vNum("max_steps", 75000),
+        positive_sample_fraction: vNum("positive_sample_fraction", 0.35),
+        negative_loss_weight: vNum("negative_loss_weight", 3),
+        hard_negative_loss_weight: vNum("hard_negative_loss_weight", 2),
+        hard_negative_threshold: vNum("hard_negative_threshold", 0.7),
+        hard_negative_mining_top_k: vNum("hard_negative_mining_top_k", 50000),
+        hard_negative_finetune_steps: vNum("hard_negative_finetune_steps", 0),
+        hard_negative_finetune_positive_fraction: vNum("hard_negative_finetune_positive_fraction", 0.5),
+        max_steps: vNum("max_steps", 200000),
         val_every_n_steps: vNum("val_every_n_steps", 500),
-        early_stop_patience: vNum("early_stop_patience", 8),
-        target_false_positives_per_hour: vNum("target_false_positives_per_hour", 0.2),
+        early_stop_patience: vNum("early_stop_patience", 30),
+        early_stop_min_steps: vNum("early_stop_min_steps", 30000),
+        target_false_positives_per_hour: vNum("target_false_positives_per_hour", 0.5),
+        min_recall_at_target_fp_for_export: vNum("min_recall_at_target_fp_for_export", 0.62),
         seed: vNum("seed", 42),
       },
     };
@@ -516,6 +585,7 @@
     setSessionControlsLocked(isRunning);
     setFormEnabled(Boolean(currentSession));
     setTestFormEnabled(!isRunning);
+    setSystemControlsEnabled(!isRunning);
     if (isRunning && phaseBanner && phaseBanner.textContent === "Idle") {
       phaseBanner.textContent = "training is running";
     }
@@ -534,6 +604,19 @@
   const progressMap = new Map();
   const metricMap = new Map();
   const seenLogs = new Set();
+
+  function resetProgressUi(runId = null) {
+    progressRunId = runId;
+    hasRunProgress = Boolean(runId);
+    progressMap.clear();
+    metricMap.clear();
+    seenLogs.clear();
+    if (progressBars) progressBars.innerHTML = "";
+    if (metricsBox) metricsBox.innerHTML = "";
+    if (logEl) logEl.innerHTML = "";
+    if (phaseBanner) phaseBanner.textContent = runId ? "starting..." : "Idle";
+    if (progressTitle) progressTitle.textContent = runId ? `Progress: ${runId}` : "Progress";
+  }
 
   function ensureProgressBar(name) {
     let bar = progressMap.get(name);
@@ -582,6 +665,9 @@
 
   function hydrateProgress(progress) {
     if (!progress) return;
+    if (progress.run_id && progressRunId && progress.run_id !== progressRunId) {
+      resetProgressUi(progress.run_id);
+    }
     progressRunId = progress.run_id || progressRunId;
     hasRunProgress = Boolean(
       progress.run_id ||
@@ -679,6 +765,7 @@
   });
   es.addEventListener("run_started", (e) => {
     const d = JSON.parse(e.data);
+    resetProgressUi(d.run_id || null);
     hasRunProgress = true;
     if (progressCard) progressCard.hidden = false;
     appendLog("info", `Run started: ${d.run_id} (${d.wake_word})`, d.ts);
@@ -717,7 +804,12 @@
     if (!sel) return;
     const prev = sel.value;
     sel.innerHTML = models
-      .map((m) => `<option value="${m.name}" data-size="${m.size}">${m.name}</option>`)
+      .map(
+        (m) => `<option value="${m.name}"
+          data-size="${m.size || 0}"
+          data-package-name="${m.package_name || ""}"
+          data-package-size="${m.package_size || ""}">${m.name}</option>`
+      )
       .join("");
     if (prev && [...sel.options].some((o) => o.value === prev)) {
       sel.value = prev;
@@ -730,13 +822,19 @@
     const info = $("#model-info");
     if (!info || !sel) return;
     const opt = sel.options[sel.selectedIndex];
+    const packageBtn = $("#download-package-btn");
     if (!opt) {
       info.textContent = "no models yet";
+      if (packageBtn) packageBtn.disabled = true;
       return;
     }
     const size = Number(opt.getAttribute("data-size") || 0);
     const kb = (size / 1024).toFixed(1);
-    info.textContent = `${opt.value} (${kb} KB)`;
+    const packageName = opt.getAttribute("data-package-name") || "";
+    const packageSize = Number(opt.getAttribute("data-package-size") || 0);
+    const packageKb = packageSize ? `, package ${(packageSize / 1024).toFixed(1)} KB` : "";
+    info.textContent = `${opt.value} (${kb} KB${packageKb})`;
+    if (packageBtn) packageBtn.disabled = !packageName;
   }
   $("#test-model")?.addEventListener("change", updateModelInfo);
 
@@ -749,6 +847,22 @@
     const a = document.createElement("a");
     a.href = `/api/models/${encodeURIComponent(name)}`;
     a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+
+  $("#download-package-btn")?.addEventListener("click", () => {
+    const sel = $("#test-model");
+    const opt = sel?.options[sel.selectedIndex];
+    const packageName = opt?.getAttribute("data-package-name");
+    if (!packageName) {
+      alert("No package is available for this model yet.");
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = `/api/model-packages/${encodeURIComponent(packageName)}`;
+    a.download = packageName;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -834,6 +948,7 @@
 
   function renderTestResult(r) {
     const out = $("#test-result");
+    if (!out) return;
     const triggered = r.triggered;
     out.innerHTML = `
       <div class="metric-tile">
@@ -873,6 +988,101 @@
       ctx.stroke();
     }
   }
+
+  // ---------- System page ----------
+
+  const systemRows = $("#system-session-rows");
+  const systemStatus = $("#system-action-status");
+
+  function setSystemStatus(text, kind) {
+    if (!systemStatus) return;
+    systemStatus.textContent = text || "";
+    systemStatus.className = "pill";
+    if (kind) systemStatus.classList.add(kind);
+  }
+
+  function renderSystemDisk(disk) {
+    if (!disk || !systemRows) return;
+    const count = $("#system-session-count");
+    const sessionBytes = $("#system-session-bytes");
+    const cacheBytes = $("#system-cache-bytes");
+    if (count) count.textContent = String((disk.sessions || []).length);
+    if (sessionBytes) sessionBytes.textContent = fmtBytes(disk.session_bytes || 0);
+    if (cacheBytes) cacheBytes.textContent = fmtBytes(disk.cache_bytes || 0);
+    if (!disk.sessions?.length) {
+      systemRows.innerHTML = `<tr><td colspan="5" class="empty-row">No sessions yet.</td></tr>`;
+      return;
+    }
+    systemRows.innerHTML = disk.sessions
+      .map(
+        (s) => `
+          <tr data-session-id="${escapeHtml(s.id)}">
+            <td>${escapeHtml(s.wake_word || s.id)}</td>
+            <td><code>${escapeHtml(s.id)}</code></td>
+            <td>${fmtBytes(s.size_bytes || 0)}</td>
+            <td>${s.has_model ? "ready" : "-"}</td>
+            <td class="row-actions">
+              <button type="button" class="danger delete-session-cache-btn" data-session-id="${escapeHtml(s.id)}">Delete cache</button>
+              <button type="button" class="danger delete-system-session-btn" data-session-id="${escapeHtml(s.id)}">Delete session</button>
+            </td>
+          </tr>
+        `
+      )
+      .join("");
+  }
+
+  async function refreshSystemDisk() {
+    if (!systemRows) return;
+    const res = await fetch("/api/system/disk");
+    if (!res.ok) return;
+    renderSystemDisk(await res.json());
+  }
+
+  async function systemDelete(url, confirmText) {
+    if (!confirm(confirmText)) return;
+    setSystemStatus("working...", "running");
+    const res = await fetch(url, { method: "DELETE" });
+    if (!res.ok) {
+      setSystemStatus("failed", "failed");
+      alert(await res.text());
+      return;
+    }
+    const data = await res.json();
+    if (data.disk) renderSystemDisk(data.disk);
+    setSystemStatus(`reclaimed ${fmtBytes(data.reclaimed_bytes || 0)}`, "succeeded");
+    return data;
+  }
+
+  $("#delete-all-cache-btn")?.addEventListener("click", () => {
+    systemDelete(
+      "/api/system/cache",
+      "Delete all generated/downloaded cache and trained models while keeping session settings?"
+    );
+  });
+
+  $("#delete-all-data-btn")?.addEventListener("click", () => {
+    systemDelete(
+      "/api/system/all",
+      "Delete all sessions, saved settings, generated data, downloaded cache, and trained models?"
+    );
+  });
+
+  systemRows?.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-session-id]");
+    if (!btn) return;
+    const id = btn.getAttribute("data-session-id");
+    if (btn.classList.contains("delete-session-cache-btn")) {
+      systemDelete(
+        `/api/system/sessions/${encodeURIComponent(id)}/cache`,
+        `Delete generated data and model for session "${id}" but keep its settings?`
+      );
+    } else if (btn.classList.contains("delete-system-session-btn")) {
+      systemDelete(
+        `/api/sessions/${encodeURIComponent(id)}`,
+        `Delete session "${id}" and all of its cached data?`
+      ).then(refreshSystemDisk);
+    }
+  });
 
   // ---------- Initial state sync ----------
 

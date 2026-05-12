@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section id="system-page" class="card">
+  <h2>System</h2>
+  <div class="system-summary">
+    <div class="metric-tile">
+      <div class="name">Sessions</div>
+      <div class="value" id="system-session-count">{{ disk.sessions|length }}</div>
+    </div>
+    <div class="metric-tile">
+      <div class="name">Session data</div>
+      <div class="value" id="system-session-bytes">{{ "%.1f"|format(disk.session_bytes / 1073741824) }} GB</div>
+    </div>
+    <div class="metric-tile">
+      <div class="name">Shared cache + models</div>
+      <div class="value" id="system-cache-bytes">{{ "%.1f"|format(disk.cache_bytes / 1073741824) }} GB</div>
+    </div>
+  </div>
+
+  <div class="actions system-danger-zone">
+    <button type="button" class="danger" id="delete-all-cache-btn" {% if state.status == 'running' %}disabled{% endif %}>Delete all disk cache</button>
+    <button type="button" class="danger" id="delete-all-data-btn" {% if state.status == 'running' %}disabled{% endif %}>Delete all sessions and cache</button>
+    <span id="system-action-status" class="pill"></span>
+  </div>
+  <small class="hint">Cache cleanup keeps session settings but removes generated WAVs, features, checkpoints, models, downloaded voices, corpora, and openWakeWord feature banks.</small>
+</section>
+
+<section class="card">
+  <h2>Sessions</h2>
+  <div class="table-wrap">
+    <table class="session-table">
+      <thead>
+        <tr>
+          <th>Wake word</th>
+          <th>Session ID</th>
+          <th>Disk</th>
+          <th>Model</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="system-session-rows">
+        {% for s in disk.sessions %}
+          <tr data-session-id="{{ s.id }}">
+            <td>{{ s.wake_word }}</td>
+            <td><code>{{ s.id }}</code></td>
+            <td data-size="{{ s.size_bytes }}">{{ "%.1f"|format((s.size_bytes or 0) / 1048576) }} MB</td>
+            <td>{% if s.has_model %}ready{% else %}-{% endif %}</td>
+            <td class="row-actions">
+              <button type="button" class="danger delete-session-cache-btn" data-session-id="{{ s.id }}" {% if state.status == 'running' %}disabled{% endif %}>Delete cache</button>
+              <button type="button" class="danger delete-system-session-btn" data-session-id="{{ s.id }}" {% if state.status == 'running' %}disabled{% endif %}>Delete session</button>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="empty-row">No sessions yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% endblock %}

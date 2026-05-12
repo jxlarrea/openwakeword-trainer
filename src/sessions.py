@@ -14,6 +14,7 @@ from typing import Any
 
 from src.config_schema import AugmentationConfig, DatasetConfig, GenerationConfig, TrainRunConfig, TrainingConfig
 from src.settings import get_settings
+from src.tts.kokoro_generator import default_kokoro_voice_keys
 from src.tts.voices import list_english_voices
 
 
@@ -54,9 +55,12 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 def _config_for_session(wake_word: str, session_id: str) -> dict[str, Any]:
     generation = GenerationConfig().model_dump(mode="json")
+    generation["kokoro_voices"] = default_kokoro_voice_keys()
     try:
         generation["piper_voices"] = [
-            {"voice_key": v.key} for v in list_english_voices()
+            {"voice_key": v.key}
+            for v in list_english_voices()
+            if v.quality in {"high", "medium"}
         ]
     except Exception:
         generation["piper_voices"] = []
@@ -146,6 +150,16 @@ def list_sessions() -> list[dict[str, Any]]:
     return out
 
 
+def list_sessions_with_size() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for session in list_sessions():
+        try:
+            out.append(session_summary(session["id"], include_size=True))
+        except Exception:
+            continue
+    return out
+
+
 def get_session(session_id: str) -> dict[str, Any]:
     return session_summary(session_id, include_size=True)
 
@@ -155,8 +169,135 @@ def delete_session(session_id: str) -> None:
     path = session_dir(sid)
     if path.exists():
         shutil.rmtree(path)
-    model_path = get_settings().models_dir / f"{sid}.onnx"
-    model_path.unlink(missing_ok=True)
+    models_dir = get_settings().models_dir
+    for artifact_path in (models_dir / f"{sid}.onnx", models_dir / f"{sid}.zip"):
+        artifact_path.unlink(missing_ok=True)
+
+
+def delete_session_cache(session_id: str) -> int:
+    """Delete generated artifacts for a session while preserving its settings."""
+
+    sid = slugify(session_id)
+    path = session_dir(sid)
+    before = _dir_size(path) if path.exists() else 0
+    if path.exists():
+        session_json = _read_json(path / "session.json")
+        config_json = _read_json(path / "config.json")
+        for child in path.iterdir():
+            if child.name == "session.json":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+        if session_json is None and config_json is not None:
+            now = time.time()
+            data = {
+                "id": sid,
+                "wake_word": config_json.get("wake_word") or sid,
+                "created_at": now,
+                "updated_at": now,
+                "config": config_json,
+            }
+            (path / "session.json").write_text(json.dumps(data, indent=2))
+    models_dir = get_settings().models_dir
+    model_size = 0
+    for artifact_path in (models_dir / f"{sid}.onnx", models_dir / f"{sid}.zip"):
+        if artifact_path.exists():
+            model_size += artifact_path.stat().st_size
+            artifact_path.unlink(missing_ok=True)
+    after = _dir_size(path) if path.exists() else 0
+    return max(0, before + model_size - after)
+
+
+def delete_all_session_caches() -> int:
+    total = 0
+    for session in list_sessions():
+        total += delete_session_cache(session["id"])
+    return total
+
+
+def delete_all_sessions() -> int:
+    total = 0
+    for session in list_sessions():
+        sid = session["id"]
+        path = session_dir(sid)
+        if path.exists():
+            total += _dir_size(path)
+        models_dir = get_settings().models_dir
+        for artifact_path in (models_dir / f"{sid}.onnx", models_dir / f"{sid}.zip"):
+            if artifact_path.exists():
+                total += artifact_path.stat().st_size
+        delete_session(sid)
+    root = _sessions_root()
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            total += _dir_size(child)
+            shutil.rmtree(child)
+        except OSError:
+            continue
+    return total
+
+
+def disk_cache_summary() -> dict[str, Any]:
+    settings = get_settings()
+    cache_dirs = [
+        settings.voices_dir,
+        settings.augmentations_dir,
+        settings.openwakeword_features_dir,
+        settings.generated_dir,
+    ]
+    dirs = []
+    for path in cache_dirs:
+        dirs.append({"path": str(path), "size_bytes": _dir_size(path)})
+    sessions = list_sessions_with_size()
+    model_bytes = _dir_size(settings.models_dir)
+    return {
+        "sessions": sessions,
+        "session_bytes": sum(int(s.get("size_bytes") or 0) for s in sessions),
+        "model_bytes": model_bytes,
+        "cache_dirs": dirs,
+        "cache_bytes": sum(int(d["size_bytes"]) for d in dirs) + model_bytes,
+        "total_bytes": sum(int(s.get("size_bytes") or 0) for s in sessions)
+        + sum(int(d["size_bytes"]) for d in dirs)
+        + model_bytes,
+    }
+
+
+def delete_global_disk_cache() -> int:
+    settings = get_settings()
+    cache_dirs = [
+        settings.voices_dir,
+        settings.augmentations_dir,
+        settings.openwakeword_features_dir,
+        settings.generated_dir,
+    ]
+    total = 0
+    for path in cache_dirs:
+        if not path.exists():
+            continue
+        total += _dir_size(path)
+        shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
+    for pattern in ("*.onnx", "*.zip"):
+        for model_path in settings.models_dir.glob(pattern):
+            try:
+                total += model_path.stat().st_size
+                model_path.unlink()
+            except OSError:
+                continue
+    settings.ensure_dirs()
+    return total
+
+
+def delete_all_disk_cache_preserving_sessions() -> int:
+    return delete_all_session_caches() + delete_global_disk_cache()
+
+
+def delete_everything() -> int:
+    return delete_all_sessions() + delete_global_disk_cache()
 
 
 def _dir_size(path: Path) -> int:

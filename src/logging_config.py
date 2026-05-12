@@ -26,5 +26,13 @@ def configure_logging(level: str = "INFO") -> None:
     root.addHandler(BusLoggingHandler(level=logging.INFO))
 
     # Tame chatty libraries.
-    for noisy in ("urllib3", "filelock", "huggingface_hub", "datasets", "matplotlib"):
+    for noisy in (
+        "urllib3",
+        "httpx",
+        "httpcore",
+        "filelock",
+        "huggingface_hub",
+        "datasets",
+        "matplotlib",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)

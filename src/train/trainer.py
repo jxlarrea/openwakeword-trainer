@@ -30,6 +30,11 @@ from src.train.progress import bus
 
 logger = logging.getLogger(__name__)
 
+# The classifier is evaluated every 80 ms, but a wake-word false positive is an
+# event, not every overlapping high-scoring window inside that event. Count
+# nearby high windows from the same source as one trigger.
+FP_EVENT_REFRACTORY_WINDOWS = 12
+
 
 @dataclass
 class TrainResult:
@@ -94,8 +99,13 @@ def _weighted_bce(
 
     Wake-word models are deployed into hours of non-wake-word audio, so a
     symmetric BCE objective is too forgiving. Keep positives at weight 1 and
-    make negatives expensive, with an extra bump for negatives currently
-    scoring above a low threshold.
+    make negatives more expensive, with an extra bump only for negatives that
+    are actually scoring as likely wake-word windows.
+
+    Normalize by the sum of weights instead of averaging raw weighted losses.
+    Otherwise changing the negative weights also changes the optimizer's
+    effective learning rate and can make later training collapse toward
+    "predict negative for everything".
     """
     per_item = nn.functional.binary_cross_entropy(probs, labels, reduction="none")
     weights = torch.ones_like(labels)
@@ -111,7 +121,7 @@ def _weighted_bce(
         weights * float(cfg.hard_negative_loss_weight),
         weights,
     )
-    return (per_item * weights).mean()
+    return (per_item * weights).sum() / torch.clamp(weights.sum(), min=1.0)
 
 
 def _evaluate(
@@ -144,6 +154,8 @@ def _evaluate(
             "recall_at_target_fp": 0.0,
             "window_recall_at_target_fp": 0.0,
             "fp_per_hour": 0.0,
+            "fp_per_hour_at_0_5": 0.0,
+            "recall_at_0_5": 0.0,
             "threshold": 0.5,
             "threshold_p95": 0.5,
             "fp_per_hour_p95": 0.0,
@@ -157,9 +169,13 @@ def _evaluate(
     pos_mask = labels == 1
     neg_mask = labels == 0
     source_ids = getattr(loader.dataset, "source_ids", None)
+    source_ids_arr = (
+        np.asarray(source_ids[: len(probs)], dtype=np.int64)
+        if source_ids is not None
+        else np.full(len(probs), -1, dtype=np.int64)
+    )
     pos_clip_scores: np.ndarray | None = None
-    if source_ids is not None:
-        source_ids_arr = np.asarray(source_ids[: len(probs)], dtype=np.int64)
+    if source_ids_arr.size:
         valid_pos_sources = source_ids_arr[pos_mask] >= 0
         if valid_pos_sources.any():
             pos_sources = source_ids_arr[pos_mask][valid_pos_sources]
@@ -169,6 +185,38 @@ def _evaluate(
             sorted_scores = pos_scores[order]
             starts = np.r_[0, np.flatnonzero(np.diff(sorted_sources)) + 1]
             pos_clip_scores = np.maximum.reduceat(sorted_scores, starts)
+
+    neg_scores_all = probs[neg_mask]
+    neg_sources_all = source_ids_arr[neg_mask]
+
+    def false_positive_events(threshold: float) -> int:
+        above = np.flatnonzero(neg_scores_all >= threshold)
+        if above.size == 0:
+            return 0
+        src = neg_sources_all[above]
+        starts = np.ones(above.size, dtype=bool)
+        if above.size > 1:
+            starts[1:] = (
+                (src[1:] != src[:-1])
+                | ((above[1:] - above[:-1]) > FP_EVENT_REFRACTORY_WINDOWS)
+            )
+        return int(starts.sum())
+
+    def threshold_for_event_fp_budget(allowed_fp: int) -> float:
+        if neg_scores_all.size == 0:
+            return p95_threshold
+        if false_positive_events(0.0) <= allowed_fp:
+            return 0.0
+        # Find the lowest threshold whose event count stays within budget.
+        lo = 0.0
+        hi = float(np.nextafter(np.float32(np.max(neg_scores_all)), np.float32(np.inf)))
+        for _ in range(24):
+            mid = (lo + hi) / 2.0
+            if false_positive_events(mid) > allowed_fp:
+                lo = mid
+            else:
+                hi = mid
+        return hi
 
     def positive_recall(threshold: float) -> float:
         if pos_clip_scores is not None and pos_clip_scores.size > 0:
@@ -193,29 +241,25 @@ def _evaluate(
             p95_threshold = float(sorted_scores[best_idx])
             recall_at_p95 = positive_recall(p95_threshold)
 
-    neg_hours = max(1, int(neg_mask.sum())) * 0.08 / 3600.0
-    fp_count_p95 = int(((probs >= p95_threshold) & neg_mask).sum())
+    neg_seconds = max(1, int(neg_mask.sum())) * 0.08
+    neg_hours = neg_seconds / 3600.0
+    fp_count_p95 = false_positive_events(p95_threshold)
     fp_per_hour_p95 = fp_count_p95 / neg_hours if neg_hours > 0 else 0.0
+    fixed_threshold = 0.5
+    fp_count_at_0_5 = false_positive_events(fixed_threshold)
+    fp_per_hour_at_0_5 = fp_count_at_0_5 / neg_hours if neg_hours > 0 else 0.0
+    recall_at_0_5 = positive_recall(fixed_threshold)
 
     # Select the operating threshold by the configured false-positive target.
     # This is the threshold that will be baked into the exported ONNX so a
     # downstream score threshold of 0.5 maps to the validated operating point.
     if cfg is not None:
         allowed_fp = int(math.floor(float(cfg.target_false_positives_per_hour) * neg_hours))
-        neg_scores = np.sort(probs[neg_mask])[::-1]
-        if neg_scores.size == 0:
-            chosen_threshold = p95_threshold
-        elif allowed_fp < neg_scores.size:
-            chosen_threshold = float(
-                np.nextafter(np.float32(neg_scores[allowed_fp]), np.float32(np.inf))
-            )
-        else:
-            chosen_threshold = 0.0
+        chosen_threshold = threshold_for_event_fp_budget(allowed_fp)
     else:
         chosen_threshold = p95_threshold
 
-    fp_count = int(((probs >= chosen_threshold) & neg_mask).sum())
-    neg_seconds = max(1, int(neg_mask.sum())) * 0.08
+    fp_count = false_positive_events(chosen_threshold)
     fp_per_hour = fp_count / (neg_seconds / 3600.0) if neg_seconds > 0 else 0.0
     window_recall_at_target_fp = float(
         ((probs >= chosen_threshold) & pos_mask).sum() / max(1, int(pos_mask.sum()))
@@ -229,6 +273,8 @@ def _evaluate(
         "recall_at_target_fp": recall_at_target_fp,
         "window_recall_at_target_fp": window_recall_at_target_fp,
         "fp_per_hour": fp_per_hour,
+        "fp_per_hour_at_0_5": fp_per_hour_at_0_5,
+        "recall_at_0_5": recall_at_0_5,
         "threshold": chosen_threshold,
         "threshold_p95": p95_threshold,
         "fp_per_hour_p95": fp_per_hour_p95,
@@ -353,6 +399,10 @@ def _fine_tune_hard_negatives(
     best_exportable: bool,
     cancel_flag=None,
 ) -> tuple[tuple | None, dict[str, float] | None, int, bool]:
+    if cfg.hard_negative_finetune_steps <= 0:
+        bus.log("Skipping hard-negative fine-tune (0 steps configured).")
+        return best_score, best_metrics, best_step, best_exportable
+
     labels = np.asarray(train_ds.labels[:], dtype=np.int64)
     pos_indices = np.flatnonzero(labels == 1)
     if pos_indices.size == 0:
@@ -427,6 +477,8 @@ def _fine_tune_hard_negatives(
                 val_recall_at_p95=metrics["recall_at_p95"],
                 val_recall_at_target_fp=metrics["recall_at_target_fp"],
                 val_fp_per_hour=metrics["fp_per_hour"],
+                val_recall_at_0_5=metrics["recall_at_0_5"],
+                val_fp_per_hour_at_0_5=metrics["fp_per_hour_at_0_5"],
                 threshold=metrics["threshold"],
             )
             bus.log(
@@ -434,6 +486,8 @@ def _fine_tune_hard_negatives(
                 f"recall@p95={metrics['recall_at_p95']:.3f} "
                 f"recall@targetFP={metrics['recall_at_target_fp']:.3f} "
                 f"FP/hr={metrics['fp_per_hour']:.2f} "
+                f"recall@0.5={metrics['recall_at_0_5']:.3f} "
+                f"rawFP/hr@0.5={metrics['fp_per_hour_at_0_5']:.2f} "
                 f"threshold={metrics['threshold']:.6f}"
             )
             score = _checkpoint_score(metrics, cfg)
@@ -486,6 +540,14 @@ def train(
     bus.log(
         f"Train windows: {len(train_ds):,} | Val windows: {len(val_ds):,} | "
         f"batch={cfg.batch_size} | max_steps={cfg.max_steps}"
+    )
+    bus.log(
+        "Training objective: "
+        f"positive_sample_fraction={cfg.positive_sample_fraction:.2f}, "
+        f"negative_loss_weight={cfg.negative_loss_weight:.2f}, "
+        f"hard_negative_threshold={cfg.hard_negative_threshold:.2f}, "
+        f"hard_negative_loss_weight={cfg.hard_negative_loss_weight:.2f}, "
+        "weighted_loss=normalized"
     )
 
     history: list[dict] = []
@@ -544,6 +606,8 @@ def train(
                 val_recall_at_p95=metrics["recall_at_p95"],
                 val_recall_at_target_fp=metrics["recall_at_target_fp"],
                 val_fp_per_hour=metrics["fp_per_hour"],
+                val_recall_at_0_5=metrics["recall_at_0_5"],
+                val_fp_per_hour_at_0_5=metrics["fp_per_hour_at_0_5"],
                 threshold=metrics["threshold"],
             )
             bus.log(
@@ -551,6 +615,8 @@ def train(
                 f"recall@p95={metrics['recall_at_p95']:.3f} "
                 f"recall@targetFP={metrics['recall_at_target_fp']:.3f} "
                 f"FP/hr={metrics['fp_per_hour']:.2f} "
+                f"recall@0.5={metrics['recall_at_0_5']:.3f} "
+                f"rawFP/hr@0.5={metrics['fp_per_hour_at_0_5']:.2f} "
                 f"threshold={metrics['threshold']:.5f}"
             )
             score = _checkpoint_score(metrics, cfg)
@@ -579,9 +645,16 @@ def train(
                     )
                     break
 
-            if _is_exportable(metrics, cfg):
+            if _is_exportable(metrics, cfg) and step >= cfg.early_stop_min_steps:
                 bus.log("Hit target FP/hour with strong recall. Stopping.", level="info")
                 break
+            if _is_exportable(metrics, cfg) and step < cfg.early_stop_min_steps:
+                bus.log(
+                    "Checkpoint is exportable; continuing until "
+                    f"early_stop_min_steps={cfg.early_stop_min_steps} "
+                    "to improve quality.",
+                    level="info",
+                )
 
     # Restore best weights and export.
     best_path = out_dir / "best.pt"

@@ -50,6 +50,29 @@ code {
 .brand-icon { width: 28px; height: 28px; border-radius: 6px; }
 .topbar h1 { font-size: 18px; margin: 0; }
 
+.main-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 20px;
+}
+.main-nav a {
+  color: var(--muted);
+  padding: 7px 12px;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 13px;
+}
+.main-nav a:hover {
+  color: var(--text);
+  text-decoration: none;
+  background: var(--panel-2);
+}
+.main-nav a.active {
+  color: #fff;
+  background: var(--accent);
+}
+
 .topbar-right { display: flex; align-items: center; gap: 14px; }
 
 .github-link {
@@ -269,6 +292,13 @@ textarea {
 .span-2 { grid-column: span 2; }
 
 @media (max-width: 800px) {
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .main-nav { margin: 0; width: 100%; }
+  .topbar-right { width: 100%; }
   .grid, .grid-2 { grid-template-columns: 1fr; }
   .session-layout,
   .session-actions { grid-template-columns: 1fr; }
@@ -435,3 +465,48 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .score-bar.miss .fill { background: var(--bad); }
 
 audio { width: 100%; margin-top: 10px; }
+
+/* ---------------- System page ---------------- */
+
+.system-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.system-danger-zone {
+  margin-top: 10px;
+}
+.table-wrap {
+  overflow-x: auto;
+}
+.session-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.session-table th,
+.session-table td {
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+.session-table th {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.session-table tr:last-child td {
+  border-bottom: 0;
+}
+.row-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  white-space: nowrap;
+}
+.empty-row {
+  color: var(--muted);
+  text-align: center;
+}
