@@ -15,6 +15,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # auto = public onnxruntime-gpu wheel on linux/amd64, source build on linux/arm64.
+        ORT_BUILD_FROM_SOURCE: ${OWW_ORT_BUILD_FROM_SOURCE:-auto}
+        # Only used when ORT is source-built. RTX 4090 = 89, DGX Spark/RTX 50-series = 120.
+        CUDA_ARCHITECTURES: ${OWW_CUDA_ARCHITECTURES:-120}
+        BUILD_PARALLEL: ${OWW_BUILD_PARALLEL:-8}
     image: oww-trainer:latest
     container_name: oww-trainer
     restart: unless-stopped

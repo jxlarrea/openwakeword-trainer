@@ -42,7 +42,7 @@ code {
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 24px;
-  background: var(--panel);
+  background: rgb(1, 4, 9);
   border-bottom: 1px solid var(--border);
 }
 .brand { display: flex; align-items: center; gap: 10px; }

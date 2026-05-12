@@ -1,21 +1,25 @@
 # syntax=docker/dockerfile:1.7
 #
-# OpenWakeWord Trainer - DGX Spark / aarch64+CUDA build.
+# OpenWakeWord Trainer - CUDA build.
 #
 # Two-stage build:
-#   Stage 1 (ort-builder): compile onnxruntime-gpu from source with sm_100
-#                          (Blackwell GB10) and sm_120 kernels. This is the
-#                          only way to get aarch64+CUDA onnxruntime as no
-#                          public wheel exists.
+#   Stage 1 (ort-builder): produce an onnxruntime-gpu wheel. On linux/amd64
+#                          this downloads the public PyPI wheel. On linux/arm64
+#                          it compiles from source because no public aarch64
+#                          CUDA wheel exists.
 #   Stage 2 (base):        slim runtime image that pip-installs the wheel
 #                          built in stage 1, plus our app deps.
 
 ARG CUDA_VERSION=12.8.0
 ARG UBUNTU_VERSION=22.04
 ARG ORT_VERSION=v1.20.1
-# GB10 = sm_120. We do NOT build for sm_100 (datacenter B100/B200) because
-# (a) we don't run on those and (b) building both doubled CUDA template
-# memory pressure and OOM'd the DGX Spark during compile.
+ARG ORT_PIP_VERSION=1.20.1
+# auto: use public onnxruntime-gpu wheel on amd64, source-build on arm64.
+# 1/true/yes: force source-build, useful if you need a custom CUDA arch set.
+ARG ORT_BUILD_FROM_SOURCE=auto
+# Used only when ORT is built from source. GB10/RTX 50-series Blackwell use
+# sm_120. RTX 4090 Ada uses sm_89. Multiple values are allowed, e.g. "89;120",
+# but compile time and memory use increase significantly.
 ARG CUDA_ARCHITECTURES=120
 # Build parallelism. CUDA template compilation peaks at ~5-15 GB per NVCC
 # instance during flash_attention compile. 8 workers x ~10 GB avg = ~80 GB peak,
@@ -25,13 +29,16 @@ ARG CUDA_ARCHITECTURES=120
 ARG BUILD_PARALLEL=8
 
 # ============================================================================
-# Stage 1: Build onnxruntime-gpu wheel
+# Stage 1: Produce onnxruntime-gpu wheel
 # ============================================================================
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS ort-builder
 
 ARG ORT_VERSION
+ARG ORT_PIP_VERSION
+ARG ORT_BUILD_FROM_SOURCE
 ARG CUDA_ARCHITECTURES
 ARG BUILD_PARALLEL
+ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -53,48 +60,57 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 
 WORKDIR /build
 
-# Pin to a release tag for reproducibility.
-RUN git clone --depth 1 --branch ${ORT_VERSION} https://github.com/microsoft/onnxruntime.git
-
-WORKDIR /build/onnxruntime
-
-# Patch the Eigen download URL: gitlab.com is Cloudflare-challenged inside the
-# build container, so we redirect FetchContent to the GitHub mirror. We have to
-# download the archive once to compute its SHA1 (the GitHub archive ZIP has
-# a different layout than GitLab's so the original hash is wrong) and then
-# patch deps.txt with the new URL + new hash. ExternalProject requires a
-# valid URL_HASH; empty fails parsing.
-RUN EIGEN_COMMIT=$(grep '^eigen;' cmake/deps.txt | grep -oE 'archive/[a-f0-9]{40}' | head -1 | cut -d/ -f2) \
- && echo "Eigen commit: $EIGEN_COMMIT" \
- && EIGEN_URL="https://github.com/eigen-mirror/eigen/archive/${EIGEN_COMMIT}.zip" \
- && echo "Downloading $EIGEN_URL to compute SHA1..." \
- && curl -sSfL -o /tmp/eigen.zip "$EIGEN_URL" \
- && EIGEN_SHA1=$(sha1sum /tmp/eigen.zip | awk '{print $1}') \
- && echo "Eigen SHA1: $EIGEN_SHA1" \
- && rm /tmp/eigen.zip \
- && sed -i -E "s|^eigen;.*$|eigen;${EIGEN_URL};${EIGEN_SHA1}|" cmake/deps.txt \
- && grep -i eigen cmake/deps.txt
-
-# Compile. --use_cuda enables the CUDA EP; CMAKE_CUDA_ARCHITECTURES picks
-# which sm_* kernels to emit. Build is single-config Release with all cores.
-RUN python tools/ci_build/build.py \
-        --build_dir /build/ort-build \
-        --config Release \
-        --parallel ${BUILD_PARALLEL} \
-        --nvcc_threads 1 \
-        --skip_tests \
-        --allow_running_as_root \
-        --compile_no_warning_as_error \
-        --use_cuda \
-        --cuda_home /usr/local/cuda \
-        --cudnn_home /usr/local/cuda \
-        --cmake_extra_defines \
-            "CMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}" \
-            "onnxruntime_BUILD_UNIT_TESTS=OFF" \
-            "FETCHCONTENT_QUIET=OFF" \
-        --build_wheel \
-        --update --build \
-    && ls -la /build/ort-build/Release/dist/
+RUN set -eux; \
+    mkdir -p /build/ort-wheel; \
+    build_from_source="${ORT_BUILD_FROM_SOURCE}"; \
+    if [ "${build_from_source}" = "auto" ]; then \
+        if [ "${TARGETARCH}" = "amd64" ]; then build_from_source="0"; else build_from_source="1"; fi; \
+    fi; \
+    case "${build_from_source}" in \
+        0|false|False|no|No) \
+            echo "Using public onnxruntime-gpu==${ORT_PIP_VERSION} wheel for TARGETARCH=${TARGETARCH}"; \
+            python -m pip download \
+                --only-binary=:all: \
+                --no-deps \
+                --dest /build/ort-wheel \
+                "onnxruntime-gpu==${ORT_PIP_VERSION}"; \
+            ;; \
+        1|true|True|yes|Yes) \
+            echo "Building onnxruntime-gpu ${ORT_VERSION} from source for TARGETARCH=${TARGETARCH}, CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}"; \
+            git clone --depth 1 --branch "${ORT_VERSION}" https://github.com/microsoft/onnxruntime.git /build/onnxruntime; \
+            cd /build/onnxruntime; \
+            EIGEN_COMMIT=$(grep '^eigen;' cmake/deps.txt | grep -oE 'archive/[a-f0-9]{40}' | head -1 | cut -d/ -f2); \
+            echo "Eigen commit: ${EIGEN_COMMIT}"; \
+            EIGEN_URL="https://github.com/eigen-mirror/eigen/archive/${EIGEN_COMMIT}.zip"; \
+            curl -sSfL -o /tmp/eigen.zip "${EIGEN_URL}"; \
+            EIGEN_SHA1=$(sha1sum /tmp/eigen.zip | awk '{print $1}'); \
+            rm /tmp/eigen.zip; \
+            sed -i -E "s|^eigen;.*$|eigen;${EIGEN_URL};${EIGEN_SHA1}|" cmake/deps.txt; \
+            python tools/ci_build/build.py \
+                --build_dir /build/ort-build \
+                --config Release \
+                --parallel "${BUILD_PARALLEL}" \
+                --nvcc_threads 1 \
+                --skip_tests \
+                --allow_running_as_root \
+                --compile_no_warning_as_error \
+                --use_cuda \
+                --cuda_home /usr/local/cuda \
+                --cudnn_home /usr/local/cuda \
+                --cmake_extra_defines \
+                    "CMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}" \
+                    "onnxruntime_BUILD_UNIT_TESTS=OFF" \
+                    "FETCHCONTENT_QUIET=OFF" \
+                --build_wheel \
+                --update --build; \
+            cp /build/ort-build/Release/dist/*.whl /build/ort-wheel/; \
+            ;; \
+        *) \
+            echo "Invalid ORT_BUILD_FROM_SOURCE=${ORT_BUILD_FROM_SOURCE}; use auto, true, or false" >&2; \
+            exit 2; \
+            ;; \
+    esac; \
+    ls -la /build/ort-wheel/
 
 # ============================================================================
 # Stage 2: Runtime image
@@ -125,15 +141,15 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /app
 
-# PyTorch from cu128 (aarch64 + Blackwell native).
+# PyTorch from cu128.
 ARG TORCH_VERSION=2.7.0
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 RUN python -m pip install --upgrade pip wheel setuptools \
  && python -m pip install --index-url "${TORCH_INDEX}" \
         "torch==${TORCH_VERSION}" "torchaudio==${TORCH_VERSION}"
 
-# Copy the locally-built onnxruntime-gpu wheel from stage 1 but DO NOT install yet.
-COPY --from=ort-builder /build/ort-build/Release/dist/*.whl /tmp/wheels/
+# Copy the onnxruntime-gpu wheel from stage 1 but DO NOT install yet.
+COPY --from=ort-builder /build/ort-wheel/*.whl /tmp/wheels/
 
 # Project requirements first. piper-tts + openwakeword list `onnxruntime` as a
 # dep (the CPU package), and pip will install it. We accept that, then

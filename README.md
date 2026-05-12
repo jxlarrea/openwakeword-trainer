@@ -8,7 +8,7 @@ Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but th
 
 ## Highlights
 
-- **GPU end-to-end.** Feature extraction (Google speech-embedding ONNX) runs on the GPU via a locally-compiled `onnxruntime-gpu` wheel for aarch64+CUDA. PyTorch trains the classifier head on the same device.
+- **GPU end-to-end.** Feature extraction (Google speech-embedding ONNX) runs on the GPU via `onnxruntime-gpu` (public wheel on amd64, source-built on aarch64). PyTorch trains the classifier head on the same device.
 - **Parallel TTS.** Piper synthesis runs across a process pool (10 workers x 2 ORT threads on DGX Spark by default) so generating ~100k clips takes ~20 min instead of ~4 hours.
 - **Session-based workflow.** Create or select a wake-word session first. A session owns `/data/runs/<session_id>`, so cached WAVs, features, checkpoints, config, and model naming are reused on later visits.
 - **Resumable pipeline.** Every long phase drops sentinels: WAV generation is cached per session, corpora downloads are sentinel-marked, and re-running a failed run skips work that was already done.
@@ -59,7 +59,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-> **First build is slow.** The Dockerfile compiles `onnxruntime-gpu` from source for sm_120 Blackwell kernels. Expect **25 to 60 minutes** on a fast CPU. The base layers, dependencies, and ORT compile are then cached for every subsequent build.
+> **First build on DGX Spark / arm64 is slow.** The Dockerfile compiles `onnxruntime-gpu` from source for sm_120 Blackwell kernels because there is no public aarch64 CUDA wheel. Expect **25 to 60 minutes** on a fast CPU. On normal linux/amd64 hosts, Compose defaults to the public `onnxruntime-gpu` wheel instead, so the build is much faster.
 
 Open http://localhost:8000.
 
@@ -94,6 +94,35 @@ Expected output:
 torch: 2.7.0+cu128 | cuda? True | NVIDIA GB10
 ort: 1.20.1 | ['CUDAExecutionProvider', 'CPUExecutionProvider']
 ```
+
+## Desktop NVIDIA GPUs
+
+On regular linux/x86_64 systems (for example RTX 4090 or RTX 5090 desktops), the default Compose build uses the public `onnxruntime-gpu` wheel instead of compiling ONNX Runtime from source:
+
+```bash
+docker compose build
+docker compose up
+```
+
+That path ignores `OWW_CUDA_ARCHITECTURES`; the wheel already contains the CUDA provider. You still need an NVIDIA driver new enough for CUDA 12.8 and `nvidia-container-toolkit`.
+
+If you explicitly force an ONNX Runtime source build on x86_64, set the GPU architecture in `.env`:
+
+```bash
+# RTX 4090 / Ada Lovelace
+OWW_ORT_BUILD_FROM_SOURCE=true
+OWW_CUDA_ARCHITECTURES=89
+
+# DGX Spark GB10 / RTX 50-series Blackwell
+OWW_ORT_BUILD_FROM_SOURCE=true
+OWW_CUDA_ARCHITECTURES=120
+
+# One image for both families, at the cost of much higher compile time/RAM
+OWW_ORT_BUILD_FROM_SOURCE=true
+OWW_CUDA_ARCHITECTURES=89;120
+```
+
+For most x86_64 users, leave `OWW_ORT_BUILD_FROM_SOURCE=auto`.
 
 ## Storage layout
 
@@ -251,6 +280,9 @@ All settable via `.env` in the repo root. Defaults are in `src/settings.py` and 
 | `OWW_DATA_DIR_HOST` | (unset; uses named volume) | Host path to bind-mount at `/data` |
 | `OWW_PORT`, `WEB_PORT` | 8000 | Web UI port |
 | `OWW_LOG_LEVEL` | INFO | Python logging level |
+| `OWW_ORT_BUILD_FROM_SOURCE` | auto | Build-time: `auto` uses PyPI ORT GPU wheel on amd64 and source-build on arm64 |
+| `OWW_CUDA_ARCHITECTURES` | 120 | Build-time: CUDA arch list for source-built ONNX Runtime (`89` for RTX 4090, `120` for GB10/RTX 50-series) |
+| `OWW_BUILD_PARALLEL` | 8 | Build-time: source-build parallelism for ONNX Runtime |
 | `OWW_GENERATION_WORKERS` | 0 (auto: `min(10, cpu_count)`) | Piper parallel pool size |
 | `OWW_PIPER_ORT_THREADS` | 2 | Onnxruntime intra-op threads per Piper worker |
 | `OWW_PIPER_USE_CUDA` | true | Run Piper TTS on GPU |
@@ -280,7 +312,7 @@ What NOT to tune unless you really know:
 
 ## Known limitations
 
-- **First build compiles onnxruntime-gpu from source** (no pre-built aarch64+CUDA wheel exists on PyPI). 25 to 60 min cold; cached after that.
+- **DGX Spark / arm64 builds compile onnxruntime-gpu from source** (no pre-built aarch64+CUDA wheel exists on PyPI). 25 to 60 min cold; cached after that. linux/amd64 builds use the public wheel by default.
 - **First full-data run downloads a lot of data.** ACAV100M alone is ~17 GB, FSD50K is ~34 GB, and MUSAN is ~26 GB. Keep `/data` on a filesystem with enough headroom.
 - **`mozilla-foundation/common_voice_17_0` on Hugging Face requires accepting Mozilla's terms** once on huggingface.co before your `HF_TOKEN` can download. The trainer uses `fsicoli/common_voice_17_0` (community parquet-less mirror) and bypasses the gating with direct tar-shard fetches, but you still need a valid HF token.
 - **Eigen FetchContent** is patched at build time to use the GitHub mirror because gitlab.com Cloudflare-blocks anonymous downloads from build containers.
@@ -317,7 +349,7 @@ python -m uvicorn src.main:app --reload --port 8000
 
 ```
 .
-|-- Dockerfile              # multi-stage: builds onnxruntime-gpu from source then runtime image
+|-- Dockerfile              # multi-stage: prepares ORT GPU wheel then runtime image
 |-- compose.yaml            # named volume by default; OWW_DATA_DIR_HOST switches to bind mount
 |-- requirements.txt
 |-- .env.example
