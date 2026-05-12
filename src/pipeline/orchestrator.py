@@ -475,6 +475,7 @@ def _run(cfg: TrainRunConfig) -> None:
         run_id, run_dir = _make_run_dir(cfg)
         state.run_id = run_id
         state.run_dir = run_dir
+        bus.start_run(run_id, run_dir)
         bus.publish("run_started", run_id=run_id, run_dir=str(run_dir), wake_word=cfg.wake_word)
         _save_config(run_dir, cfg)
         for stale_name in ("wakeword.onnx", "best.pt", "best_candidate.pt", "result.json"):
@@ -667,6 +668,7 @@ def _run(cfg: TrainRunConfig) -> None:
             bus.error(str(exc))
     finally:
         state.finished_at = time.time()
+        bus.finish_run()
 
 
 def start_run(cfg: TrainRunConfig) -> bool:

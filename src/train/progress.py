@@ -10,11 +10,13 @@ asyncio.Queue. Cross-thread enqueue is handled via loop.call_soon_threadsafe.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,12 @@ class EventBus:
     def __init__(self, history_size: int = 200) -> None:
         self._subscribers: set[_Subscriber] = set()
         self._history: deque[Event] = deque(maxlen=history_size)
+        self._logs: deque[dict[str, Any]] = deque(maxlen=3000)
+        self._phase: dict[str, Any] | None = None
+        self._progress: dict[str, dict[str, Any]] = {}
+        self._metrics: dict[str, Any] = {}
+        self._run_id: str | None = None
+        self._persist_path: Path | None = None
         # threading.Lock protects mutations from any thread.
         self._lock = threading.Lock()
 
@@ -65,7 +73,11 @@ class EventBus:
         ev = Event(kind=kind, payload=payload, timestamp=time.time())
         with self._lock:
             self._history.append(ev)
+            self._update_snapshot_locked(ev)
+            persist_path = self._persist_path
             subs = list(self._subscribers)
+        if persist_path is not None:
+            self._persist_event(persist_path, ev)
 
         # Fan out without awaiting; drop on full to avoid blocking the producer.
         for sub in subs:
@@ -96,6 +108,75 @@ class EventBus:
         # Named "run_error" so it doesn't collide with EventSource's built-in
         # connection-error event in the browser.
         self.publish("run_error", message=message, **extra)
+
+    # Persistent run snapshot ---------------------------------------------
+
+    def start_run(self, run_id: str, run_dir: Path) -> None:
+        """Start a durable per-run event log and clear the live snapshot."""
+        path = run_dir / "live_events.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        with self._lock:
+            self._history.clear()
+            self._logs.clear()
+            self._phase = None
+            self._progress = {}
+            self._metrics = {}
+            self._run_id = run_id
+            self._persist_path = path
+
+    def finish_run(self) -> None:
+        with self._lock:
+            self._persist_path = None
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "run_id": self._run_id,
+                "phase": dict(self._phase) if self._phase else None,
+                "progress": [dict(v) for v in self._progress.values()],
+                "metrics": dict(self._metrics),
+                "logs": list(self._logs),
+            }
+
+    def _update_snapshot_locked(self, ev: Event) -> None:
+        if ev.kind == "run_started":
+            self._run_id = ev.payload.get("run_id") or self._run_id
+        elif ev.kind == "phase":
+            self._phase = {
+                "name": ev.payload.get("name", ""),
+                "detail": ev.payload.get("detail", ""),
+                "ts": ev.timestamp,
+            }
+        elif ev.kind == "progress":
+            name = str(ev.payload.get("name", ""))
+            if name:
+                self._progress[name] = {
+                    "name": name,
+                    "fraction": ev.payload.get("fraction", 0.0),
+                    "detail": ev.payload.get("detail", ""),
+                    "ts": ev.timestamp,
+                }
+        elif ev.kind == "metric":
+            for key, value in ev.payload.items():
+                if key not in ("kind", "ts"):
+                    self._metrics[key] = value
+        elif ev.kind == "log":
+            self._logs.append(
+                {
+                    "level": ev.payload.get("level", "info"),
+                    "message": ev.payload.get("message", ""),
+                    "ts": ev.timestamp,
+                }
+            )
+
+    @staticmethod
+    def _persist_event(path: Path, ev: Event) -> None:
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(ev.to_dict(), ensure_ascii=False) + "\n")
+        except Exception:
+            logger.warning("Failed to persist progress event to %s", path, exc_info=True)
 
 
 def _safe_put_nowait(q: asyncio.Queue, ev: Event) -> None:

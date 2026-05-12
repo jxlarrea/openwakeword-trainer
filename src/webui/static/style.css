@@ -1,7 +1,8 @@
 :root {
   --bg: #0e1116;
-  --panel: #161b22;
+  --panel: rgb(21, 27, 35);
   --panel-2: #1f2630;
+  --field-bg: rgb(13, 17, 23);
   --text: #e6edf3;
   --muted: #9ba9b8;
   --accent: #58a6ff;
@@ -79,10 +80,14 @@ main {
   padding: 24px;
   display: flex; flex-direction: column; gap: 20px;
 }
+body.run-active #progress {
+  order: -1;
+  border-color: var(--warn);
+}
 
 .card {
   background: var(--panel);
-  border: 1px solid var(--border);
+  border: none;
   border-radius: var(--radius);
   padding: 22px;
 }
@@ -213,7 +218,7 @@ fieldset.invalid {
 }
 
 input, textarea, select {
-  background: var(--panel-2);
+  background: var(--field-bg);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -284,17 +289,30 @@ button {
   transition: background 0.1s;
 }
 button:hover:not(:disabled) { background: #2a3140; }
-button.primary { background: var(--accent); color: #0e1116; border-color: var(--accent); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
 button.primary:hover:not(:disabled) { background: #79b8ff; }
 button.danger { background: var(--bad); color: #fff; border-color: var(--bad); }
-button.danger:hover:not(:disabled) { filter: brightness(1.1); }
+button.danger:hover:not(:disabled) { background: #ff7b72; border-color: #ff7b72; }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+#start-btn,
+#cancel-btn,
+#progress-cancel-btn {
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #fff;
+}
+#start-btn.primary {
+  color: #fff;
+}
 
 .actions {
   display: flex; gap: 12px; align-items: center; margin-top: 16px;
   flex-wrap: wrap;
 }
 .test-actions { margin-top: 8px; margin-bottom: 8px; }
+.progress-actions { margin-top: -4px; margin-bottom: 12px; }
 
 /* In the test section, the upload-row grid sits between two .test-actions rows;
  * give it breathing room from the preceding row. */

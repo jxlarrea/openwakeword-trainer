@@ -229,14 +229,18 @@
 
     <div class="actions">
       <button type="submit" class="primary" id="start-btn">Start training</button>
-      <button type="button" class="danger" id="cancel-btn" style="display:none">Cancel running</button>
+      <button type="button" class="danger" id="cancel-btn" style="display:none">Cancel training</button>
       <span id="status-pill" class="pill">{{ state.status }}</span>
     </div>
   </form>
 </section>
 
-<section id="progress" class="card">
-  <h2>3. Progress</h2>
+<section id="progress" class="card" hidden>
+  <h2 id="progress-title">Progress</h2>
+  <div class="actions progress-actions">
+    <span id="progress-status-pill" class="pill">{{ state.status }}</span>
+    <button type="button" class="danger" id="progress-cancel-btn" style="display:none">Cancel training</button>
+  </div>
   <div id="phase-banner" class="phase">Idle</div>
   <div class="progress-bars" id="progress-bars"></div>
   <div class="metrics" id="metrics"></div>
@@ -247,7 +251,7 @@
 </section>
 
 <section id="test" class="card">
-  <h2>4. Test a trained model</h2>
+  <h2>3. Test a trained model</h2>
   <form id="test-form">
     <div class="grid">
       <label class="span-2">Model

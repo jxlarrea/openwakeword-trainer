@@ -17,7 +17,15 @@
   const newSessionWakeWord = $("#new-session-wake-word");
   const sessionSummary = $("#session-summary");
   const configCard = $("#config");
+  const testForm = $("#test-form");
+  const progressCancelBtn = $("#progress-cancel-btn");
+  const progressStatusPill = $("#progress-status-pill");
+  const progressCard = $("#progress");
+  const progressTitle = $("#progress-title");
   let currentSession = null;
+  let runStatus = "idle";
+  let hasRunProgress = false;
+  let progressRunId = null;
 
   function slugify(s) {
     return String(s || "")
@@ -39,13 +47,40 @@
   }
 
   function setFormEnabled(enabled) {
-    configCard?.classList.toggle("disabled-card", !enabled);
+    const canEdit = enabled && runStatus !== "running";
+    configCard?.classList.toggle("disabled-card", !canEdit);
     $$("#train-form input, #train-form select, #train-form textarea, #train-form button").forEach((el) => {
       if (el.id === "cancel-btn") return;
-      el.disabled = !enabled;
+      el.disabled = !canEdit;
     });
     if (wakeInput) wakeInput.readOnly = true;
     if (runNameInput) runNameInput.readOnly = true;
+  }
+
+  function setSessionControlsLocked(locked) {
+    if (sessionSelect) sessionSelect.disabled = locked;
+    if (newSessionWakeWord) newSessionWakeWord.disabled = locked;
+    if (createSessionBtn) createSessionBtn.disabled = locked;
+    if (deleteSessionBtn) deleteSessionBtn.disabled = locked || !currentSession;
+  }
+
+  function setTestFormEnabled(enabled) {
+    if (!testForm) return;
+    testForm.querySelectorAll("input, select, textarea, button").forEach((el) => {
+      if (!enabled) {
+        el.disabled = true;
+        return;
+      }
+      if (el.id === "stop-record-btn") {
+        el.disabled = true;
+        return;
+      }
+      if (el.id === "record-btn" && !(window.isSecureContext || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
+        el.disabled = true;
+        return;
+      }
+      el.disabled = false;
+    });
   }
 
   function setChecked(form, name, value) {
@@ -64,6 +99,7 @@
     const cfg = session.config;
     currentSession = session;
     setFormEnabled(true);
+    setRunState(runStatus);
     if (sessionIdInput) sessionIdInput.value = session.id;
     if (wakeInput) wakeInput.value = cfg.wake_word || session.wake_word || "";
     if (runNameInput) runNameInput.value = session.id;
@@ -112,7 +148,7 @@
     setValue(form, "target_false_positives_per_hour", tr.target_false_positives_per_hour);
     setValue(form, "seed", tr.seed);
 
-    if (deleteSessionBtn) deleteSessionBtn.disabled = false;
+    if (deleteSessionBtn) deleteSessionBtn.disabled = runStatus === "running";
     if (sessionSummary) {
       sessionSummary.textContent =
         `${session.wake_word} (${session.id}) - cache ${fmtBytes(session.size_bytes || 0)}` +
@@ -142,7 +178,8 @@
     if (!id) {
       currentSession = null;
       setFormEnabled(false);
-      if (deleteSessionBtn) deleteSessionBtn.disabled = true;
+      setRunState(runStatus);
+      setSessionControlsLocked(runStatus === "running");
       if (sessionSummary) sessionSummary.textContent = "Select or create a session to configure training.";
       return;
     }
@@ -353,7 +390,9 @@
       return;
     }
     const data = await res.json();
+    hasRunProgress = true;
     setRunState(data.status);
+    if (data.status === "running") scrollToTop();
   });
 
   // Clear validation styling when the user starts fixing things.
@@ -366,8 +405,15 @@
   });
 
   $("#cancel-btn")?.addEventListener("click", async () => {
-    await fetch("/api/train/cancel", { method: "POST" });
+    await requestCancel();
   });
+  progressCancelBtn?.addEventListener("click", async () => {
+    await requestCancel();
+  });
+
+  async function requestCancel() {
+    await fetch("/api/train/cancel", { method: "POST" });
+  }
 
   function formToPayload(fd) {
     const v = (k) => fd.get(k) || "";
@@ -438,13 +484,35 @@
     const pill = $("#status-pill");
     const startBtn = $("#start-btn");
     const cancelBtn = $("#cancel-btn");
-    if (!pill) return;
-    pill.textContent = state || "idle";
-    pill.className = "pill " + (state || "");
+    runStatus = state || "idle";
+    [pill, progressStatusPill].forEach((el) => {
+      if (!el) return;
+      el.textContent = runStatus;
+      el.className = "pill " + runStatus;
+    });
 
-    const isRunning = state === "running";
+    const isRunning = runStatus === "running";
+    const progressBelongsToCurrentSession =
+      !currentSession || !progressRunId || currentSession.id === progressRunId;
+    const showProgress =
+      isRunning ||
+      ((hasRunProgress || !["idle", ""].includes(runStatus)) && progressBelongsToCurrentSession);
+    if (progressCard) progressCard.hidden = !showProgress;
+    if (progressTitle) progressTitle.textContent = progressRunId ? `Progress: ${progressRunId}` : "Progress";
+    document.body.classList.toggle("run-active", showProgress);
     if (startBtn) startBtn.style.display = isRunning ? "none" : "";
     if (cancelBtn) cancelBtn.style.display = isRunning ? "" : "none";
+    if (progressCancelBtn) progressCancelBtn.style.display = isRunning ? "" : "none";
+    setSessionControlsLocked(isRunning);
+    setFormEnabled(Boolean(currentSession));
+    setTestFormEnabled(!isRunning);
+    if (isRunning && phaseBanner && phaseBanner.textContent === "Idle") {
+      phaseBanner.textContent = "training is running";
+    }
+  }
+
+  function scrollToTop() {
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   // ---------- SSE: live progress ----------
@@ -455,6 +523,7 @@
   const logEl = $("#log");
   const progressMap = new Map();
   const metricMap = new Map();
+  const seenLogs = new Set();
 
   function ensureProgressBar(name) {
     let bar = progressMap.get(name);
@@ -490,12 +559,42 @@
     tile.querySelector(".value").textContent = value;
   }
 
-  function appendLog(level, msg) {
+  function appendLog(level, msg, ts) {
+    const key = `${ts || ""}|${level || "info"}|${msg}`;
+    if (seenLogs.has(key)) return;
+    seenLogs.add(key);
     const span = document.createElement("span");
     span.className = "l-" + (level || "info");
     span.textContent = msg + "\n";
     logEl.appendChild(span);
     logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function hydrateProgress(progress) {
+    if (!progress) return;
+    progressRunId = progress.run_id || progressRunId;
+    hasRunProgress = Boolean(
+      progress.run_id ||
+      progress.phase ||
+      (progress.progress || []).length ||
+      Object.keys(progress.metrics || {}).length ||
+      (progress.logs || []).length
+    );
+    if (progress.phase?.name && phaseBanner) {
+      phaseBanner.textContent =
+        `phase: ${progress.phase.name}` +
+        (progress.phase.detail ? ` -> ${progress.phase.detail}` : "");
+    }
+    (progress.progress || []).forEach((p) => {
+      setProgress(p.name, Number(p.fraction) || 0, p.detail || "");
+    });
+    Object.entries(progress.metrics || {}).forEach(([k, v]) => {
+      setMetric(k, fmt(v));
+    });
+    (progress.logs || []).forEach((l) => {
+      appendLog(l.level, l.message, l.ts);
+    });
+    setRunState(runStatus);
   }
 
   function fmt(v) {
@@ -537,14 +636,22 @@
   const es = new EventSource("/api/events");
   es.addEventListener("phase", (e) => {
     const d = JSON.parse(e.data);
+    hasRunProgress = true;
+    progressRunId = d.run_id || progressRunId;
+    if (progressCard) progressCard.hidden = false;
+    document.body.classList.add("run-active");
     phaseBanner.textContent = `phase: ${d.name}` + (d.detail ? ` -> ${d.detail}` : "");
   });
   es.addEventListener("progress", (e) => {
     const d = JSON.parse(e.data);
+    hasRunProgress = true;
+    if (progressCard) progressCard.hidden = false;
     setProgress(d.name, d.fraction, d.detail || "");
   });
   es.addEventListener("metric", (e) => {
     const d = JSON.parse(e.data);
+    hasRunProgress = true;
+    if (progressCard) progressCard.hidden = false;
     Object.keys(d).forEach((k) => {
       if (k === "kind" || k === "ts") return;
       setMetric(k, fmt(d[k]));
@@ -556,28 +663,35 @@
   });
   es.addEventListener("log", (e) => {
     const d = JSON.parse(e.data);
-    appendLog(d.level, d.message);
+    hasRunProgress = true;
+    if (progressCard) progressCard.hidden = false;
+    appendLog(d.level, d.message, d.ts);
   });
   es.addEventListener("run_started", (e) => {
     const d = JSON.parse(e.data);
-    appendLog("info", `Run started: ${d.run_id} (${d.wake_word})`);
+    hasRunProgress = true;
+    if (progressCard) progressCard.hidden = false;
+    appendLog("info", `Run started: ${d.run_id} (${d.wake_word})`, d.ts);
     setRunState("running");
+    scrollToTop();
   });
   es.addEventListener("complete", (e) => {
     const d = JSON.parse(e.data);
-    appendLog("info", `Complete -> ${d.onnx_path}`);
+    appendLog("info", `Complete -> ${d.onnx_path}`, d.ts);
     setRunState("succeeded");
     refreshModels();
   });
   es.addEventListener("run_error", (e) => {
     try {
       const d = JSON.parse(e.data);
-      appendLog("error", d.message);
+      appendLog("error", d.message, d.ts);
       setRunState("failed");
     } catch {}
   });
-  es.addEventListener("cancelled", () => {
-    appendLog("warning", "Run cancelled");
+  es.addEventListener("cancelled", (e) => {
+    let ts;
+    try { ts = JSON.parse(e.data).ts; } catch {}
+    appendLog("warning", "Run cancelled", ts);
     setRunState("cancelled");
   });
   es.onerror = () => {
@@ -754,8 +868,24 @@
 
   fetch("/api/train/status")
     .then((r) => r.json())
-    .then((s) => {
+    .then(async (s) => {
       setRunState(s.status);
+      if (s.status === "running" && s.run_id) {
+        if (sessionSelect) sessionSelect.value = s.run_id;
+        await loadSession(s.run_id);
+        if (sessionSummary) {
+          sessionSummary.textContent = `${s.wake_word || s.run_id} (${s.run_id}) - training in progress`;
+        }
+      }
+      progressRunId = s.progress?.run_id || s.run_id || progressRunId;
+      hydrateProgress(s.progress);
+      if (s.run_id && s.status !== "idle") {
+        hasRunProgress = true;
+        setRunState(s.status);
+      }
+      if (s.status === "running" && !s.progress?.phase && phaseBanner) {
+        phaseBanner.textContent = `training: ${s.run_id || "active run"}`;
+      }
       if (s.system) updateSystemMetrics(s.system);
     });
 })();

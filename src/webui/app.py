@@ -110,6 +110,8 @@ def register_routes(api: APIRouter) -> None:
 
     @api.post("/api/sessions")
     async def sessions_create(request: Request):
+        if orchestrator.state.status == "running":
+            raise HTTPException(status_code=409, detail="Cannot create a session while training is running.")
         payload = await request.json()
         try:
             return create_session((payload or {}).get("wake_word", ""))
@@ -126,8 +128,8 @@ def register_routes(api: APIRouter) -> None:
     @api.delete("/api/sessions/{session_id}")
     def sessions_delete(session_id: str):
         sid = slugify(session_id)
-        if orchestrator.state.status == "running" and orchestrator.state.run_id == sid:
-            raise HTTPException(status_code=409, detail="Cannot delete a running session.")
+        if orchestrator.state.status == "running":
+            raise HTTPException(status_code=409, detail="Cannot delete sessions while training is running.")
         delete_session(sid)
         return {"deleted": True, "id": sid}
 
@@ -147,6 +149,9 @@ def register_routes(api: APIRouter) -> None:
 
         if not payload:
             raise HTTPException(status_code=400, detail="empty payload")
+
+        if orchestrator.state.status == "running":
+            raise HTTPException(status_code=409, detail="A run is already in progress.")
 
         try:
             session_id = slugify(payload.get("session_id") or payload.get("run_name") or "")
@@ -170,7 +175,11 @@ def register_routes(api: APIRouter) -> None:
 
     @api.get("/api/train/status")
     def train_status():
-        return {**orchestrator.state.to_dict(), "system": sample_system()}
+        return {
+            **orchestrator.state.to_dict(),
+            "system": sample_system(),
+            "progress": bus.snapshot(),
+        }
 
     # ----- SSE -----
 
