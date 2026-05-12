@@ -115,10 +115,76 @@ def build_augmenter(
     return Compose(transforms=transforms, shuffle=False)
 
 
+def apply_tablet_far_field_effect(
+    audio: np.ndarray,
+    sample_rate: int,
+    cfg: AugmentationConfig,
+) -> np.ndarray:
+    """Approximate off-axis tablet capture after the normal augmentation chain."""
+    if not cfg.use_tablet_far_field_augmentation:
+        return audio.astype(np.float32, copy=False)
+    rng = np.random.default_rng()
+    if rng.random() > cfg.tablet_far_field_probability:
+        return audio.astype(np.float32, copy=False)
+
+    y = audio.astype(np.float32, copy=True)
+    try:
+        from scipy.signal import butter, sosfilt
+
+        # Cheap tablet mics and off-axis pickup tend to lose lows/highs and
+        # emphasize a narrow speech band. Randomize the band so the model does
+        # not overfit one device response.
+        highpass_hz = float(rng.uniform(90.0, 220.0))
+        lowpass_hz = float(rng.uniform(2800.0, 5200.0))
+        sos = butter(
+            2,
+            [highpass_hz, min(lowpass_hz, sample_rate / 2 - 100.0)],
+            btype="bandpass",
+            fs=sample_rate,
+            output="sos",
+        )
+        y = sosfilt(sos, y).astype(np.float32, copy=False)
+    except Exception:
+        pass
+
+    # Add a few very early reflections, which mimic the tablet sitting near a
+    # tabletop/wall and the user speaking from an awkward angle.
+    reflected = y.copy()
+    for _ in range(int(rng.integers(1, 4))):
+        delay = int(sample_rate * rng.uniform(0.004, 0.035))
+        gain = float(rng.uniform(0.04, 0.22))
+        if delay <= 0 or delay >= y.size:
+            continue
+        reflected[delay:] += y[:-delay] * gain
+    y = reflected
+
+    # Distance/off-axis attenuation. Background SNR augmentation can still
+    # raise or lower the final mix, but this gives the model genuinely quiet
+    # wake-word examples.
+    gain_db = float(rng.uniform(-24.0, -6.0))
+    y *= 10.0 ** (gain_db / 20.0)
+
+    # After the speech has been attenuated, add a small device/room noise floor
+    # so some variants are genuinely low-SNR instead of just quiet.
+    rms = float(np.sqrt(np.mean(np.square(y), dtype=np.float64))) if y.size else 0.0
+    if rms > 1e-7:
+        snr_db = float(rng.uniform(8.0, 28.0))
+        noise_rms = rms / (10.0 ** (snr_db / 20.0))
+        y += rng.normal(0.0, noise_rms, size=y.shape).astype(np.float32)
+
+    # Light compression / limiter-style saturation, similar to mobile capture
+    # paths under noise suppression or AGC. Keep it subtle.
+    drive = float(rng.uniform(1.0, 2.2))
+    y = np.tanh(y * drive) / drive
+    np.clip(y, -1.0, 1.0, out=y)
+    return y.astype(np.float32, copy=False)
+
+
 def augment_clip(
     audio: np.ndarray,
     sample_rate: int,
     augmenter: Compose,
+    augmentation_cfg: AugmentationConfig | None = None,
     n_variants: int = 1,
 ) -> list[np.ndarray]:
     """Return n_variants augmented copies of `audio`."""
@@ -126,6 +192,8 @@ def augment_clip(
     for _ in range(n_variants):
         try:
             aug = augmenter(samples=audio.astype(np.float32), sample_rate=sample_rate)
+            if augmentation_cfg is not None:
+                aug = apply_tablet_far_field_effect(aug, sample_rate, augmentation_cfg)
             # Re-clip to [-1, 1] to keep downstream int16 conversion safe.
             np.clip(aug, -1.0, 1.0, out=aug)
             out.append(aug.astype(np.float32))
@@ -135,12 +203,20 @@ def augment_clip(
     return out
 
 
-def collect_rir_dirs() -> list[Path]:
+def collect_rir_dirs(
+    *,
+    use_mit_rirs: bool = True,
+    use_but_reverbdb: bool = False,
+) -> list[Path]:
     """Return RIR dirs that exist on disk."""
     from src.settings import get_settings
 
     settings = get_settings()
-    candidates = [settings.rirs_dir, settings.rirs_dir / "mit"]
+    candidates: list[Path] = []
+    if use_mit_rirs:
+        candidates.extend([settings.rirs_dir / "mit"])
+    if use_but_reverbdb:
+        candidates.extend([settings.but_reverbdb_dir, settings.but_reverbdb_dir / "BUT_ReverbDB"])
     return [p for p in candidates if p.exists() and any(p.rglob("*.wav"))]
 
 

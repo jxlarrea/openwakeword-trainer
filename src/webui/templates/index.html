@@ -68,7 +68,7 @@
       <div class="voice-list">
         {% for v in voices %}
           <label class="voice-row" data-quality="{{ v.quality }}" data-key="{{ v.key }}">
-            <input type="checkbox" name="piper_voice" value="{{ v.key }}">
+            <input type="checkbox" name="piper_voice" value="{{ v.key }}" checked>
             <span class="voice-name">{{ v.key }}</span>
             <span class="voice-meta">{{ v.quality }} | {{ v.n_speakers }} spk | {{ v.sample_rate }} Hz</span>
           </label>
@@ -120,8 +120,8 @@
           <small class="hint">Reps per adversarial phrase. Keep at 1 unless your voice set is tiny.</small>
         </label>
         <label>Augmentations per clip
-          <input type="number" name="augmentations_per_clip" value="5" min="1" max="10" required>
-          <small class="hint">Each WAV becomes N augmented variants (reverb, noise, etc.). 5 is a good DGX default.</small>
+          <input type="number" name="augmentations_per_clip" value="6" min="1" max="10" required>
+          <small class="hint">Each WAV becomes N augmented variants (reverb, noise, etc.). 6 is a good tablet/far-field default.</small>
         </label>
       </div>
     </fieldset>
@@ -131,6 +131,10 @@
       <div class="check-row">
         <label class="inline"><input type="checkbox" name="use_mit_rirs" checked> MIT IR Survey (room reverb)</label>
         <small class="hint">270 room impulse responses. Critical for far-field robustness.</small>
+      </div>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="use_but_reverbdb" checked> BUT ReverbDB far-field RIRs</label>
+        <small class="hint">Large measured room impulse response set for distant/off-axis microphones. First download is several GB.</small>
       </div>
       <div class="check-row">
         <label class="inline"><input type="checkbox" name="use_musan_noise" checked> MUSAN noise</label>
@@ -164,14 +168,22 @@
 
     <fieldset>
       <legend>Augmentation probabilities</legend>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="use_tablet_far_field_augmentation" checked> Tablet far-field augmentation</label>
+        <small class="hint">Adds off-axis tablet mic coloration, distance attenuation, early reflections, and light capture compression.</small>
+      </div>
       <div class="grid">
         <label>RIR p
-          <input type="number" name="rir_probability" value="0.7" min="0" max="1" step="0.05" required>
+          <input type="number" name="rir_probability" value="0.9" min="0" max="1" step="0.05" required>
           <small class="hint">Probability of applying a random room impulse response per clip.</small>
         </label>
         <label>Background noise p
           <input type="number" name="background_noise_probability" value="0.7" min="0" max="1" step="0.05" required>
           <small class="hint">Probability of mixing in noise/music/speech background per clip.</small>
+        </label>
+        <label>Tablet far-field p
+          <input type="number" name="tablet_far_field_probability" value="0.6" min="0" max="1" step="0.05" required>
+          <small class="hint">Probability of applying tablet/off-axis coloration when the far-field mode is enabled.</small>
         </label>
       </div>
     </fieldset>

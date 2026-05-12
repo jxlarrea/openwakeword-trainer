@@ -14,6 +14,7 @@ from typing import Any
 
 from src.config_schema import AugmentationConfig, DatasetConfig, GenerationConfig, TrainRunConfig, TrainingConfig
 from src.settings import get_settings
+from src.tts.voices import list_english_voices
 
 
 def slugify(value: str) -> str:
@@ -52,10 +53,17 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 def _config_for_session(wake_word: str, session_id: str) -> dict[str, Any]:
+    generation = GenerationConfig().model_dump(mode="json")
+    try:
+        generation["piper_voices"] = [
+            {"voice_key": v.key} for v in list_english_voices()
+        ]
+    except Exception:
+        generation["piper_voices"] = []
     return {
         "wake_word": wake_word,
         "run_name": session_id,
-        "generation": GenerationConfig().model_dump(mode="json"),
+        "generation": generation,
         "augmentation": AugmentationConfig().model_dump(mode="json"),
         "datasets": DatasetConfig().model_dump(mode="json"),
         "training": TrainingConfig().model_dump(mode="json"),

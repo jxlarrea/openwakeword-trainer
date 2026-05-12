@@ -15,7 +15,7 @@
 <a href="https://buymeacoffee.com/jxlarrea"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 </p>
 
-A Dockerized, GPU-accelerated trainer for [openWakeWord](https://github.com/dscripka/openWakeWord) custom models with a Web UI. Generates synthetic positives and hard negatives with [Piper](https://github.com/OHF-Voice/piper1-gpl) (and optional ElevenLabs voices), pulls real-world augmentation corpora (MIT IR Survey, MUSAN, FSD50K, Common Voice), uses the official openWakeWord ACAV100M/validation negative feature banks, trains a small classifier head on top of Google's frozen speech-embedding model, and exports an ONNX model that drops into the openWakeWord runtime.
+A Dockerized, GPU-accelerated trainer for [openWakeWord](https://github.com/dscripka/openWakeWord) custom models with a Web UI. Generates synthetic positives and hard negatives with [Piper](https://github.com/OHF-Voice/piper1-gpl) (and optional ElevenLabs voices), pulls real-world augmentation corpora (MIT IR Survey, BUT ReverbDB, MUSAN, FSD50K, Common Voice), uses the official openWakeWord ACAV100M/validation negative feature banks, trains a small classifier head on top of Google's frozen speech-embedding model, and exports an ONNX model that drops into the openWakeWord runtime.
 
 Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but the same image runs on any NVIDIA host with CUDA 12.8 drivers.
 
@@ -24,7 +24,8 @@ Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but th
 - **GPU end-to-end.** Feature extraction (Google speech-embedding ONNX) runs on the GPU via `onnxruntime-gpu` (public wheel on amd64, source-built on aarch64). PyTorch trains the classifier head on the same device.
 - **Parallel TTS.** Piper synthesis runs across a process pool (10 workers x 2 ORT threads on DGX Spark by default) so generating ~100k clips takes ~20 min instead of ~4 hours.
 - **Session-based workflow.** Create or select a wake-word session first. A session owns `/data/runs/<session_id>`, so cached WAVs, features, checkpoints, config, and model naming are reused on later visits.
-- **Resumable pipeline.** Every long phase drops sentinels: WAV generation is cached per session, corpora downloads are sentinel-marked, and re-running a failed run skips work that was already done.
+- **Resumable pipeline.** Every long phase drops sentinels: WAV generation is cached per session, corpora downloads are sentinel-marked, feature extraction checkpoints completed clips, and re-running a failed run skips work that was already done.
+- **Far-field tablet robustness.** BUT ReverbDB RIRs plus tablet far-field augmentation are enabled by default to simulate distant/off-axis single-mic capture, muffling, low level, early reflections, and light device compression.
 - **Hard-negative iteration.** Paste false-triggers you saw in production into the "Negative phrases" field; they get synthesized with the same emphasis as positives so the next model strongly rejects them.
 - **Official negative feature banks.** ACAV100M generic negatives are added to training, and the official openWakeWord validation negatives are used for FP/hr calibration.
 - **False-positive guarded export.** The trainer calibrates the validated threshold into the exported ONNX and refuses to publish models that miss the configured recall/FP/hr gates.
@@ -80,7 +81,7 @@ Open http://localhost:8000.
 2. Paste positive phrases (5 to 10 spelling/pronunciation variants of the wake word).
 3. Optionally paste negative phrases (false-triggers observed in production).
 4. Pick voices. Click **Select all** or **High quality only**.
-5. Confirm augmentation corpora. The openWakeWord ACAV100M and validation feature banks are enabled by default and strongly recommended.
+5. Confirm augmentation corpora. The openWakeWord ACAV100M, validation feature bank, BUT ReverbDB, and tablet far-field augmentation are enabled by default and strongly recommended for tablet deployments.
 6. Click **Start training**. Live progress and system telemetry stream into the panel below.
 7. When done, click **Download .onnx** in section 4. The model also stays at `/opt/models/openwakeword-trainer/models/<session_id>.onnx` on the host (or inside the docker volume if you didn't set `OWW_DATA_DIR_HOST`).
 
@@ -155,6 +156,7 @@ Inside `/data`:
   piper_voices/        downloaded Piper voice .onnx + .json (lazy, on first use)
   augmentations/
     rirs/mit/          MIT IR Survey wavs (via HF mirror)
+    rirs/but_reverbdb/ BUT ReverbDB measured far-field RIRs
     musan/             musan/{noise,music,speech}/
     fsd50k/clips/      FSD50K individual wavs (via Fhrozen/FSD50k HF mirror)
     common_voice/en/   16 kHz wavs decoded from CV tar shards
@@ -168,6 +170,7 @@ Inside `/data`:
       positive/        positive synthesized wavs + .generated_pos sentinel
       negative/        adversarial + hard-negative wavs + sentinels
     train_features.bin val_features.bin   memmap feature shards
+    features_resume.json                  resumable feature-extraction checkpoint
     train_labels.npy   val_labels.npy
     best.pt            best classifier weights
     wakeword.onnx      exported model
@@ -181,6 +184,7 @@ Inside `/data`:
 | Corpus | Disk on /data |
 |---|---|
 | MIT IR Survey (RIRs) | ~10 MB |
+| BUT ReverbDB RIR-only release | ~9 GB download, larger after extraction |
 | MUSAN (noise + music + speech) | ~26 GB |
 | FSD50K dev + eval (clips/) | ~34 GB |
 | Common Voice subset (15k clips) | ~3-5 GB |
@@ -210,7 +214,8 @@ Plan for 120 GB+ on a healthy `/data` mount if you enable all corpora and keep s
 - **Piper voices**: select all, none, or high-quality-only. Use the search box to narrow. Multi-speaker voices like `en_US-libritts-high` cover hundreds of speakers per voice.
 - **ElevenLabs** (only if `ELEVENLABS_API_KEY` is set in `.env`): adds external voice diversity. Note: costs per character; recommended only for positive phrases.
 - **Sample volume**: per-phrase reps, adversarial-pool size, augmentations-per-clip. Defaults are tuned for DGX Spark.
-- **Augmentation corpora**: each toggle has a hint. At least one corpus must be enabled. ACAV100M adds generic negative training windows; the openWakeWord validation bank is used for low-FP threshold calibration.
+- **Augmentation corpora**: each toggle has a hint. At least one corpus must be enabled. BUT ReverbDB adds measured far-field room impulse responses. ACAV100M adds generic negative training windows; the openWakeWord validation bank is used for low-FP threshold calibration.
+- **Tablet far-field augmentation**: default-on channel simulation for off-axis tablet microphones. It applies mic band-limiting, distance attenuation, a device/room noise floor, early reflections, and light capture compression.
 - **Classifier + training**: model architecture, optimizer, schedule, and target FP/hr. Defaults are tuned for low false positives on DGX Spark.
 
 The Start button is hidden while a run is in progress, and the Cancel button is hidden when nothing is running. Cancellation is honored at every long phase (download, generation, feature extraction, training).
@@ -313,6 +318,7 @@ Defaults are tuned for "extremely high quality" on the DGX Spark. Further knobs:
 
 - **More voices, more accents.** Toggle every English Piper voice. Enable ElevenLabs (`ELEVENLABS_API_KEY`) for additional accent variations.
 - **More augmentations per clip.** Bump from 5 to 8. Each WAV becomes more variants, forcing the classifier to learn channel-invariant cues. Linearly grows feature-extraction time.
+- **Tablet / far-field deployments.** BUT ReverbDB, Tablet far-field augmentation, `RIR p = 0.9`, and 6 augmentations per clip are the defaults. Increase tablet far-field probability toward `0.8` for harsher off-axis environments.
 - **More adversarial phrases.** From 3,000 to 10,000+. The main failure mode of a wake-word classifier is firing on phonetically-similar phrases.
 - **More Common Voice.** 15k is enough to learn "real human speech is not the wake word"; 50k+ helps with rare-accent generalization.
 - **Keep ACAV100M and validation negatives enabled.** They are the biggest generic false-positive guardrail and make FP/hr calibration meaningful.
@@ -320,13 +326,13 @@ Defaults are tuned for "extremely high quality" on the DGX Spark. Further knobs:
 
 What NOT to tune unless you really know:
 
-- Augmentation probabilities. Default `RIR p = 0.7`, `noise p = 0.7` is the openWakeWord recipe. Pushing higher trades recall for noise robustness; pushing lower trades robustness for clean-mic recall.
+- Augmentation probabilities. Default `RIR p = 0.9`, `noise p = 0.7` is tuned for tablet/far-field robustness. Pushing higher trades clean/direct recall for noise/room robustness; pushing lower trades robustness for clean-mic recall.
 - Min SNR (currently `3 dB`). Going negative (noise louder than signal) makes the model brittle to noise-as-signal false-triggers. Use hard-negatives instead.
 
 ## Known limitations
 
 - **DGX Spark / arm64 builds compile onnxruntime-gpu from source** (no pre-built aarch64+CUDA wheel exists on PyPI). 25 to 60 min cold; cached after that. linux/amd64 builds use the public wheel by default.
-- **First full-data run downloads a lot of data.** ACAV100M alone is ~17 GB, FSD50K is ~34 GB, and MUSAN is ~26 GB. Keep `/data` on a filesystem with enough headroom.
+- **First full-data run downloads a lot of data.** ACAV100M alone is ~17 GB, FSD50K is ~34 GB, MUSAN is ~26 GB, and BUT ReverbDB is several GB more if enabled. Keep `/data` on a filesystem with enough headroom.
 - **`mozilla-foundation/common_voice_17_0` on Hugging Face requires accepting Mozilla's terms** once on huggingface.co before your `HF_TOKEN` can download. The trainer uses `fsicoli/common_voice_17_0` (community parquet-less mirror) and bypasses the gating with direct tar-shard fetches, but you still need a valid HF token.
 - **Eigen FetchContent** is patched at build time to use the GitHub mirror because gitlab.com Cloudflare-blocks anonymous downloads from build containers.
 - **`openwakeword==0.6.0` declares `tflite-runtime`** which has no aarch64 wheel past Python 3.11. We `pip install --no-deps openwakeword` and use the ONNX feature-model path only.

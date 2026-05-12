@@ -55,7 +55,7 @@ class GenerationConfig(BaseModel):
 class AugmentationConfig(BaseModel):
     """Per-clip augmentation knobs."""
 
-    rir_probability: float = 0.7
+    rir_probability: float = 0.9
     background_noise_probability: float = 0.7
     background_noise_min_snr_db: float = 3.0
     background_noise_max_snr_db: float = 30.0
@@ -71,13 +71,16 @@ class AugmentationConfig(BaseModel):
     gain_min_db: float = -12.0
     gain_max_db: float = 3.0
     mp3_compression_probability: float = 0.2
-    augmentations_per_clip: int = 5  # multiplies dataset size (DGX Spark default)
+    use_tablet_far_field_augmentation: bool = True
+    tablet_far_field_probability: float = 0.6
+    augmentations_per_clip: int = 6  # multiplies dataset size (DGX Spark default)
 
 
 class DatasetConfig(BaseModel):
     """Which augmentation / negative-speech corpora to use."""
 
     use_mit_rirs: bool = True
+    use_but_reverbdb: bool = True
     use_musan_noise: bool = True
     use_musan_music: bool = True
     use_fsd50k: bool = True
@@ -150,6 +153,7 @@ class TrainRunConfig(BaseModel):
         # At least one augmentation corpus.
         any_corpus = (
             self.datasets.use_mit_rirs
+            or self.datasets.use_but_reverbdb
             or self.datasets.use_musan_noise
             or self.datasets.use_musan_music
             or self.datasets.use_fsd50k
@@ -159,7 +163,7 @@ class TrainRunConfig(BaseModel):
         )
         if not any_corpus:
             raise ValueError(
-                "Enable at least one augmentation corpus (MIT IR, MUSAN, FSD50K, or Common Voice)."
+                "Enable at least one augmentation corpus (MIT IR, BUT ReverbDB, MUSAN, FSD50K, or Common Voice)."
             )
         return self
 

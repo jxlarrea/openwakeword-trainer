@@ -57,6 +57,10 @@ class Settings(BaseSettings):
         return self.augmentations_dir / "rirs"
 
     @property
+    def but_reverbdb_dir(self) -> Path:
+        return self.rirs_dir / "but_reverbdb"
+
+    @property
     def musan_dir(self) -> Path:
         return self.augmentations_dir / "musan"
 
@@ -90,6 +94,7 @@ class Settings(BaseSettings):
             self.voices_dir,
             self.augmentations_dir,
             self.rirs_dir,
+            self.but_reverbdb_dir,
             self.musan_dir,
             self.fsd50k_dir,
             self.common_voice_dir,

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -331,6 +332,7 @@ def _filter_speech_windows(
 
 _WORKER_AUGMENTER = None     # populated by _augment_worker_init
 _WORKER_EXTRACTOR = None     # populated by _augment_worker_init
+_WORKER_AUG_CFG = None       # populated by _augment_worker_init
 
 
 def _augment_worker_init(
@@ -346,7 +348,7 @@ def _augment_worker_init(
     memmap. This removes the per-variant Python/IPC overhead that was capping
     GPU utilization at ~18% in main-process-only mode.
     """
-    global _WORKER_AUGMENTER, _WORKER_EXTRACTOR
+    global _WORKER_AUGMENTER, _WORKER_EXTRACTOR, _WORKER_AUG_CFG
     import warnings as _warnings
 
     from src.augment.augmenter import build_augmenter
@@ -360,6 +362,7 @@ def _augment_worker_init(
     )
 
     aug_cfg = AugmentationConfig(**aug_cfg_dump)
+    _WORKER_AUG_CFG = aug_cfg
     rir_dirs = [Path(p) for p in rir_dir_strs]
     bg_dirs = [Path(p) for p in bg_dir_strs]
     _WORKER_AUGMENTER = build_augmenter(
@@ -390,6 +393,7 @@ def _augment_one_clip(task: dict) -> dict | None:
         n_augs = task["augmentations_per_clip"]
         seed = task["seed"]
         source_id = int(task.get("source_id", -1))
+        task_index = int(task.get("task_index", -1))
 
         audio, sr = _sf.read(wav_path, dtype="float32", always_2d=False)
         if audio.ndim > 1:
@@ -405,6 +409,9 @@ def _augment_one_clip(task: dict) -> dict | None:
         for _ in range(n_augs):
             try:
                 aug = _WORKER_AUGMENTER(samples=audio.astype(_np.float32), sample_rate=16_000)
+                from src.augment.augmenter import apply_tablet_far_field_effect
+
+                aug = apply_tablet_far_field_effect(aug, 16_000, _WORKER_AUG_CFG)
                 _np.clip(aug, -1.0, 1.0, out=aug)
             except Exception:
                 aug = audio
@@ -416,16 +423,27 @@ def _augment_one_clip(task: dict) -> dict | None:
                 all_windows.append(windows)
 
         if not all_windows:
-            return {"n_windows": 0, "windows_bytes": b""}
+            return {"n_windows": 0, "windows_bytes": b"", "task_index": task_index}
 
         combined = _np.concatenate(all_windows, axis=0).astype(_np.float32, copy=False)
         return {
             "n_windows": int(combined.shape[0]),
             "windows_bytes": combined.tobytes(),
             "source_id": source_id,
+            "task_index": task_index,
         }
     except Exception:
-        return None
+        return {
+            "n_windows": 0,
+            "windows_bytes": b"",
+            "source_id": int(task.get("source_id", -1)),
+            "task_index": int(task.get("task_index", -1)),
+        }
+
+
+def _stable_feature_seed(path: Path, label: int, source_id: int, augmentations_per_clip: int) -> int:
+    blob = f"{path}|{label}|{source_id}|{augmentations_per_clip}".encode("utf-8")
+    return int(hashlib.sha1(blob).hexdigest()[:8], 16)
 
 
 def build_features_from_wavs_parallel(
@@ -447,6 +465,9 @@ def build_features_from_wavs_parallel(
     progress_fraction_base: float = 0.0,
     progress_fraction_span: float = 1.0,
     source_id_base: int = 0,
+    completed_clip_indices: set[int] | None = None,
+    checkpoint_callback=None,
+    checkpoint_every: int = 500,
 ) -> int:
     """Full end-to-end pipeline in workers (augment + mel + embedding + filter).
 
@@ -464,16 +485,22 @@ def build_features_from_wavs_parallel(
     total = len(wav_paths)
     if total == 0:
         return cursor
+    completed_indices = completed_clip_indices if completed_clip_indices is not None else set()
+    completed = len(completed_indices)
+    if completed >= total:
+        return cursor
 
     tasks = [
         {
             "wav_path": str(p),
             "label": label,
             "augmentations_per_clip": augmentations_per_clip,
-            "seed": (hash((str(p), label, write_offset)) & 0xFFFFFFFF),
+            "seed": _stable_feature_seed(p, label, source_id_base + i, augmentations_per_clip),
             "source_id": source_id_base + i,
+            "task_index": i,
         }
         for i, p in enumerate(wav_paths)
+        if i not in completed_indices
     ]
 
     aug_cfg_dump = augmentation_cfg.model_dump()
@@ -486,9 +513,9 @@ def build_features_from_wavs_parallel(
     )
 
     ctx = get_context("spawn")
-    completed = 0
     last_progress_t = _time.monotonic()
     feature_shape_tail = out_features.shape[1:]  # (16, 96)
+    last_checkpoint_completed = completed
 
     with ctx.Pool(
         processes=workers,
@@ -499,26 +526,34 @@ def build_features_from_wavs_parallel(
             if cancel_flag is not None and cancel_flag.is_set():
                 pool.terminate()
                 break
-            completed += 1
 
-            if result is None:
-                continue
-
-            n_new = result["n_windows"]
+            task_index = int(result.get("task_index", -1)) if result is not None else -1
+            n_new = int(result.get("n_windows", 0)) if result is not None else 0
             if n_new == 0:
-                continue
+                windows = None
+            else:
+                windows_flat = np.frombuffer(result["windows_bytes"], dtype=np.float32)
+                windows = windows_flat.reshape((n_new,) + feature_shape_tail)
 
-            windows_flat = np.frombuffer(result["windows_bytes"], dtype=np.float32)
-            windows = windows_flat.reshape((n_new,) + feature_shape_tail)
+                if cursor + n_new > out_features.shape[0]:
+                    pool.terminate()
+                    break
+                out_features[cursor : cursor + n_new] = windows
+                out_labels[cursor : cursor + n_new] = label
+                if out_source_ids is not None:
+                    out_source_ids[cursor : cursor + n_new] = int(result.get("source_id", -1))
+                cursor += n_new
 
-            if cursor + n_new > out_features.shape[0]:
-                n_new = out_features.shape[0] - cursor
-                windows = windows[:n_new]
-            out_features[cursor : cursor + n_new] = windows
-            out_labels[cursor : cursor + n_new] = label
-            if out_source_ids is not None:
-                out_source_ids[cursor : cursor + n_new] = int(result.get("source_id", -1))
-            cursor += n_new
+            if task_index >= 0:
+                completed_indices.add(task_index)
+            completed = len(completed_indices)
+
+            if (
+                checkpoint_callback is not None
+                and completed - last_checkpoint_completed >= max(1, checkpoint_every)
+            ):
+                checkpoint_callback(cursor, completed_indices, completed)
+                last_checkpoint_completed = completed
 
             now = _time.monotonic()
             if completed % 100 == 0 or (now - last_progress_t) > 5.0:
@@ -537,6 +572,9 @@ def build_features_from_wavs_parallel(
 
             if cursor >= out_features.shape[0]:
                 break
+
+    if checkpoint_callback is not None and completed != last_checkpoint_completed:
+        checkpoint_callback(cursor, completed_indices, completed)
 
     return cursor
 
@@ -610,7 +648,13 @@ def build_features_from_wavs(
         # Track the speech region so we can drop silent-padding windows for positives.
         audio, speech_start, speech_end = _pad_to_min_length(audio, rng)
 
-        for variant in augment_clip(audio, 16_000, augmenter, n_variants=augmentations_per_clip):
+        for variant in augment_clip(
+            audio,
+            16_000,
+            augmenter,
+            augmentation_cfg=augmentation_cfg,
+            n_variants=augmentations_per_clip,
+        ):
             int16 = float32_to_int16(variant)
             windows = extractor.classifier_inputs(int16)
             # CRITICAL: for positive clips, drop classifier windows that are
@@ -652,12 +696,12 @@ def estimate_window_count(n_clips: int, augmentations_per_clip: int, avg_windows
     return max(1, n_clips * augmentations_per_clip * avg_windows_per_clip)
 
 
-def allocate_memmap(path: Path, n_windows: int) -> tuple[np.memmap, Path]:
+def allocate_memmap(path: Path, n_windows: int, mode: str = "w+") -> tuple[np.memmap, Path]:
     path.parent.mkdir(parents=True, exist_ok=True)
     arr = np.memmap(
         path,
         dtype=np.float32,
-        mode="w+",
+        mode=mode,
         shape=(n_windows, CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM),
     )
     return arr, path

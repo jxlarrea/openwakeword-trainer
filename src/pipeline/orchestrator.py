@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import threading
 import time
 from datetime import datetime, timezone
@@ -57,6 +58,10 @@ from src.tts.elevenlabs_generator import ElevenLabsGenerator
 from src.tts.piper_generator import PiperGenerator
 
 logger = logging.getLogger(__name__)
+
+FEATURE_RESUME_FILENAME = "features_resume.json"
+FEATURE_RESUME_VERSION = 1
+FEATURE_CHECKPOINT_EVERY_CLIPS = 500
 
 
 class RunState:
@@ -275,6 +280,184 @@ def _generate_samples(
     return written
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def _feature_input_signature(
+    cfg: TrainRunConfig,
+    positive_wavs: list[Path],
+    negative_wavs: list[Path],
+    cv_clips: list[Path],
+) -> str:
+    """Hash the inputs that affect extracted features and train/val splits."""
+    h = hashlib.sha256()
+    payload = {
+        "version": FEATURE_RESUME_VERSION,
+        "wake_word": cfg.wake_word,
+        "generation": cfg.generation.model_dump(mode="json"),
+        "augmentation": cfg.augmentation.model_dump(mode="json"),
+        "datasets": cfg.datasets.model_dump(mode="json"),
+        "split_seed": cfg.training.seed,
+    }
+    h.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
+    for group_name, paths in (
+        ("positive", positive_wavs),
+        ("negative", negative_wavs),
+        ("common_voice", cv_clips),
+    ):
+        h.update(group_name.encode("utf-8"))
+        h.update(str(len(paths)).encode("ascii"))
+        for path in paths:
+            h.update(str(path).encode("utf-8"))
+            try:
+                st = path.stat()
+            except OSError:
+                h.update(b":missing")
+                continue
+            h.update(f":{st.st_size}:{st.st_mtime_ns}".encode("ascii"))
+    return h.hexdigest()
+
+
+def _load_completed_feature_cache(
+    run_dir: Path,
+    signature: str,
+) -> tuple[FeatureMemmapDataset, FeatureMemmapDataset, dict[str, ShardManifest]] | None:
+    resume_path = run_dir / FEATURE_RESUME_FILENAME
+    manifest_path = run_dir / "shards.json"
+    if not resume_path.exists() or not manifest_path.exists():
+        return None
+    try:
+        resume = json.loads(resume_path.read_text())
+        manifest_data = json.loads(manifest_path.read_text())
+    except Exception:
+        return None
+    if (
+        resume.get("version") != FEATURE_RESUME_VERSION
+        or resume.get("signature") != signature
+        or not resume.get("complete")
+    ):
+        return None
+
+    manifests: dict[str, ShardManifest] = {}
+    for split in ("train", "val"):
+        entry = manifest_data.get(split)
+        if not entry:
+            return None
+        features_path = run_dir / entry["features"]
+        labels_path = run_dir / entry["labels"]
+        source_ids_path = (
+            run_dir / entry["source_ids"]
+            if entry.get("source_ids")
+            else None
+        )
+        if not features_path.exists() or not labels_path.exists():
+            return None
+        if source_ids_path is not None and not source_ids_path.exists():
+            return None
+        manifests[split] = ShardManifest(
+            features_path=features_path,
+            labels_path=labels_path,
+            source_ids_path=source_ids_path,
+            n_windows=int(entry["n_windows"]),
+            label_counts={int(k): int(v) for k, v in entry["label_counts"].items()},
+        )
+
+    bus.log("Reusing completed feature cache for matching session/config")
+    return (
+        FeatureMemmapDataset(
+            manifests["train"].features_path,
+            manifests["train"].labels_path,
+            manifests["train"].source_ids_path,
+        ),
+        FeatureMemmapDataset(
+            manifests["val"].features_path,
+            manifests["val"].labels_path,
+            manifests["val"].source_ids_path,
+        ),
+        manifests,
+    )
+
+
+def _feature_partial_paths(run_dir: Path) -> dict[str, Path]:
+    return {
+        "train_features": run_dir / "train_features.bin",
+        "val_features": run_dir / "val_features.bin",
+        "train_labels": run_dir / "train_labels.partial.bin",
+        "val_labels": run_dir / "val_labels.partial.bin",
+        "train_source_ids": run_dir / "train_source_ids.partial.bin",
+        "val_source_ids": run_dir / "val_source_ids.partial.bin",
+    }
+
+
+def _feature_partial_files_match(
+    paths: dict[str, Path],
+    train_capacity: int,
+    val_capacity: int,
+) -> bool:
+    bytes_per_window = CLASSIFIER_WINDOW_EMBEDDINGS * EMBEDDING_DIM * 4
+    expected = {
+        "train_features": train_capacity * bytes_per_window,
+        "val_features": val_capacity * bytes_per_window,
+        "train_labels": train_capacity,
+        "val_labels": val_capacity,
+        "train_source_ids": train_capacity * 4,
+        "val_source_ids": val_capacity * 4,
+    }
+    for key, size in expected.items():
+        path = paths[key]
+        if not path.exists() or path.stat().st_size != size:
+            return False
+    return True
+
+
+def _initial_feature_resume_state(
+    signature: str,
+    train_capacity: int,
+    val_capacity: int,
+) -> dict:
+    return {
+        "version": FEATURE_RESUME_VERSION,
+        "signature": signature,
+        "complete": False,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "capacities": {"train": train_capacity, "val": val_capacity},
+        "split_cursors": {"train": 0, "val": 0},
+        "passes": {},
+    }
+
+
+def _load_partial_feature_resume(
+    run_dir: Path,
+    signature: str,
+    train_capacity: int,
+    val_capacity: int,
+) -> tuple[dict, bool]:
+    resume_path = run_dir / FEATURE_RESUME_FILENAME
+    partial_paths = _feature_partial_paths(run_dir)
+    if not resume_path.exists():
+        return _initial_feature_resume_state(signature, train_capacity, val_capacity), False
+    try:
+        resume = json.loads(resume_path.read_text())
+    except Exception:
+        bus.log("Ignoring unreadable feature resume checkpoint", level="warning")
+        return _initial_feature_resume_state(signature, train_capacity, val_capacity), False
+    if (
+        resume.get("version") != FEATURE_RESUME_VERSION
+        or resume.get("signature") != signature
+        or resume.get("complete")
+        or resume.get("capacities") != {"train": train_capacity, "val": val_capacity}
+        or not _feature_partial_files_match(partial_paths, train_capacity, val_capacity)
+    ):
+        bus.log("Feature resume checkpoint does not match this run; rebuilding features")
+        return _initial_feature_resume_state(signature, train_capacity, val_capacity), False
+    bus.log("Resuming feature extraction from saved checkpoint")
+    return resume, True
+
+
 def _build_features(
     positive_wavs: list[Path],
     negative_wavs: list[Path],
@@ -285,7 +468,10 @@ def _build_features(
     """Augment + extract features into train/val memmaps."""
     extractor = FeatureExtractor()
 
-    rir_dirs = collect_rir_dirs() if cfg.datasets.use_mit_rirs else []
+    rir_dirs = collect_rir_dirs(
+        use_mit_rirs=cfg.datasets.use_mit_rirs,
+        use_but_reverbdb=cfg.datasets.use_but_reverbdb,
+    )
     bg_dirs = collect_background_noise_dirs(
         use_musan_noise=cfg.datasets.use_musan_noise,
         use_musan_music=cfg.datasets.use_musan_music,
@@ -319,6 +505,10 @@ def _build_features(
     val_neg = [all_negatives[i] for i in neg_idx[neg_split:]]
 
     aug_per = cfg.augmentation.augmentations_per_clip
+    feature_signature = _feature_input_signature(cfg, positive_wavs, negative_wavs, cv_clips)
+    cached = _load_completed_feature_cache(run_dir, feature_signature)
+    if cached is not None:
+        return cached
 
     train_capacity = (
         estimate_window_count(len(train_pos), aug_per)
@@ -337,13 +527,51 @@ def _build_features(
     val_labels_path = run_dir / "val_labels.npy"
     train_source_ids_path = run_dir / "train_source_ids.npy"
     val_source_ids_path = run_dir / "val_source_ids.npy"
+    partial_paths = _feature_partial_paths(run_dir)
+    resume_path = run_dir / FEATURE_RESUME_FILENAME
+    resume_state, is_resuming = _load_partial_feature_resume(
+        run_dir,
+        feature_signature,
+        train_capacity,
+        val_capacity,
+    )
+    memmap_mode = "r+" if is_resuming else "w+"
 
-    train_arr, _ = allocate_memmap(train_features_path, train_capacity)
-    val_arr, _ = allocate_memmap(val_features_path, val_capacity)
-    train_labels = np.zeros(train_capacity, dtype=np.uint8)
-    val_labels = np.zeros(val_capacity, dtype=np.uint8)
-    train_source_ids = np.full(train_capacity, -1, dtype=np.int32)
-    val_source_ids = np.full(val_capacity, -1, dtype=np.int32)
+    train_arr, _ = allocate_memmap(train_features_path, train_capacity, mode=memmap_mode)
+    val_arr, _ = allocate_memmap(val_features_path, val_capacity, mode=memmap_mode)
+    train_labels = np.memmap(
+        partial_paths["train_labels"],
+        dtype=np.uint8,
+        mode=memmap_mode,
+        shape=(train_capacity,),
+    )
+    val_labels = np.memmap(
+        partial_paths["val_labels"],
+        dtype=np.uint8,
+        mode=memmap_mode,
+        shape=(val_capacity,),
+    )
+    train_source_ids = np.memmap(
+        partial_paths["train_source_ids"],
+        dtype=np.int32,
+        mode=memmap_mode,
+        shape=(train_capacity,),
+    )
+    val_source_ids = np.memmap(
+        partial_paths["val_source_ids"],
+        dtype=np.int32,
+        mode=memmap_mode,
+        shape=(val_capacity,),
+    )
+    if not is_resuming:
+        train_labels[:] = 0
+        val_labels[:] = 0
+        train_source_ids[:] = -1
+        val_source_ids[:] = -1
+        train_labels.flush()
+        val_labels.flush()
+        train_source_ids.flush()
+        val_source_ids.flush()
 
     # Split the global progress bar across 4 sub-passes weighted by clip count.
     total_clips = max(1, len(train_pos) + len(train_neg) + len(val_pos) + len(val_neg))
@@ -360,55 +588,200 @@ def _build_features(
         f"(each with its own CUDA session)"
     )
 
+    split_cursors = {
+        "train": int(resume_state.get("split_cursors", {}).get("train", 0)),
+        "val": int(resume_state.get("split_cursors", {}).get("val", 0)),
+    }
+
+    def save_feature_checkpoint(
+        pass_name: str,
+        split: str,
+        label: int,
+        total: int,
+        cursor: int,
+        completed_indices: set[int],
+        complete: bool = False,
+    ) -> None:
+        train_arr.flush()
+        val_arr.flush()
+        train_labels.flush()
+        val_labels.flush()
+        train_source_ids.flush()
+        val_source_ids.flush()
+        resume_state["updated_at"] = time.time()
+        resume_state["complete"] = False
+        resume_state.setdefault("split_cursors", {})[split] = int(cursor)
+        resume_state.setdefault("passes", {})[pass_name] = {
+            "split": split,
+            "label": label,
+            "total": total,
+            "cursor": int(cursor),
+            "completed_count": len(completed_indices),
+            "completed_indices": sorted(int(i) for i in completed_indices),
+            "complete": complete,
+        }
+        _atomic_write_json(resume_path, resume_state)
+
+    def run_feature_pass(
+        pass_name: str,
+        split: str,
+        label: int,
+        wavs: list[Path],
+        out_features: np.memmap,
+        out_labels: np.memmap,
+        out_source_ids: np.memmap,
+        base: float,
+        span: float,
+        source_id_base: int,
+    ) -> int:
+        entry = resume_state.get("passes", {}).get(pass_name, {})
+        if (
+            entry.get("complete")
+            and entry.get("total") == len(wavs)
+            and entry.get("split") == split
+            and entry.get("label") == label
+        ):
+            cursor = int(entry.get("cursor", split_cursors[split]))
+            split_cursors[split] = cursor
+            bus.log(
+                f"Reusing completed feature pass {pass_name}: "
+                f"{len(wavs):,}/{len(wavs):,} clips"
+            )
+            bus.progress(
+                "features:extract",
+                base + span,
+                detail=f"{len(wavs)}/{len(wavs)} clips, {cursor:,} windows",
+            )
+            return cursor
+
+        completed_indices = {
+            int(i)
+            for i in entry.get("completed_indices", [])
+            if 0 <= int(i) < len(wavs)
+        }
+        cursor = int(entry.get("cursor", split_cursors[split]))
+        if completed_indices:
+            bus.log(
+                f"Resuming feature pass {pass_name}: "
+                f"{len(completed_indices):,}/{len(wavs):,} clips already written"
+            )
+            bus.progress(
+                "features:extract",
+                base + span * (len(completed_indices) / max(1, len(wavs))),
+                detail=f"{len(completed_indices)}/{len(wavs)} clips, {cursor:,} windows",
+            )
+
+        bus.phase("features:extract", detail=f"{pass_name.replace('_', ' ')} ({len(wavs)} clips)")
+
+        def checkpoint(new_cursor: int, done: set[int], _done_count: int) -> None:
+            save_feature_checkpoint(
+                pass_name,
+                split,
+                label,
+                len(wavs),
+                new_cursor,
+                done,
+            )
+
+        new_cursor = build_features_from_wavs_parallel(
+            wavs, label, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
+            out_features, out_labels, out_source_ids, cursor,
+            workers=workers,
+            cancel_flag=state.cancel_flag,
+            progress_label="features:extract",
+            progress_fraction_base=base,
+            progress_fraction_span=span,
+            source_id_base=source_id_base,
+            completed_clip_indices=completed_indices,
+            checkpoint_callback=checkpoint,
+            checkpoint_every=FEATURE_CHECKPOINT_EVERY_CLIPS,
+        )
+        split_cursors[split] = new_cursor
+        save_feature_checkpoint(
+            pass_name,
+            split,
+            label,
+            len(wavs),
+            new_cursor,
+            completed_indices,
+            complete=False,
+        )
+        if state.cancel_flag.is_set():
+            raise RuntimeError("cancelled")
+        if len(completed_indices) < len(wavs):
+            raise RuntimeError(
+                f"Feature capacity exhausted during {pass_name}: "
+                f"{len(completed_indices):,}/{len(wavs):,} clips completed. "
+                "Increase the feature capacity estimate before retrying."
+            )
+        save_feature_checkpoint(
+            pass_name,
+            split,
+            label,
+            len(wavs),
+            new_cursor,
+            completed_indices,
+            complete=True,
+        )
+        return new_cursor
+
     base = 0.0
     span = len(train_pos) / total_clips
-    bus.phase("features:extract", detail=f"train positives ({len(train_pos)} clips)")
-    train_cursor = build_features_from_wavs_parallel(
-        train_pos, 1, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
-        train_arr, train_labels, train_source_ids, 0,
-        workers=workers,
-        cancel_flag=state.cancel_flag,
-        progress_label="features:extract",
-        progress_fraction_base=base, progress_fraction_span=span,
+    train_cursor = run_feature_pass(
+        "train_positives",
+        "train",
+        1,
+        train_pos,
+        train_arr,
+        train_labels,
+        train_source_ids,
+        base,
+        span,
         source_id_base=0,
     )
 
     base += span
     span = len(train_neg) / total_clips
-    bus.phase("features:extract", detail=f"train negatives ({len(train_neg)} clips)")
-    train_cursor = build_features_from_wavs_parallel(
-        train_neg, 0, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
-        train_arr, train_labels, train_source_ids, train_cursor,
-        workers=workers,
-        cancel_flag=state.cancel_flag,
-        progress_label="features:extract",
-        progress_fraction_base=base, progress_fraction_span=span,
+    train_cursor = run_feature_pass(
+        "train_negatives",
+        "train",
+        0,
+        train_neg,
+        train_arr,
+        train_labels,
+        train_source_ids,
+        base,
+        span,
         source_id_base=len(train_pos),
     )
 
     base += span
     span = len(val_pos) / total_clips
-    bus.phase("features:extract", detail=f"val positives ({len(val_pos)} clips)")
-    val_cursor = build_features_from_wavs_parallel(
-        val_pos, 1, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
-        val_arr, val_labels, val_source_ids, 0,
-        workers=workers,
-        cancel_flag=state.cancel_flag,
-        progress_label="features:extract",
-        progress_fraction_base=base, progress_fraction_span=span,
+    val_cursor = run_feature_pass(
+        "val_positives",
+        "val",
+        1,
+        val_pos,
+        val_arr,
+        val_labels,
+        val_source_ids,
+        base,
+        span,
         source_id_base=0,
     )
 
     base += span
     span = len(val_neg) / total_clips
-    bus.phase("features:extract", detail=f"val negatives ({len(val_neg)} clips)")
-    val_cursor = build_features_from_wavs_parallel(
-        val_neg, 0, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
-        val_arr, val_labels, val_source_ids, val_cursor,
-        workers=workers,
-        cancel_flag=state.cancel_flag,
-        progress_label="features:extract",
-        progress_fraction_base=base, progress_fraction_span=span,
+    val_cursor = run_feature_pass(
+        "val_negatives",
+        "val",
+        0,
+        val_neg,
+        val_arr,
+        val_labels,
+        val_source_ids,
+        base,
+        span,
         source_id_base=len(val_pos),
     )
     bus.progress("features:extract", 1.0,
@@ -460,6 +833,11 @@ def _build_features(
         ),
     }
     save_manifest(run_dir, manifests)
+    resume_state["complete"] = True
+    resume_state["completed_at"] = time.time()
+    resume_state["updated_at"] = time.time()
+    resume_state["split_cursors"] = {"train": int(train_cursor), "val": int(val_cursor)}
+    _atomic_write_json(resume_path, resume_state)
     return train_ds, val_ds, manifests
 
 
@@ -483,7 +861,42 @@ def _run(cfg: TrainRunConfig) -> None:
             if stale_path.exists():
                 stale_path.unlink()
 
-        # 1. Positive phrases
+        # 1. Download/verify corpora and external feature banks first. This
+        # fails fast on missing credentials/disk and avoids spending hours on
+        # TTS before discovering a dataset problem.
+        bus.phase("download:corpora")
+        corpora = ensure_corpora(
+            use_mit_rirs=cfg.datasets.use_mit_rirs,
+            use_but_reverbdb=cfg.datasets.use_but_reverbdb,
+            use_musan=cfg.datasets.use_musan_noise or cfg.datasets.use_musan_music,
+            use_fsd50k=cfg.datasets.use_fsd50k,
+            use_common_voice=cfg.datasets.use_common_voice_negatives,
+            common_voice_subset=cfg.datasets.common_voice_subset,
+            progress=lambda name, frac: bus.progress(f"download:{name}", frac),
+            cancel_flag=state.cancel_flag,
+        )
+        bus.log(f"Corpora ready: {list(corpora.keys())}")
+
+        oww_feature_paths: dict[str, Path] = {}
+        if (
+            cfg.datasets.use_openwakeword_negative_features
+            or cfg.datasets.use_openwakeword_validation_features
+        ):
+            bus.phase("download:openwakeword_features")
+            oww_feature_paths = ensure_openwakeword_feature_files(
+                use_training=cfg.datasets.use_openwakeword_negative_features,
+                use_validation=cfg.datasets.use_openwakeword_validation_features,
+                progress=lambda name, frac: bus.progress(f"download:{name}", frac),
+            )
+            bus.log(
+                "openWakeWord feature banks ready: "
+                + ", ".join(f"{k}={v.name}" for k, v in oww_feature_paths.items())
+            )
+
+        if state.cancel_flag.is_set():
+            raise RuntimeError("cancelled")
+
+        # 2. Positive phrases
         positive_phrases = cfg.generation.positive_phrases or [cfg.wake_word]
         bus.phase("generate:positive", detail=f"{len(positive_phrases)} phrases")
         positive_wavs = _generate_samples(
@@ -498,7 +911,7 @@ def _run(cfg: TrainRunConfig) -> None:
         if state.cancel_flag.is_set():
             raise RuntimeError("cancelled")
 
-        # 2a. Hard negatives (user-supplied phrases the model must NOT trigger on).
+        # 3a. Hard negatives (user-supplied phrases the model must NOT trigger on).
         # Synthesized with the same emphasis as positives so the model strongly
         # learns to reject them.
         negative_wavs: list[Path] = []
@@ -534,7 +947,7 @@ def _run(cfg: TrainRunConfig) -> None:
         if state.cancel_flag.is_set():
             raise RuntimeError("cancelled")
 
-        # 2b. Auto-generated adversarial phrases (phonetic neighbors + generic
+        # 3b. Auto-generated adversarial phrases (phonetic neighbors + generic
         # conversational pool). These broaden the negative distribution.
         adv_phrases = build_adversarial_phrases(
             cfg.wake_word,
@@ -553,38 +966,6 @@ def _run(cfg: TrainRunConfig) -> None:
             )
         )
         bus.log(f"Total negative WAVs (hard + adversarial): {len(negative_wavs)}")
-
-        if state.cancel_flag.is_set():
-            raise RuntimeError("cancelled")
-
-        # 3. Augmentation corpora
-        bus.phase("download:corpora")
-        corpora = ensure_corpora(
-            use_mit_rirs=cfg.datasets.use_mit_rirs,
-            use_musan=cfg.datasets.use_musan_noise or cfg.datasets.use_musan_music,
-            use_fsd50k=cfg.datasets.use_fsd50k,
-            use_common_voice=cfg.datasets.use_common_voice_negatives,
-            common_voice_subset=cfg.datasets.common_voice_subset,
-            progress=lambda name, frac: bus.progress(f"download:{name}", frac),
-            cancel_flag=state.cancel_flag,
-        )
-        bus.log(f"Corpora ready: {list(corpora.keys())}")
-
-        oww_feature_paths: dict[str, Path] = {}
-        if (
-            cfg.datasets.use_openwakeword_negative_features
-            or cfg.datasets.use_openwakeword_validation_features
-        ):
-            bus.phase("download:openwakeword_features")
-            oww_feature_paths = ensure_openwakeword_feature_files(
-                use_training=cfg.datasets.use_openwakeword_negative_features,
-                use_validation=cfg.datasets.use_openwakeword_validation_features,
-                progress=lambda name, frac: bus.progress(f"download:{name}", frac),
-            )
-            bus.log(
-                "openWakeWord feature banks ready: "
-                + ", ".join(f"{k}={v.name}" for k, v in oww_feature_paths.items())
-            )
 
         if state.cancel_flag.is_set():
             raise RuntimeError("cancelled")

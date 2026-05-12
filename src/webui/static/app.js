@@ -117,8 +117,11 @@
     setValue(form, "elevenlabs_model", gen.elevenlabs_model);
     setChecked(form, "use_elevenlabs", gen.use_elevenlabs);
 
+    const savedPiperVoices = gen.piper_voices || [];
     $$("#config input[name='piper_voice']").forEach((cb) => {
-      cb.checked = (gen.piper_voices || []).some((v) => (v.voice_key || v) === cb.value);
+      cb.checked =
+        savedPiperVoices.length === 0 ||
+        savedPiperVoices.some((v) => (v.voice_key || v) === cb.value);
     });
     $$("#config input[name='elevenlabs_voice_id']").forEach((cb) => {
       cb.checked = (gen.elevenlabs_voice_ids || []).includes(cb.value);
@@ -127,8 +130,11 @@
     setValue(form, "augmentations_per_clip", aug.augmentations_per_clip);
     setValue(form, "rir_probability", aug.rir_probability);
     setValue(form, "background_noise_probability", aug.background_noise_probability);
+    setChecked(form, "use_tablet_far_field_augmentation", aug.use_tablet_far_field_augmentation !== false);
+    setValue(form, "tablet_far_field_probability", aug.tablet_far_field_probability);
 
     setChecked(form, "use_mit_rirs", ds.use_mit_rirs !== false);
+    setChecked(form, "use_but_reverbdb", ds.use_but_reverbdb !== false);
     setChecked(form, "use_musan_noise", ds.use_musan_noise !== false);
     setChecked(form, "use_musan_music", ds.use_musan_music !== false);
     setChecked(form, "use_fsd50k", ds.use_fsd50k !== false);
@@ -326,6 +332,7 @@
     // Custom: at least one augmentation corpus must be on.
     const corpusBoxes = [
       "use_mit_rirs",
+      "use_but_reverbdb",
       "use_musan_noise",
       "use_musan_music",
       "use_fsd50k",
@@ -449,12 +456,15 @@
         elevenlabs_model: String(v("elevenlabs_model")) || "eleven_multilingual_v2",
       },
       augmentation: {
-        rir_probability: vNum("rir_probability", 0.7),
+        rir_probability: vNum("rir_probability", 0.9),
         background_noise_probability: vNum("background_noise_probability", 0.7),
-        augmentations_per_clip: vNum("augmentations_per_clip", 5),
+        use_tablet_far_field_augmentation: vBool("use_tablet_far_field_augmentation"),
+        tablet_far_field_probability: vNum("tablet_far_field_probability", 0.6),
+        augmentations_per_clip: vNum("augmentations_per_clip", 6),
       },
       datasets: {
         use_mit_rirs: vBool("use_mit_rirs"),
+        use_but_reverbdb: vBool("use_but_reverbdb"),
         use_musan_noise: vBool("use_musan_noise"),
         use_musan_music: vBool("use_musan_music"),
         use_fsd50k: vBool("use_fsd50k"),

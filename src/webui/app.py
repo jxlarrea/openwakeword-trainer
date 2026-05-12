@@ -388,12 +388,15 @@ def _form_to_config_payload(form) -> dict:
             "elevenlabs_model": form.get("elevenlabs_model", "eleven_multilingual_v2"),
         },
         "augmentation": {
-            "rir_probability": _float("rir_probability", 0.7),
+            "rir_probability": _float("rir_probability", 0.9),
             "background_noise_probability": _float("background_noise_probability", 0.7),
-            "augmentations_per_clip": _int("augmentations_per_clip", 3),
+            "use_tablet_far_field_augmentation": _bool("use_tablet_far_field_augmentation"),
+            "tablet_far_field_probability": _float("tablet_far_field_probability", 0.6),
+            "augmentations_per_clip": _int("augmentations_per_clip", 6),
         },
         "datasets": {
             "use_mit_rirs": _bool("use_mit_rirs"),
+            "use_but_reverbdb": _bool("use_but_reverbdb"),
             "use_musan_noise": _bool("use_musan_noise"),
             "use_musan_music": _bool("use_musan_music"),
             "use_fsd50k": _bool("use_fsd50k"),

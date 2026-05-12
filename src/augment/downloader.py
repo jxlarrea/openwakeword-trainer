@@ -1,6 +1,7 @@
 """Download + extract augmentation corpora.
 
 - MIT IR Survey: room impulse responses (mirror on HF for reproducibility)
+- BUT ReverbDB: measured far-field room impulse responses
 - MUSAN: noise, music, speech (~11 GB)
 - FSD50K: environmental sounds (~34 GB compressed)
 - Common Voice 17.0: streamed from HF, samples written as wavs
@@ -64,6 +65,48 @@ def _download_with_progress(
     tmp.rename(dest)
 
 
+def _download_with_progress_resume(
+    url: str,
+    dest: Path,
+    progress: ProgressCallback | None = None,
+    name: str = "",
+) -> None:
+    """Download a large file with HTTP Range resume when the server supports it."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        if progress:
+            progress(name, 1.0)
+        return
+
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    resume_from = tmp.stat().st_size if tmp.exists() else 0
+    headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
+    mode = "ab" if resume_from else "wb"
+    with requests.get(url, stream=True, timeout=60, headers=headers) as r:
+        if resume_from and r.status_code == 200:
+            # Server ignored Range; restart cleanly rather than appending corrupt data.
+            resume_from = 0
+            mode = "wb"
+        r.raise_for_status()
+        if r.status_code not in (200, 206):
+            raise RuntimeError(f"Unexpected HTTP status {r.status_code} for {url}")
+        total_header = r.headers.get("content-range") or r.headers.get("content-length")
+        if total_header and "/" in total_header:
+            total = int(total_header.rsplit("/", 1)[-1])
+        else:
+            total = resume_from + int(r.headers.get("content-length", 0))
+        bytes_done = resume_from
+        with open(tmp, mode) as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                bytes_done += len(chunk)
+                if progress and total:
+                    progress(name, min(1.0, bytes_done / total))
+    tmp.rename(dest)
+
+
 def _extract_archive(archive: Path, target_dir: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     if archive.suffixes[-2:] == [".tar", ".gz"] or archive.suffix == ".tgz":
@@ -104,13 +147,12 @@ def ensure_openwakeword_feature_files(
         wanted.append(("validation", OPENWAKEWORD_VALIDATION_FILE))
 
     out: dict[str, Path] = {}
-    total = max(1, len(wanted))
-    for i, (key, filename) in enumerate(wanted):
+    for key, filename in wanted:
         local_path = target / filename
         if not local_path.exists():
             logger.info("Downloading openWakeWord feature bank %s", filename)
             if progress:
-                progress(f"openwakeword_features:{key}", i / total)
+                progress(f"openwakeword_features:{key}", 0.0)
             hf_hub_download(
                 repo_id=OPENWAKEWORD_FEATURES_HF_REPO,
                 repo_type="dataset",
@@ -119,9 +161,9 @@ def ensure_openwakeword_feature_files(
                 local_dir_use_symlinks=False,
                 resume_download=True,
             )
+            if progress:
+                progress(f"openwakeword_features:{key}", 1.0)
         out[key] = local_path
-        if progress:
-            progress(f"openwakeword_features:{key}", (i + 1) / total)
     return out
 
 
@@ -147,6 +189,108 @@ def download_mit_rirs(progress: ProgressCallback | None = None) -> Path:
     if progress:
         progress("mit_rirs", 1.0)
     _mark_complete(target)
+    return target
+
+
+# -------- BUT ReverbDB --------
+
+# Same official URL used by Lhotse's BUT ReverbDB recipe.
+BUT_REVERBDB_URL = "http://merlin.fit.vutbr.cz/ReverbDB/BUT_ReverbDB_rel_19_06_RIR-Only.tgz"
+BUT_REVERBDB_HF_REPO = "mwei/BUT-Reverb-dataset"
+BUT_REVERBDB_HF_PARTS = [
+    "BUT_ReverbDB_rel_19_06_RIR-Only.tgz.00",
+    "BUT_ReverbDB_rel_19_06_RIR-Only.tgz.01",
+    "BUT_ReverbDB_rel_19_06_RIR-Only.tgz.02",
+]
+
+
+def _download_but_reverbdb_hf_mirror(
+    target: Path,
+    archive: Path,
+    progress: ProgressCallback | None = None,
+) -> None:
+    """Download the split HF mirror and concatenate it into one tgz archive."""
+    if archive.exists() and archive.stat().st_size > 0:
+        if progress:
+            progress("but_reverbdb", 0.95)
+        return
+
+    token = get_settings().hf_token
+    downloaded_parts: list[Path] = []
+    total = len(BUT_REVERBDB_HF_PARTS)
+    for i, part_name in enumerate(BUT_REVERBDB_HF_PARTS):
+        if progress:
+            progress("but_reverbdb", 0.05 + 0.75 * (i / max(1, total)))
+        logger.info(
+            "Downloading BUT ReverbDB HF mirror part %d/%d: %s",
+            i + 1,
+            total,
+            part_name,
+        )
+        part_path = Path(
+            hf_hub_download(
+                repo_id=BUT_REVERBDB_HF_REPO,
+                repo_type="model",
+                filename=part_name,
+                local_dir=str(target),
+                token=token,
+                resume_download=True,
+            )
+        )
+        downloaded_parts.append(part_path)
+        if progress:
+            progress("but_reverbdb", 0.05 + 0.75 * ((i + 1) / max(1, total)))
+
+    tmp = archive.with_suffix(archive.suffix + ".part")
+    tmp.unlink(missing_ok=True)
+    logger.info("Concatenating BUT ReverbDB split archive")
+    with open(tmp, "wb") as out:
+        for part_path in downloaded_parts:
+            with open(part_path, "rb") as src:
+                shutil.copyfileobj(src, out, length=16 << 20)
+    tmp.replace(archive)
+    if progress:
+        progress("but_reverbdb", 0.95)
+
+
+def download_but_reverbdb(progress: ProgressCallback | None = None) -> Path:
+    """Download + extract BUT ReverbDB RIR-only release.
+
+    The archive is large (~9 GB), so this uses a resumable HTTP download and a
+    completion sentinel around extraction.
+    """
+    target = get_settings().but_reverbdb_dir
+    if _is_complete(target):
+        return target
+    target.mkdir(parents=True, exist_ok=True)
+    archive = target / "BUT_ReverbDB_rel_19_06_RIR-Only.tgz"
+    logger.info("Downloading BUT ReverbDB RIRs to %s", archive)
+    try:
+        _download_with_progress_resume(
+            BUT_REVERBDB_URL,
+            archive,
+            progress=progress,
+            name="but_reverbdb",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Official BUT ReverbDB download failed (%s); trying Hugging Face mirror %s",
+            exc,
+            BUT_REVERBDB_HF_REPO,
+        )
+        archive.unlink(missing_ok=True)
+        archive.with_suffix(archive.suffix + ".part").unlink(missing_ok=True)
+        _download_but_reverbdb_hf_mirror(target, archive, progress=progress)
+    logger.info("Extracting BUT ReverbDB")
+    if progress:
+        progress("but_reverbdb", 0.98)
+    _extract_archive(archive, target)
+    archive.unlink(missing_ok=True)
+    for part_name in BUT_REVERBDB_HF_PARTS:
+        (target / part_name).unlink(missing_ok=True)
+    _mark_complete(target)
+    if progress:
+        progress("but_reverbdb", 1.0)
     return target
 
 
@@ -512,6 +656,7 @@ def download_common_voice_subset(
 def ensure_corpora(
     *,
     use_mit_rirs: bool,
+    use_but_reverbdb: bool,
     use_musan: bool,
     use_fsd50k: bool,
     use_common_voice: bool,
@@ -523,6 +668,10 @@ def ensure_corpora(
     out: dict[str, Path] = {}
     if use_mit_rirs:
         out["mit_rirs"] = download_mit_rirs(progress)
+    if cancel_flag is not None and cancel_flag.is_set():
+        return out
+    if use_but_reverbdb:
+        out["but_reverbdb"] = download_but_reverbdb(progress)
     if cancel_flag is not None and cancel_flag.is_set():
         return out
     if use_musan:
