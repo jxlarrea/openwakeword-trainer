@@ -19,18 +19,40 @@ A Dockerized, GPU-accelerated trainer for [openWakeWord](https://github.com/dscr
 
 Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but the same image runs on any NVIDIA host with CUDA 12.8 drivers.
 
+## Table of contents
+
+- [Highlights](#highlights)
+- [Architecture](#architecture)
+- [Quickstart](#quickstart)
+- [DGX Spark notes](#dgx-spark-notes)
+- [Desktop NVIDIA GPUs](#desktop-nvidia-gpus)
+- [Storage layout](#storage-layout)
+- [Web UI walkthrough](#web-ui-walkthrough)
+- [Example trained models](#example-trained-models)
+- [Hard-negative iteration workflow](#hard-negative-iteration-workflow)
+- [Training/export behavior](#trainingexport-behavior)
+- [HTTP endpoints](#http-endpoints)
+- [Environment variables](#environment-variables)
+- [Tuning for quality](#tuning-for-quality)
+- [Known limitations](#known-limitations)
+- [Local development](#local-development-no-docker)
+- [License](#license)
+
 ## Highlights
 
 - **GPU end-to-end.** Feature extraction (Google speech-embedding ONNX) runs on the GPU via `onnxruntime-gpu` (public wheel on amd64, source-built on aarch64). PyTorch trains the classifier head on the same device.
 - **Parallel TTS.** Piper synthesis runs across a process pool (10 workers x 2 ORT threads on DGX Spark by default) so generating ~100k clips takes ~20 min instead of ~4 hours.
 - **Kokoro positives.** Kokoro is enabled by default as an additive high-quality local TTS source for positive wake-word phrases.
 - **Session-based workflow.** Create or select a wake-word session first. A session owns `/data/runs/<session_id>`, so cached WAVs, features, checkpoints, config, and model naming are reused on later visits.
+- **Three-page UI.** Trainer, Tester, and System pages split training, model testing/downloads, and disk/session cleanup into separate workflows.
+- **Browser-resilient runs.** Running sessions stay locked if you close/reopen the browser, live logs are persisted, and the progress card stays available until the run is cancelled or finishes.
 - **Resumable pipeline.** Every long phase drops sentinels: WAV generation is cached per session, corpora downloads are sentinel-marked, feature extraction checkpoints completed clips, and re-running a failed run skips work that was already done.
 - **Far-field tablet robustness.** BUT ReverbDB RIRs plus tablet far-field augmentation are enabled by default to simulate distant/off-axis single-mic capture, muffling, low level, early reflections, and light device compression.
 - **Hard-negative iteration.** Paste false-triggers you saw in production into the "Negative phrases" field; they get synthesized with the same emphasis as positives so the next model strongly rejects them.
 - **Official negative feature banks.** ACAV100M generic negatives are added to training, and the official openWakeWord validation negatives are used for FP/hr calibration.
 - **Quality-first defaults.** The default UI settings are tuned from tablet testing to produce high-quality, low-false-positive models without extra knob turning.
 - **False-positive guarded export.** The trainer calibrates the validated threshold into the exported ONNX and refuses to publish models that miss the configured recall/FP/hr gates.
+- **Packaged exports.** Successful runs publish both a bare `.onnx` and a `.zip` with the ONNX, exact training config, checkpoint, and checkpoint metadata.
 - **Live progress.** Web UI shows phase banner, multiple progress bars, validation metrics, and a streaming log fed by every module's `logger.info` calls.
 - **Live system telemetry.** CPU, RAM, GPU utilization, GPU temperature, and VRAM (when reported by `nvidia-smi`) stream into the progress panel.
 - **Sane validation.** The form blocks Start when required fields are empty, when no voice is selected, or when no augmentation corpus is enabled. The same checks fire server-side as a defense.
@@ -38,19 +60,19 @@ Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but th
 ## Architecture
 
 ```
-+------------------+     +--------------------+     +-------------------+
-| Web UI           | --> | Pipeline           | --> | openWakeWord      |
-| (FastAPI + SSE)  |     | Orchestrator       |     | runtime           |
-+------------------+     |                    |     | (HA / Wyoming /   |
-                         | 1. Piper x N voices |    |  your app)        |
-                         | 2. Hard negatives  |     +-------------------+
-                         | 3. Adversarial     |
-                         | 4. Download corpora|
-                         | 5. Add OWW negs |
-                         | 6. Augment + feat. |
-                         | 7. Train + mine HNs|
-                         | 8. Export ONNX     |
-                         +--------------------+
++-----------------------+     +----------------------+     +-------------------+
+| Web UI                | --> | Pipeline             | --> | openWakeWord      |
+| Trainer / Tester /    |     | Orchestrator         |     | runtime           |
+| System (FastAPI+SSE)  |     |                      |     | (HA / Wyoming /   |
++-----------------------+     | 1. Piper/Kokoro TTS  |     |  your app)        |
+                              | 2. Hard negatives    |     +-------------------+
+                              | 3. Adversarial pool  |
+                              | 4. Download corpora  |
+                              | 5. Add OWW neg banks |
+                              | 6. Augment + feature |
+                              | 7. Train + evaluate  |
+                              | 8. Export ONNX + zip |
+                              +----------------------+
 ```
 
 The classifier ONNX accepts `(1, 16, 96)` float32 input - 16 consecutive 96-dim Google speech-embeddings, which is exactly what `openwakeword.Model(wakeword_models=["mymodel.onnx"])` expects.
@@ -79,15 +101,24 @@ docker compose up --build
 
 Open http://localhost:8000.
 
-1. Create or select a wake-word session (e.g. `hey jarvis`). The session id becomes the stable run/model id (`hey_jarvis`).
+The top navigation has three pages:
+
+- **Trainer**: create/select a wake-word session, configure a run, start/cancel training, and watch persistent progress/logs.
+- **Tester**: upload or record audio, score it against exported models, and download either the bare `.onnx` or the full model package.
+- **System**: inspect session disk usage, delete individual session caches, delete sessions, or clear all downloaded/generated cache.
+
+Basic training flow:
+
+1. Open **Trainer** and create or select a wake-word session (e.g. `hey jarvis`). The session id becomes the stable run/model id (`hey_jarvis`).
 2. Paste positive phrases (5 to 10 spelling/pronunciation variants of the wake word).
 3. Optionally paste negative phrases (false-triggers observed in production).
-4. Pick voices. High/medium Piper voices and the best Kokoro voices are selected by default; click **Select all** if you want every available voice.
-5. Confirm augmentation corpora. The openWakeWord ACAV100M, validation feature bank, BUT ReverbDB, and tablet far-field augmentation are enabled by default and strongly recommended for tablet deployments.
-6. Click **Start training**. Live progress and system telemetry stream into the panel below.
-7. When done, click **Download .onnx** in section 4. The model also stays at `/opt/models/openwakeword-trainer/models/<session_id>.onnx` on the host (or inside the docker volume if you didn't set `OWW_DATA_DIR_HOST`).
+4. Review voices. High/medium Piper voices and the best Kokoro voices are selected by default; click **Select all** if you want every available voice.
+5. Confirm augmentation corpora. ACAV100M, the validation feature bank, BUT ReverbDB, and tablet far-field augmentation are enabled by default and strongly recommended for tablet deployments.
+6. Click **Start training**. The page scrolls to the progress panel, and live progress/system telemetry/logs stream there.
+7. You can close the browser and come back later. The session stays locked while training is running, fields remain disabled, and the persisted progress/logs rehydrate when the UI loads.
+8. When done, open **Tester** to download `<session_id>.onnx` or `<session_id>.zip`. The model also stays at `/opt/models/openwakeword-trainer/models/<session_id>.onnx` on the host (or inside the docker volume if you didn't set `OWW_DATA_DIR_HOST`).
 
-Sessions are saved to disk. Reopen the UI later, select the same session, and the trainer will reuse cached WAVs/features/checkpoints where possible. Deleting a session from the UI removes its run cache and matching model file to reclaim disk.
+Sessions are saved to disk. Reopen the UI later, select the same session, and the trainer will reuse cached WAVs/features/checkpoints where possible. Use **System** to remove one session's cache, delete a session entirely, or clear shared downloaded corpora/feature banks.
 
 ## DGX Spark notes
 
@@ -177,7 +208,7 @@ Inside `/data`:
     best.pt            best classifier weights
     wakeword.onnx      exported model
     result.json        final metrics + history
-  models/              <session_id>.onnx copies, served by the UI download button
+  models/              <session_id>.onnx and <session_id>.zip, served by Tester downloads
   cache/               HF / torch caches (HF_HOME, TORCH_HOME)
 ```
 
@@ -196,21 +227,32 @@ Inside `/data`:
 | Per-run WAVs (113k clips, ok_nabu scale) | ~10-15 GB |
 | Per-run feature shards (113k x 5 augs) | ~20 GB |
 
-Plan for 120 GB+ on a healthy `/data` mount if you enable all corpora and keep several sessions around. Use **Delete session** in the UI to remove a session's cached WAVs/features/checkpoints and its matching model copy.
+Plan for 120 GB+ on a healthy `/data` mount if you enable all corpora and keep several sessions around. Use **System -> Delete cache** to remove generated data for one session while keeping its settings, **Delete session** to remove the session and its model, or **Delete all disk cache** to reclaim shared downloaded/generated data while preserving sessions.
 
 ## Web UI walkthrough
 
-### Section 1: Session
+### Navigation
+
+The header includes three primary pages:
+
+- **Trainer** (`/`): session selection, run configuration, start/cancel, persistent progress, metrics, logs, and live system telemetry.
+- **Tester** (`/tester`): exported model downloads and audio scoring.
+- **System** (`/system`): session inventory, disk usage, and cleanup actions.
+
+### Trainer page
+
+#### Session
 
 - **Wake-word session** selects an existing durable run. Existing `/data/runs/<id>` directories with `session.json` or `config.json` appear here.
 - **Create session** asks for the wake word once. The trainer slugifies it (`ok nabu` -> `ok_nabu`) and uses that as the stable run/model id.
-- **Delete session** removes `/data/runs/<session_id>` and `/data/models/<session_id>.onnx`. It is blocked while that same session is actively running.
-- Selecting a session fills the form with the last saved config and shows its cache size/model status.
+- **Delete session** removes `/data/runs/<session_id>`, `/data/models/<session_id>.onnx`, and `/data/models/<session_id>.zip`.
+- Selecting a session fills the form with the last saved config and shows its cache/model status.
+- While any training run is active, session creation/deletion is locked so two sessions cannot train at the same time.
 
-### Section 2: Configure training run
+#### Configure training run
 
 - **Wake word** is set by the session and kept read-only so cached data stays attached to the correct wake word.
-- **Run name** is the session id and is also read-only. This keeps the output model and run directory stable across retries.
+- **Run name** is the session id and is also read-only. This keeps the output model, package, and run directory stable across retries.
 - **Positive phrases** (left column) are TTS'd as positive samples. 5 to 10 spelling variants is the sweet spot. Empty defaults to the wake word itself.
 - **Negative phrases (hard negatives)** (right column) are TTS'd as **negative** samples with the same emphasis as positives. Paste any false-trigger phrases you observed in production. This is the most important knob for v2+ models.
 - **Piper voices**: high/medium voices are selected by default; select all, none, or high-quality-only as needed. Use the search box to narrow. Multi-speaker voices like `en_US-libritts-high` cover hundreds of speakers per voice.
@@ -221,28 +263,42 @@ Plan for 120 GB+ on a healthy `/data` mount if you enable all corpora and keep s
 - **Tablet far-field augmentation**: default-on channel simulation for off-axis tablet microphones. It applies mic band-limiting, distance attenuation, a device/room noise floor, early reflections, and light capture compression.
 - **Classifier + training**: model architecture, optimizer, schedule, and target FP/hr. Defaults are tuned for low false positives on DGX Spark.
 
-The Start button is hidden while a run is in progress, and the Cancel button is hidden when nothing is running. Cancellation is honored at every long phase (download, generation, feature extraction, training).
+The Start button is disabled/hidden while a run is in progress, and the Cancel button is shown only when cancellation is possible. All editable fields are disabled during training so the saved session config cannot drift under a running process. Cancellation is honored at every long phase (download, generation, feature extraction, training).
 
-### Section 3: Progress
+#### Progress
 
+- The progress card appears at the top once a run starts and remains visible after cancellation or completion.
+- The title includes the active run id, e.g. `Progress: ok_nabu`.
 - **Phase banner** shows the current step (e.g. `phase: generate:piper:adv -> 10 phrases, 111000 synths, 10 workers`).
-- **Progress bars** stack as phases come online. Each bar reaches 100% explicitly on completion.
+- **Progress bars** are cleared for each new run, stack as phases come online, and reach 100% explicitly on completion.
 - **Metrics tiles** populate during training: step, train_loss, val_loss, recall@p95, recall@targetFP, FP/hr, threshold, etc.
 - **System metrics** update continuously: CPU, RAM, GPU, GPU temperature, and VRAM on systems where `nvidia-smi` reports dedicated memory. DGX Spark uses unified memory, so VRAM may be absent while RAM still reflects total pressure.
-- **Live log** is fed by `logger.info` from every module in `src/*`. Long phases emit a heartbeat every ~5-10 seconds so the UI never feels hung.
+- **Live log** is persisted in the progress snapshot. If you close and reopen the browser during a run, the current phase/progress/metrics/logs rehydrate from `/api/train/status`.
+- **Cancel training** is available from the progress card, which matters after reload because the rest of the form remains locked.
 
-### Section 4: Test a trained model
+### Tester page
 
-- **Model dropdown** lists everything under `/data/models/`. The pill shows the file size.
+- **Model dropdown** lists everything under `/data/models/`. The pill shows the ONNX file size and package size when a zip exists.
 - **Download .onnx** button triggers a browser download via `/api/models/<name>`.
-- **Refresh list** re-queries the models endpoint.
-- **Upload audio** accepts WAV / MP3 / FLAC.
+- **Download package** downloads `/data/models/<session_id>.zip`, which contains the ONNX, exact training config, checkpoint, and checkpoint metadata.
+- **Refresh list** re-queries the models endpoint without leaving the page.
+- **Upload audio** accepts common browser/server-decodable audio files. The server can decode WAV/MP3/FLAC through libsndfile and browser-recorded WebM/Opus through ffmpeg.
 - **Record from mic** is disabled unless the page is served over HTTPS or from `localhost` (browser API requirement). The pill shows "mic disabled - HTTPS required" when it cannot run.
 - **Run test** uploads the audio, scores it through the selected model, and shows max / mean score, detection count, and a score curve chart.
 
+### System page
+
+- **Summary tiles** show total session count, session data size, and shared cache/model size.
+- **Sessions table** lists wake word, session id, disk usage, and model status for every saved session.
+- **Delete cache** removes generated data for one session while keeping `session.json` and the saved settings. Use this when you want to reclaim WAV/features/checkpoints but keep the session reusable.
+- **Delete session** removes the session, its generated data, and matching model/package artifacts.
+- **Delete all disk cache** removes generated/downloaded cache and trained models while preserving sessions and their parameters.
+- **Delete all sessions and cache** removes sessions, saved settings, generated data, downloaded cache, and trained models.
+- Destructive System actions are disabled while training is running.
+
 ## Example trained models
 
-The `trained-models/` folder contains ONNX models trained with this project. Use them as examples of the exported artifact format, or copy one into your openWakeWord runtime to test it directly.
+The `trained-models/` folder contains models trained with this project, including the ONNX file plus the config/checkpoint metadata used to produce it. Use them as examples of the exported artifact format, or copy the ONNX into your openWakeWord runtime to test it directly.
 
 ## Hard-negative iteration workflow
 
@@ -260,7 +316,7 @@ The intended dev loop for a production-quality model:
 
 After 2 to 3 iterations the model converges on essentially zero false-triggers in your specific deployment environment. This is how the official `ok_nabu` model from Nabu Casa was tuned.
 
-To force a fresh regeneration (e.g. after changing voice selection), create a new session or delete `/data/runs/<session_id>/wavs/*/.generated_*` sentinel files. To reclaim all space for a wake word, use **Delete session** in the UI.
+To force a fresh regeneration (e.g. after changing voice selection), create a new session or delete `/data/runs/<session_id>/wavs/*/.generated_*` sentinel files. To reclaim space, use the **System** page to delete a session cache or remove the session entirely.
 
 ## Training/export behavior
 
@@ -281,13 +337,19 @@ The trainer optimizes for low false positives, not just low validation loss:
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/` | Web UI |
+| GET | `/` | Trainer page |
+| GET | `/tester` | Tester page |
+| GET | `/system` | System page |
 | GET/HEAD | `/favicon.ico` | Browser favicon |
 | GET | `/healthz` | Liveness + run status |
 | GET | `/api/sessions` | List saved wake-word sessions |
 | POST | `/api/sessions` | Create a session (JSON: `wake_word`) |
 | GET | `/api/sessions/{session_id}` | Load one session, including saved config and cache size |
-| DELETE | `/api/sessions/{session_id}` | Delete run cache and matching model for that session |
+| DELETE | `/api/sessions/{session_id}` | Delete a session, run cache, and matching model/package |
+| GET | `/api/system/disk` | Disk summary for sessions, shared cache, and models |
+| DELETE | `/api/system/sessions/{session_id}/cache` | Delete generated data/model for one session while keeping settings |
+| DELETE | `/api/system/cache` | Delete shared/generated disk cache while preserving sessions |
+| DELETE | `/api/system/all` | Delete all sessions and cache |
 | POST | `/api/train/start` | Start a run (JSON `TrainRunConfig`). Returns 422 with details on invalid config. |
 | POST | `/api/train/cancel` | Set the cancel flag |
 | GET | `/api/train/status` | Current run state plus current system telemetry |
@@ -296,8 +358,9 @@ The trainer optimizes for low false positives, not just low validation loss:
 | POST | `/api/audition/elevenlabs` | One-shot ElevenLabs synth |
 | GET | `/api/voices/piper` | List English Piper voices from HF manifest |
 | GET | `/api/voices/elevenlabs` | List your ElevenLabs voices |
-| GET | `/api/models` | List trained ONNX models with sizes |
+| GET | `/api/models` | List trained ONNX models with ONNX/package sizes |
 | GET | `/api/models/{name}` | Download a trained ONNX |
+| GET | `/api/model-packages/{name}` | Download a trained model zip package |
 | POST | `/api/test/file` | Score an uploaded audio file (multipart: model_name, threshold, audio) |
 
 ## Environment variables
@@ -328,9 +391,9 @@ Defaults pair `workers * threads = 20` to match DGX Spark's 20 Grace cores exact
 
 Defaults are tuned for high-quality, low-false-positive models on the DGX Spark, including noisy/far-field tablet use. Further knobs:
 
-- **More voices, more accents.** Toggle every English Piper voice. Enable ElevenLabs (`ELEVENLABS_API_KEY`) for additional accent variations.
+- **More voices, more accents.** High/medium Piper voices are the default quality set. Toggle every English Piper voice only if you want more variety and are willing to test whether lower-quality voices help your phrase. Enable ElevenLabs (`ELEVENLABS_API_KEY`) for additional accent variations.
 - **Use Kokoro for natural positives.** Kokoro is on by default with 2 positive renders per phrase/voice. Enable Kokoro hard negatives only for short, important false-trigger phrases.
-- **More augmentations per clip.** Bump from 5 to 8. Each WAV becomes more variants, forcing the classifier to learn channel-invariant cues. Linearly grows feature-extraction time.
+- **More augmentations per clip.** Bump from 6 to 8. Each WAV becomes more variants, forcing the classifier to learn channel-invariant cues. Linearly grows feature-extraction time.
 - **Tablet / far-field deployments.** BUT ReverbDB, Tablet far-field augmentation, `RIR p = 0.9`, and 6 augmentations per clip are the defaults. Increase tablet far-field probability toward `0.8` for harsher off-axis environments.
 - **More adversarial phrases.** From 3,000 to 10,000+. The main failure mode of a wake-word classifier is firing on phonetically-similar phrases.
 - **More Common Voice.** 20k is the default speech-negative pool; 50k+ helps with rare-accent generalization.
@@ -373,51 +436,9 @@ export OWW_DATA_DIR=$(pwd)/data
 python -m uvicorn src.main:app --reload --port 8000
 ```
 
-`espeak-ng` is required by Piper for phoneme generation. Install via your OS package manager (`brew install espeak-ng`, `apt install espeak-ng`, or scoop on Windows).
+`espeak-ng` is required by Piper for phoneme generation. `ffmpeg` is required if you want the Tester page to decode browser-recorded WebM/Opus locally. Install via your OS package manager (`brew install espeak-ng ffmpeg`, `apt install espeak-ng ffmpeg`, or scoop on Windows).
 
 `/data` and `/app/src` are bind-mounted in the production compose file. For local dev, the same hot-reload behavior comes from `uvicorn --reload`.
-
-## Project layout
-
-```
-.
-|-- Dockerfile              # multi-stage: prepares ORT GPU wheel then runtime image
-|-- compose.yaml            # named volume by default; OWW_DATA_DIR_HOST switches to bind mount
-|-- requirements.txt
-|-- .env.example
-`-- src/
-    |-- main.py             # FastAPI entry
-    |-- settings.py         # pydantic-settings + /data paths
-    |-- config_schema.py    # TrainRunConfig + validators
-    |-- sessions.py         # durable wake-word session metadata + cleanup
-    |-- system_monitor.py   # CPU/RAM/GPU telemetry for the UI
-    |-- assets/             # logo + favicon
-    |-- tts/
-    |   |-- piper_generator.py    # process-pool Piper synthesis
-    |   |-- elevenlabs_generator.py
-    |   `-- voices.py             # HF voice manifest + downloads
-    |-- augment/
-    |   |-- augmenter.py          # audiomentations chain
-    |   `-- downloader.py         # corpora + openWakeWord feature banks
-    |-- data/
-    |   |-- features.py           # mel + speech_embedding ONNX (CUDA EP)
-    |   |-- adversarial.py        # auto-generated hard negatives
-    |   `-- dataset.py            # memmap dataset + feature-bank adapters
-    |-- train/
-    |   |-- model.py              # WakeWordDNN / RNN
-    |   |-- trainer.py            # weighted BCE + mining + export gates
-    |   |-- export.py             # threshold-calibrated ONNX export
-    |   |-- diagnostics.py        # local model evaluation helpers
-    |   `-- progress.py           # EventBus + BusLoggingHandler
-    |-- inference/
-    |   `-- tester.py             # /api/test/file
-    |-- pipeline/
-    |   `-- orchestrator.py       # full run state machine + sentinels
-    `-- webui/
-        |-- app.py                # FastAPI routes
-        |-- templates/{base,index}.html
-        `-- static/{style.css,app.js}
-```
 
 ## License
 
