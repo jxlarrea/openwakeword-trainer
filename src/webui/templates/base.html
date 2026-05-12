@@ -4,12 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}OpenWakeWord Trainer{% endblock %}</title>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
   <link rel="stylesheet" href="/static/style.css">
   <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
 </head>
 <body>
   <header class="topbar">
-    <h1>OpenWakeWord Trainer</h1>
+    <div class="brand">
+      <img src="/assets/icon.png" alt="" class="brand-icon">
+      <h1>OpenWakeWord Trainer</h1>
+    </div>
     <div class="topbar-right">
       <a class="github-link" href="https://github.com/jxlarrea/openwakeword-trainer"
          target="_blank" rel="noopener" title="View source on GitHub">

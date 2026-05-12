@@ -30,6 +30,11 @@ ProgressCallback = Callable[[str, float], None]
 """(dataset_name, fraction_done) -> None"""
 
 
+OPENWAKEWORD_FEATURES_HF_REPO = "davidscripka/openwakeword_features"
+OPENWAKEWORD_ACAV100M_FILE = "openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
+OPENWAKEWORD_VALIDATION_FILE = "validation_set_features.npy"
+
+
 # -------- low-level helpers --------
 
 def _download_with_progress(
@@ -80,6 +85,44 @@ def _mark_complete(target_dir: Path) -> None:
 
 def _is_complete(target_dir: Path) -> bool:
     return (target_dir / ".complete").exists()
+
+
+def ensure_openwakeword_feature_files(
+    use_training: bool = True,
+    use_validation: bool = True,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Path]:
+    """Download official openWakeWord negative feature banks if requested."""
+    from huggingface_hub import hf_hub_download
+
+    target = get_settings().openwakeword_features_dir
+    target.mkdir(parents=True, exist_ok=True)
+    wanted: list[tuple[str, str]] = []
+    if use_training:
+        wanted.append(("acav100m", OPENWAKEWORD_ACAV100M_FILE))
+    if use_validation:
+        wanted.append(("validation", OPENWAKEWORD_VALIDATION_FILE))
+
+    out: dict[str, Path] = {}
+    total = max(1, len(wanted))
+    for i, (key, filename) in enumerate(wanted):
+        local_path = target / filename
+        if not local_path.exists():
+            logger.info("Downloading openWakeWord feature bank %s", filename)
+            if progress:
+                progress(f"openwakeword_features:{key}", i / total)
+            hf_hub_download(
+                repo_id=OPENWAKEWORD_FEATURES_HF_REPO,
+                repo_type="dataset",
+                filename=filename,
+                local_dir=str(target),
+                local_dir_use_symlinks=False,
+                resume_download=True,
+            )
+        out[key] = local_path
+        if progress:
+            progress(f"openwakeword_features:{key}", (i + 1) / total)
+    return out
 
 
 # -------- MIT IR Survey --------

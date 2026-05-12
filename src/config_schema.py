@@ -83,6 +83,8 @@ class DatasetConfig(BaseModel):
     use_fsd50k: bool = True
     use_common_voice_negatives: bool = True
     common_voice_subset: int = 15000  # DGX Spark default
+    use_openwakeword_negative_features: bool = True
+    use_openwakeword_validation_features: bool = True
 
 
 class TrainingConfig(BaseModel):
@@ -94,9 +96,19 @@ class TrainingConfig(BaseModel):
     n_blocks: int = 1
     learning_rate: float = 1e-4
     batch_size: int = 2048
+    positive_sample_fraction: float = 0.20
+    negative_loss_weight: float = 8.0
+    hard_negative_loss_weight: float = 4.0
+    hard_negative_threshold: float = 0.10
+    hard_negative_mining_top_k: int = 50_000
+    hard_negative_finetune_steps: int = 10_000
+    hard_negative_finetune_positive_fraction: float = 0.35
     max_steps: int = 75_000
     val_every_n_steps: int = 500
     target_false_positives_per_hour: float = 0.2
+    min_recall_at_p95_for_export: float = 0.80
+    min_recall_at_target_fp_for_export: float = 0.75
+    early_stop_min_steps: int = 15_000
     early_stop_patience: int = 8
     seed: int = 42
 
@@ -142,6 +154,8 @@ class TrainRunConfig(BaseModel):
             or self.datasets.use_musan_music
             or self.datasets.use_fsd50k
             or self.datasets.use_common_voice_negatives
+            or self.datasets.use_openwakeword_negative_features
+            or self.datasets.use_openwakeword_validation_features
         )
         if not any_corpus:
             raise ValueError(

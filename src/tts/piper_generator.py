@@ -15,8 +15,11 @@ A spawn-based pool keeps each worker isolated.
 from __future__ import annotations
 
 import logging
+import gc
+import os
 import random
 from collections.abc import Iterator
+from itertools import groupby
 from typing import Any
 
 import numpy as np
@@ -121,6 +124,18 @@ def _worker_load_voice(key: str) -> tuple[PiperVoice, PiperVoiceInfo]:
     return voice, info
 
 
+def _worker_release_voice_cache() -> None:
+    """Drop Piper voice sessions held by this worker.
+
+    ONNX Runtime owns native/CUDA allocations under the PiperVoice object. This
+    is intentionally optional because reloading a CUDA Piper session for every
+    single sample is very expensive.
+    """
+    global _WORKER_VOICES
+    _WORKER_VOICES.clear()
+    gc.collect()
+
+
 def _worker_synth(task: dict[str, Any]) -> dict[str, Any] | None:
     """Synthesize one task in a worker. Returns dict or None on failure."""
     try:
@@ -160,6 +175,12 @@ def _worker_synth(task: dict[str, Any]) -> dict[str, Any] | None:
             exc,
         )
         return None
+    finally:
+        release_after_synth = os.environ.get(
+            "OWW_PIPER_RELEASE_AFTER_SYNTH", "false"
+        ).lower() in ("1", "true", "yes", "on")
+        if release_after_synth:
+            _worker_release_voice_cache()
 
 
 # ----------------------------------------------------------------------------- #
@@ -347,23 +368,38 @@ class PiperGenerator:
         from multiprocessing import get_context
 
         # `spawn` avoids fork-with-threads pitfalls in onnxruntime / numpy.
+        #
+        # Keep pools scoped to one voice at a time. Each worker caches loaded
+        # PiperVoice sessions for speed; a single long-lived pool over a large
+        # multi-voice adversarial run lets every worker eventually keep many
+        # ONNX sessions resident. On unified-memory systems this can consume
+        # nearly all RAM. Per-voice pools bound peak memory to
+        # `workers * one voice`, and exiting the pool releases that cache.
         ctx = get_context("spawn")
-        with ctx.Pool(
-            processes=workers,
-            initializer=_worker_init,
-            initargs=(self.use_cuda,),
-        ) as pool:
-            for result in pool.imap_unordered(_worker_synth, tasks, chunksize=chunksize):
-                if result is None:
-                    continue
-                audio = np.frombuffer(result["audio_bytes"], dtype=np.float32)
-                yield GeneratedSample(
-                    audio=audio,
-                    sample_rate=TARGET_SAMPLE_RATE,
-                    text=result["text"],
-                    voice=result["voice"],
-                    metadata=result["metadata"],
-                )
+        max_tasks_per_child = int(os.environ.get("OWW_PIPER_MAX_TASKS_PER_CHILD", "250"))
+        pool_kwargs = {}
+        if max_tasks_per_child > 0:
+            pool_kwargs["maxtasksperchild"] = max_tasks_per_child
+        sorted_tasks = sorted(tasks, key=lambda t: t["voice_key"])
+        for _voice_key, voice_group in groupby(sorted_tasks, key=lambda t: t["voice_key"]):
+            voice_tasks = list(voice_group)
+            with ctx.Pool(
+                processes=workers,
+                initializer=_worker_init,
+                initargs=(self.use_cuda,),
+                **pool_kwargs,
+            ) as pool:
+                for result in pool.imap_unordered(_worker_synth, voice_tasks, chunksize=chunksize):
+                    if result is None:
+                        continue
+                    audio = np.frombuffer(result["audio_bytes"], dtype=np.float32)
+                    yield GeneratedSample(
+                        audio=audio,
+                        sample_rate=TARGET_SAMPLE_RATE,
+                        text=result["text"],
+                        voice=result["voice"],
+                        metadata=result["metadata"],
+                    )
 
     def _inline_iter(self, tasks: list[dict[str, Any]]) -> Iterator[GeneratedSample]:
         """Inline (single-process) fallback. Same output contract as iter_parallel."""

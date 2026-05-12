@@ -69,6 +69,10 @@ class Settings(BaseSettings):
         return self.augmentations_dir / "common_voice"
 
     @property
+    def openwakeword_features_dir(self) -> Path:
+        return self.data_dir / "openwakeword_features"
+
+    @property
     def generated_dir(self) -> Path:
         return self.data_dir / "generated"
 
@@ -89,6 +93,7 @@ class Settings(BaseSettings):
             self.musan_dir,
             self.fsd50k_dir,
             self.common_voice_dir,
+            self.openwakeword_features_dir,
             self.generated_dir,
             self.models_dir,
             self.runs_dir,

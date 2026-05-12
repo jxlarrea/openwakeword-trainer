@@ -24,7 +24,9 @@ from torch.utils.data import Dataset
 
 from src.data.features import (
     CLASSIFIER_WINDOW_EMBEDDINGS,
+    EMBEDDING_HOP_FRAMES,
     EMBEDDING_DIM,
+    EMBEDDING_WINDOW_FRAMES,
     FeatureExtractor,
     float32_to_int16,
 )
@@ -43,12 +45,18 @@ class ShardManifest:
     labels_path: Path
     n_windows: int
     label_counts: dict[int, int]
+    source_ids_path: Path | None = None
 
 
 class FeatureMemmapDataset(Dataset):
     """Reads precomputed (windows, 16, 96) float32 + (windows,) uint8 memmaps."""
 
-    def __init__(self, features_path: Path, labels_path: Path) -> None:
+    def __init__(
+        self,
+        features_path: Path,
+        labels_path: Path,
+        source_ids_path: Path | None = None,
+    ) -> None:
         labels = np.load(labels_path, mmap_mode="r")
         n = int(labels.shape[0])
         if n == 0:
@@ -64,6 +72,16 @@ class FeatureMemmapDataset(Dataset):
             shape=(n, CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM),
         )
         self.labels = labels
+        if source_ids_path is None:
+            inferred = labels_path.with_name(
+                labels_path.name.replace("_labels.npy", "_source_ids.npy")
+            )
+            source_ids_path = inferred if inferred.exists() else None
+        self.source_ids = (
+            np.load(source_ids_path, mmap_mode="r")
+            if source_ids_path is not None and source_ids_path.exists()
+            else None
+        )
 
     def __len__(self) -> int:
         return int(self.labels.shape[0])
@@ -74,13 +92,160 @@ class FeatureMemmapDataset(Dataset):
         return x, y
 
 
+class ExternalNegativeFeatureDataset(Dataset):
+    """Reads an openWakeWord `.npy` feature bank as label-0 windows."""
+
+    def __init__(self, features_path: Path) -> None:
+        self.features = np.load(features_path, mmap_mode="r")
+        if self.features.ndim == 3 and self.features.shape[1:] == (
+            CLASSIFIER_WINDOW_EMBEDDINGS,
+            EMBEDDING_DIM,
+        ):
+            self._mode = "windows"
+            n = int(self.features.shape[0])
+        elif self.features.ndim == 2 and self.features.shape[1] == EMBEDDING_DIM:
+            self._mode = "embeddings"
+            n = max(0, int(self.features.shape[0]) - CLASSIFIER_WINDOW_EMBEDDINGS + 1)
+        else:
+            raise RuntimeError(
+                f"Unexpected external feature shape at {features_path}: "
+                f"{self.features.shape}; expected "
+                f"(N, {CLASSIFIER_WINDOW_EMBEDDINGS}, {EMBEDDING_DIM}) windows "
+                f"or (N, {EMBEDDING_DIM}) embedding frames"
+            )
+        if n <= 0:
+            raise RuntimeError(f"External feature bank is empty or too short: {features_path}")
+        self.labels = np.zeros(n, dtype=np.uint8)
+        self.source_ids = None
+
+    def __len__(self) -> int:
+        return int(self.labels.shape[0])
+
+    def __getitem__(self, idx: int):
+        if self._mode == "windows":
+            x = np.asarray(self.features[idx], dtype=np.float32)
+        else:
+            x = np.asarray(
+                self.features[idx : idx + CLASSIFIER_WINDOW_EMBEDDINGS],
+                dtype=np.float32,
+            )
+        return x, 0.0
+
+    def get_features(self, indices: np.ndarray) -> np.ndarray:
+        indices = np.asarray(indices, dtype=np.int64)
+        if self._mode == "windows":
+            return np.asarray(self.features[indices], dtype=np.float32)
+        out = np.empty(
+            (indices.size, CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM),
+            dtype=np.float32,
+        )
+        for i, idx in enumerate(indices):
+            out[i] = np.asarray(
+                self.features[idx : idx + CLASSIFIER_WINDOW_EMBEDDINGS],
+                dtype=np.float32,
+            )
+        return out
+
+
+class CombinedFeatureDataset(Dataset):
+    """Concatenate feature datasets while preserving labels/source IDs."""
+
+    def __init__(self, datasets: list[Dataset]) -> None:
+        self.datasets = [d for d in datasets if len(d) > 0]
+        if not self.datasets:
+            raise RuntimeError("CombinedFeatureDataset requires at least one non-empty dataset")
+        lengths = [len(d) for d in self.datasets]
+        self._offsets = np.cumsum([0] + lengths)
+        self.labels = np.concatenate(
+            [np.asarray(getattr(d, "labels")[:], dtype=np.uint8) for d in self.datasets]
+        )
+        source_parts: list[np.ndarray] = []
+        source_base = 0
+        for d in self.datasets:
+            n = len(d)
+            src = getattr(d, "source_ids", None)
+            labels = np.asarray(getattr(d, "labels")[:], dtype=np.uint8)
+            if src is None:
+                part = np.full(n, -1, dtype=np.int64)
+            else:
+                part = np.asarray(src[:], dtype=np.int64)
+                valid = part >= 0
+                # Keep positive source IDs unique across child datasets.
+                part = part.copy()
+                part[valid] += source_base
+                if valid.any():
+                    source_base = int(part[valid].max()) + 1
+            part[labels == 0] = -1
+            source_parts.append(part)
+        self.source_ids = np.concatenate(source_parts)
+
+    def __len__(self) -> int:
+        return int(self._offsets[-1])
+
+    def _locate(self, idx: int) -> tuple[Dataset, int]:
+        if idx < 0:
+            idx += len(self)
+        ds_idx = int(np.searchsorted(self._offsets, idx, side="right") - 1)
+        return self.datasets[ds_idx], int(idx - self._offsets[ds_idx])
+
+    def __getitem__(self, idx: int):
+        ds, local_idx = self._locate(idx)
+        return ds[local_idx]
+
+    def get_features(self, indices: np.ndarray) -> np.ndarray:
+        indices = np.asarray(indices, dtype=np.int64)
+        out = np.empty(
+            (indices.size, CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM),
+            dtype=np.float32,
+        )
+        for ds_idx, ds in enumerate(self.datasets):
+            start = self._offsets[ds_idx]
+            end = self._offsets[ds_idx + 1]
+            mask = (indices >= start) & (indices < end)
+            if not mask.any():
+                continue
+            local = indices[mask] - start
+            out[mask] = _dataset_features_at(ds, local)
+        return out
+
+
+def _dataset_features_at(dataset: Dataset, indices: np.ndarray) -> np.ndarray:
+    if hasattr(dataset, "get_features"):
+        return dataset.get_features(indices)
+    return np.asarray(getattr(dataset, "features")[indices], dtype=np.float32)
+
+
 def write_wav(path: Path, audio: np.ndarray, sample_rate: int = 16_000) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(path, audio, sample_rate, subtype="PCM_16")
 
 
+def _active_audio_bounds(audio: np.ndarray) -> tuple[int, int]:
+    """Return a conservative non-silence region for a synthesized clip."""
+    if audio.size == 0:
+        return 0, 0
+    abs_audio = np.abs(audio.astype(np.float32))
+    peak = float(abs_audio.max(initial=0.0))
+    if peak <= 1e-5:
+        return 0, audio.size
+    threshold = max(1e-4, peak * 0.02)
+    active = np.flatnonzero(abs_audio >= threshold)
+    if active.size == 0:
+        return 0, audio.size
+
+    # Include a little edge context so quiet consonants do not get clipped out
+    # of the timing estimate.
+    margin = int(0.08 * 16_000)
+    start = max(0, int(active[0]) - margin)
+    end = min(audio.size, int(active[-1]) + margin + 1)
+    return start, max(start + 1, end)
+
+
 def _pad_to_min_length(
-    audio: np.ndarray, rng: np.random.Generator
+    audio: np.ndarray,
+    rng: np.random.Generator,
+    active_start: int | None = None,
+    active_end: int | None = None,
 ) -> tuple[np.ndarray, int, int]:
     """Pad audio with silence so the result is at least MIN_CLIP_SAMPLES long.
 
@@ -90,32 +255,41 @@ def _pad_to_min_length(
     the whole array.
     """
     audio = audio.astype(np.float32)
+    if active_start is None or active_end is None:
+        active_start, active_end = _active_audio_bounds(audio)
+    active_start = max(0, min(int(active_start), audio.size))
+    active_end = max(active_start + 1, min(int(active_end), audio.size))
+
     if audio.size >= MIN_CLIP_SAMPLES:
-        return audio, 0, audio.size
+        return audio, active_start, active_end
     out = np.zeros(MIN_CLIP_SAMPLES, dtype=np.float32)
     max_offset = MIN_CLIP_SAMPLES - audio.size
     offset = int(rng.integers(0, max_offset + 1))
     out[offset : offset + audio.size] = audio
-    return out, offset, offset + audio.size
+    return out, offset + active_start, offset + active_end
 
 
-# Each classifier window covers 16 embeddings x 8 mel-frame hop x 200 samples
-# per mel frame at 16 kHz = 25,600 samples (1.6 s). Adjacent classifier windows
-# differ by one embedding hop = 8 mel-frames = 1,600 samples (0.1 s).
-_SAMPLES_PER_CLASSIFIER_WINDOW = CLASSIFIER_WINDOW_EMBEDDINGS * 8 * 200
-_SAMPLES_PER_CLASSIFIER_HOP = 8 * 200
+# openWakeWord advances one embedding every 8 mel frames. The ONNX mel model
+# uses 160-sample frame hops, so classifier windows advance every 1,280 samples
+# (80 ms). A classifier input of 16 embeddings spans the first embedding's
+# 76-frame receptive field plus 15 embedding hops: ~1.96 s.
+_MEL_FRAME_HOP_SAMPLES = 160
+_SAMPLES_PER_CLASSIFIER_HOP = EMBEDDING_HOP_FRAMES * _MEL_FRAME_HOP_SAMPLES
+_SAMPLES_PER_CLASSIFIER_WINDOW = (
+    (CLASSIFIER_WINDOW_EMBEDDINGS - 1) * EMBEDDING_HOP_FRAMES
+    + EMBEDDING_WINDOW_FRAMES
+) * _MEL_FRAME_HOP_SAMPLES
+_POSITIVE_MIN_SPEECH_COVERAGE = 0.85
 
 
 def _filter_speech_windows(
     windows: np.ndarray, speech_start: int, speech_end: int
 ) -> np.ndarray:
-    """Keep only classifier-windows whose audio span overlaps the speech region.
+    """Keep positive windows that contain the completed wake phrase.
 
-    A positive clip padded to 3 s contains long stretches of silence. Without
-    this filter, those silent windows get labeled positive and the model
-    learns to fire on silence. We keep a window if at least half of the
-    original speech is inside it; if none qualify (very short speech), we
-    fall back to the single window closest to the speech center.
+    A wake phrase should not be labeled positive until the model has enough
+    context to hear the whole phrase. Prefix-heavy windows are exactly how a
+    model learns "ok/oh/open..." instead of "ok nabu".
     """
     if windows.shape[0] == 0:
         return windows
@@ -125,12 +299,24 @@ def _filter_speech_windows(
         ws = k * _SAMPLES_PER_CLASSIFIER_HOP
         we = ws + _SAMPLES_PER_CLASSIFIER_WINDOW
         overlap = max(0, min(we, speech_end) - max(ws, speech_start))
-        if overlap / speech_len >= 0.5:
+        phrase_complete = we >= speech_end
+        if phrase_complete and overlap / speech_len >= _POSITIVE_MIN_SPEECH_COVERAGE:
             keep.append(k)
     if not keep:
-        speech_center = (speech_start + speech_end) // 2
-        closest = max(0, min(windows.shape[0] - 1, speech_center // _SAMPLES_PER_CLASSIFIER_HOP))
-        keep = [closest]
+        # Fall back to the window with maximum speech coverage, preferring one
+        # that ends after the phrase if possible. This keeps long/slow phrases
+        # trainable without accepting early prefix-only windows.
+        best_idx = 0
+        best_score = (-1, -1.0)
+        for k in range(windows.shape[0]):
+            ws = k * _SAMPLES_PER_CLASSIFIER_HOP
+            we = ws + _SAMPLES_PER_CLASSIFIER_WINDOW
+            overlap = max(0, min(we, speech_end) - max(ws, speech_start))
+            score = (1 if we >= speech_end else 0, overlap / speech_len)
+            if score > best_score:
+                best_idx = k
+                best_score = score
+        keep = [best_idx]
     return windows[keep]
 
 
@@ -203,6 +389,7 @@ def _augment_one_clip(task: dict) -> dict | None:
         label = int(task["label"])
         n_augs = task["augmentations_per_clip"]
         seed = task["seed"]
+        source_id = int(task.get("source_id", -1))
 
         audio, sr = _sf.read(wav_path, dtype="float32", always_2d=False)
         if audio.ndim > 1:
@@ -235,6 +422,7 @@ def _augment_one_clip(task: dict) -> dict | None:
         return {
             "n_windows": int(combined.shape[0]),
             "windows_bytes": combined.tobytes(),
+            "source_id": source_id,
         }
     except Exception:
         return None
@@ -250,6 +438,7 @@ def build_features_from_wavs_parallel(
     augmentations_per_clip: int,
     out_features: np.memmap,
     out_labels: np.ndarray,
+    out_source_ids: np.ndarray | None,
     write_offset: int,
     workers: int,
     cancel_flag=None,
@@ -257,6 +446,7 @@ def build_features_from_wavs_parallel(
     progress_label: str = "features:extract",
     progress_fraction_base: float = 0.0,
     progress_fraction_span: float = 1.0,
+    source_id_base: int = 0,
 ) -> int:
     """Full end-to-end pipeline in workers (augment + mel + embedding + filter).
 
@@ -281,8 +471,9 @@ def build_features_from_wavs_parallel(
             "label": label,
             "augmentations_per_clip": augmentations_per_clip,
             "seed": (hash((str(p), label, write_offset)) & 0xFFFFFFFF),
+            "source_id": source_id_base + i,
         }
-        for p in wav_paths
+        for i, p in enumerate(wav_paths)
     ]
 
     aug_cfg_dump = augmentation_cfg.model_dump()
@@ -325,6 +516,8 @@ def build_features_from_wavs_parallel(
                 windows = windows[:n_new]
             out_features[cursor : cursor + n_new] = windows
             out_labels[cursor : cursor + n_new] = label
+            if out_source_ids is not None:
+                out_source_ids[cursor : cursor + n_new] = int(result.get("source_id", -1))
             cursor += n_new
 
             now = _time.monotonic()
@@ -356,11 +549,13 @@ def build_features_from_wavs(
     augmentations_per_clip: int,
     out_features: np.memmap,
     out_labels: np.ndarray,
+    out_source_ids: np.ndarray | None,
     write_offset: int,
     cancel_flag=None,
     progress_label: str = "features:extract",
     progress_fraction_base: float = 0.0,
     progress_fraction_span: float = 1.0,
+    source_id_base: int = 0,
 ) -> int:
     """Read each wav, augment + extract features, write to the memmap.
 
@@ -434,6 +629,8 @@ def build_features_from_wavs(
                 windows = windows[:n_new]
             out_features[cursor : cursor + n_new] = windows
             out_labels[cursor : cursor + n_new] = label
+            if out_source_ids is not None:
+                out_source_ids[cursor : cursor + n_new] = source_id_base + clip_idx
             cursor += n_new
             if cursor >= out_features.shape[0]:
                 break
@@ -443,11 +640,14 @@ def build_features_from_wavs(
     return cursor
 
 
-def estimate_window_count(n_clips: int, augmentations_per_clip: int, avg_windows_per_clip: int = 6) -> int:
+def estimate_window_count(n_clips: int, augmentations_per_clip: int, avg_windows_per_clip: int = 16) -> int:
     """Conservative estimate of how many classifier-windows a clip set will yield.
 
-    With clips padded to MIN_CLIP_SAMPLES (3 s) and 12.5 ms mel hop:
-      ~240 mel-frames -> 21 embedding windows -> 6 classifier-windows per clip.
+    With clips padded to MIN_CLIP_SAMPLES (3 s) and openWakeWord's 80 ms
+    embedding hop, each padded clip usually yields about 13 classifier windows.
+    Positive filtering keeps fewer than this, while negative clips keep all
+    windows, so the default must be above the old 6-window estimate or feature
+    extraction truncates the negative set before all clips are processed.
     """
     return max(1, n_clips * augmentations_per_clip * avg_windows_per_clip)
 
@@ -468,6 +668,11 @@ def save_manifest(run_dir: Path, manifests: dict[str, ShardManifest]) -> None:
         split: {
             "features": str(m.features_path.relative_to(run_dir)),
             "labels": str(m.labels_path.relative_to(run_dir)),
+            "source_ids": (
+                str(m.source_ids_path.relative_to(run_dir))
+                if m.source_ids_path is not None
+                else None
+            ),
             "n_windows": m.n_windows,
             "label_counts": m.label_counts,
         }

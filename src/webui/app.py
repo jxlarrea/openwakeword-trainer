@@ -26,7 +26,16 @@ from src.config_schema import (
 )
 from src.inference.tester import ModelTester
 from src.pipeline import orchestrator
+from src.sessions import (
+    create_session,
+    delete_session,
+    get_session,
+    list_sessions,
+    save_session_config,
+    slugify,
+)
 from src.settings import get_settings
+from src.system_monitor import sample_system
 from src.train.progress import bus
 from src.tts.elevenlabs_generator import ElevenLabsGenerator
 from src.tts.piper_generator import PiperGenerator
@@ -46,6 +55,9 @@ def create_app() -> FastAPI:
         StaticFiles(directory=str(_BASE_DIR / "static")),
         name="static",
     )
+    assets_dir = _BASE_DIR.parent / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
     api = APIRouter()
     register_routes(api)
@@ -63,6 +75,13 @@ def register_routes(api: APIRouter) -> None:
     def healthz() -> dict[str, Any]:
         return {"ok": True, "status": orchestrator.state.status}
 
+    @api.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
+    def favicon() -> FileResponse:
+        path = _BASE_DIR.parent / "assets" / "favicon.ico"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="favicon not found")
+        return FileResponse(path, media_type="image/x-icon")
+
     @api.get("/", response_class=HTMLResponse)
     def index(request: Request) -> HTMLResponse:
         try:
@@ -77,12 +96,40 @@ def register_routes(api: APIRouter) -> None:
             {
                 "voices": voices,
                 "state": orchestrator.state.to_dict(),
-                "models": [{"name": m.name, "path": str(m)} for m in models],
+                "models": [{"name": m.name, "path": str(m), "size": m.stat().st_size} for m in models],
+                "sessions": list_sessions(),
                 "elevenlabs_enabled": bool(get_settings().elevenlabs_api_key),
             },
         )
 
     # ----- Train endpoints -----
+
+    @api.get("/api/sessions")
+    def sessions_list():
+        return list_sessions()
+
+    @api.post("/api/sessions")
+    async def sessions_create(request: Request):
+        payload = await request.json()
+        try:
+            return create_session((payload or {}).get("wake_word", ""))
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @api.get("/api/sessions/{session_id}")
+    def sessions_get(session_id: str):
+        try:
+            return get_session(session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
+
+    @api.delete("/api/sessions/{session_id}")
+    def sessions_delete(session_id: str):
+        sid = slugify(session_id)
+        if orchestrator.state.status == "running" and orchestrator.state.run_id == sid:
+            raise HTTPException(status_code=409, detail="Cannot delete a running session.")
+        delete_session(sid)
+        return {"deleted": True, "id": sid}
 
     @api.post("/api/train/start")
     async def train_start(request: Request):
@@ -102,10 +149,15 @@ def register_routes(api: APIRouter) -> None:
             raise HTTPException(status_code=400, detail="empty payload")
 
         try:
+            session_id = slugify(payload.get("session_id") or payload.get("run_name") or "")
             cfg = _payload_to_run_config(payload)
+            if session_id:
+                cfg = cfg.model_copy(update={"run_name": session_id})
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"Invalid config: {exc}") from exc
 
+        if cfg.run_name:
+            save_session_config(cfg.run_name, cfg)
         ok = orchestrator.start_run(cfg)
         if not ok:
             raise HTTPException(status_code=409, detail="A run is already in progress.")
@@ -118,7 +170,7 @@ def register_routes(api: APIRouter) -> None:
 
     @api.get("/api/train/status")
     def train_status():
-        return orchestrator.state.to_dict()
+        return {**orchestrator.state.to_dict(), "system": sample_system()}
 
     # ----- SSE -----
 
@@ -126,14 +178,28 @@ def register_routes(api: APIRouter) -> None:
     async def events(request: Request):
         async def event_stream():
             q = await bus.subscribe()
+            last_system_t = 0.0
             try:
                 # send a comment frame on connect to flush proxies
                 yield {"event": "ping", "data": "open"}
                 while True:
                     if await request.is_disconnected():
                         break
+                    now = asyncio.get_running_loop().time()
+                    if now - last_system_t >= 2.0:
+                        yield {
+                            "event": "system",
+                            "data": json.dumps(
+                                {
+                                    "kind": "system",
+                                    "status": orchestrator.state.status,
+                                    **sample_system(),
+                                }
+                            ),
+                        }
+                        last_system_t = now
                     try:
-                        ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                        ev = await asyncio.wait_for(q.get(), timeout=2.0)
                         yield {"event": ev.kind, "data": json.dumps(ev.to_dict())}
                     except asyncio.TimeoutError:
                         # heartbeat to keep the connection alive
@@ -298,6 +364,7 @@ def _form_to_config_payload(form) -> dict:
 
     payload = {
         "wake_word": form.get("wake_word", "").strip(),
+        "session_id": form.get("session_id", "").strip(),
         "run_name": form.get("run_name", "").strip(),
         "generation": {
             "positive_phrases": positive_phrases,
@@ -322,6 +389,8 @@ def _form_to_config_payload(form) -> dict:
             "use_musan_music": _bool("use_musan_music"),
             "use_fsd50k": _bool("use_fsd50k"),
             "use_common_voice_negatives": _bool("use_common_voice_negatives"),
+            "use_openwakeword_negative_features": _bool("use_openwakeword_negative_features"),
+            "use_openwakeword_validation_features": _bool("use_openwakeword_validation_features"),
             "common_voice_subset": _int("common_voice_subset", 10000),
         },
         "training": {

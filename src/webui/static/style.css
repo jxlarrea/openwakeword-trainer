@@ -45,6 +45,8 @@ code {
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-icon { width: 28px; height: 28px; border-radius: 6px; }
 .topbar h1 { font-size: 18px; margin: 0; }
 
 .topbar-right { display: flex; align-items: center; gap: 14px; }
@@ -88,6 +90,44 @@ main {
   margin: 0 0 14px;
   font-size: 16px;
   color: var(--accent);
+}
+.disabled-card {
+  opacity: 0.65;
+}
+.disabled-card::after {
+  content: "";
+}
+
+.session-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(440px, 1.15fr);
+  gap: 16px;
+  align-items: start;
+}
+.session-layout > label,
+.session-actions > label {
+  margin-bottom: 0;
+}
+.session-actions {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 8px;
+  align-items: end;
+}
+.session-actions button {
+  min-height: 36px;
+  white-space: nowrap;
+}
+.session-summary {
+  margin-top: 10px;
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.session-summary::before {
+  content: "Status: ";
+  color: var(--accent);
+  font-weight: 600;
 }
 
 fieldset {
@@ -225,6 +265,8 @@ textarea {
 
 @media (max-width: 800px) {
   .grid, .grid-2 { grid-template-columns: 1fr; }
+  .session-layout,
+  .session-actions { grid-template-columns: 1fr; }
   .span-2 { grid-column: span 1; }
 }
 

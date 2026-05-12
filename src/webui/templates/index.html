@@ -1,20 +1,44 @@
 {% extends "base.html" %}
 {% block content %}
 
-<section id="config" class="card">
-  <h2>1. Configure training run</h2>
+<section id="sessions" class="card">
+  <h2>1. Session</h2>
+  <div class="session-layout">
+    <label>Wake-word session
+      <select id="session-select">
+        <option value="">Create or select a session...</option>
+        {% for s in sessions %}
+          <option value="{{ s.id }}">{{ s.wake_word }}{% if s.has_model %} - model ready{% endif %}</option>
+        {% endfor %}
+      </select>
+      <small class="hint">A session owns the cached WAVs, features, checkpoints, and model for one wake word.</small>
+    </label>
+    <div class="session-actions">
+      <label>New session
+        <input type="text" id="new-session-wake-word" placeholder="new wake word, e.g. hey jarvis">
+      </label>
+      <button type="button" class="primary" id="create-session-btn">Create session</button>
+      <button type="button" class="danger" id="delete-session-btn" disabled>Delete session</button>
+    </div>
+  </div>
+  <div id="session-summary" class="session-summary">Select or create a session to configure training.</div>
+</section>
+
+<section id="config" class="card disabled-card">
+  <h2>2. Configure training run</h2>
   <form id="train-form" autocomplete="off">
+    <input type="hidden" name="session_id" id="session-id-input">
 
     <div class="grid-2">
       <label>Wake word <span class="req">*</span>
-        <input type="text" name="wake_word" required placeholder="e.g. hey jarvis"
+        <input type="text" name="wake_word" id="wake-word-input" required readonly placeholder="Select a session first"
                value="{{ state.wake_word or '' }}">
-        <small class="hint">The literal phrase users will say. Lowercase. Spaces ok.</small>
+        <small class="hint">Set when the session is created.</small>
       </label>
       <label>Run name
         <input type="text" name="run_name" id="run-name-input"
-               placeholder="auto-generated from wake word">
-        <small class="hint">Filename of the output model. Auto-fills from the wake word; you can override.</small>
+               placeholder="session id" readonly>
+        <small class="hint">Stable session/model id. Cached data is reused under this name.</small>
       </label>
     </div>
 
@@ -124,6 +148,14 @@
         <label class="inline"><input type="checkbox" name="use_common_voice_negatives" checked> Common Voice negatives</label>
         <small class="hint">Real human speech as negative samples. Reduces false-triggers on conversation.</small>
       </div>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="use_openwakeword_negative_features" checked> openWakeWord ACAV100M negatives</label>
+        <small class="hint">Large official precomputed generic-negative feature bank. Strongly recommended.</small>
+      </div>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="use_openwakeword_validation_features" checked> openWakeWord validation negatives</label>
+        <small class="hint">Official negative validation feature bank for FP/hr calibration.</small>
+      </div>
       <label>Common Voice subset size
         <input type="number" name="common_voice_subset" value="15000" min="500" max="200000" required>
         <small class="hint">How many Common Voice clips to fetch. 10-20k is plenty.</small>
@@ -204,7 +236,7 @@
 </section>
 
 <section id="progress" class="card">
-  <h2>2. Progress</h2>
+  <h2>3. Progress</h2>
   <div id="phase-banner" class="phase">Idle</div>
   <div class="progress-bars" id="progress-bars"></div>
   <div class="metrics" id="metrics"></div>
@@ -215,7 +247,7 @@
 </section>
 
 <section id="test" class="card">
-  <h2>3. Test a trained model</h2>
+  <h2>4. Test a trained model</h2>
   <form id="test-form">
     <div class="grid">
       <label class="span-2">Model

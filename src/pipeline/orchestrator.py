@@ -30,9 +30,12 @@ from src.augment.augmenter import (
     collect_rir_dirs,
 )
 from src.augment.downloader import ensure_corpora
+from src.augment.downloader import ensure_openwakeword_feature_files
 from src.config_schema import TrainRunConfig
 from src.data.adversarial import build_adversarial_phrases
 from src.data.dataset import (
+    CombinedFeatureDataset,
+    ExternalNegativeFeatureDataset,
     FeatureMemmapDataset,
     ShardManifest,
     allocate_memmap,
@@ -332,11 +335,15 @@ def _build_features(
     val_features_path = run_dir / "val_features.bin"
     train_labels_path = run_dir / "train_labels.npy"
     val_labels_path = run_dir / "val_labels.npy"
+    train_source_ids_path = run_dir / "train_source_ids.npy"
+    val_source_ids_path = run_dir / "val_source_ids.npy"
 
     train_arr, _ = allocate_memmap(train_features_path, train_capacity)
     val_arr, _ = allocate_memmap(val_features_path, val_capacity)
     train_labels = np.zeros(train_capacity, dtype=np.uint8)
     val_labels = np.zeros(val_capacity, dtype=np.uint8)
+    train_source_ids = np.full(train_capacity, -1, dtype=np.int32)
+    val_source_ids = np.full(val_capacity, -1, dtype=np.int32)
 
     # Split the global progress bar across 4 sub-passes weighted by clip count.
     total_clips = max(1, len(train_pos) + len(train_neg) + len(val_pos) + len(val_neg))
@@ -358,11 +365,12 @@ def _build_features(
     bus.phase("features:extract", detail=f"train positives ({len(train_pos)} clips)")
     train_cursor = build_features_from_wavs_parallel(
         train_pos, 1, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
-        train_arr, train_labels, 0,
+        train_arr, train_labels, train_source_ids, 0,
         workers=workers,
         cancel_flag=state.cancel_flag,
         progress_label="features:extract",
         progress_fraction_base=base, progress_fraction_span=span,
+        source_id_base=0,
     )
 
     base += span
@@ -370,11 +378,12 @@ def _build_features(
     bus.phase("features:extract", detail=f"train negatives ({len(train_neg)} clips)")
     train_cursor = build_features_from_wavs_parallel(
         train_neg, 0, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
-        train_arr, train_labels, train_cursor,
+        train_arr, train_labels, train_source_ids, train_cursor,
         workers=workers,
         cancel_flag=state.cancel_flag,
         progress_label="features:extract",
         progress_fraction_base=base, progress_fraction_span=span,
+        source_id_base=len(train_pos),
     )
 
     base += span
@@ -382,11 +391,12 @@ def _build_features(
     bus.phase("features:extract", detail=f"val positives ({len(val_pos)} clips)")
     val_cursor = build_features_from_wavs_parallel(
         val_pos, 1, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
-        val_arr, val_labels, 0,
+        val_arr, val_labels, val_source_ids, 0,
         workers=workers,
         cancel_flag=state.cancel_flag,
         progress_label="features:extract",
         progress_fraction_base=base, progress_fraction_span=span,
+        source_id_base=0,
     )
 
     base += span
@@ -394,11 +404,12 @@ def _build_features(
     bus.phase("features:extract", detail=f"val negatives ({len(val_neg)} clips)")
     val_cursor = build_features_from_wavs_parallel(
         val_neg, 0, extractor, cfg.augmentation, rir_dirs, bg_dirs, aug_per,
-        val_arr, val_labels, val_cursor,
+        val_arr, val_labels, val_source_ids, val_cursor,
         workers=workers,
         cancel_flag=state.cancel_flag,
         progress_label="features:extract",
         progress_fraction_base=base, progress_fraction_span=span,
+        source_id_base=len(val_pos),
     )
     bus.progress("features:extract", 1.0,
                  detail=f"done - train {train_cursor:,} windows, val {val_cursor:,} windows")
@@ -411,6 +422,8 @@ def _build_features(
     # Resize via memmap "view" + label array
     np.save(train_labels_path, train_labels[:train_cursor])
     np.save(val_labels_path, val_labels[:val_cursor])
+    np.save(train_source_ids_path, train_source_ids[:train_cursor])
+    np.save(val_source_ids_path, val_source_ids[:val_cursor])
     # Truncate the binary files so the dataset memmap reads the right shape.
     bytes_per_window = CLASSIFIER_WINDOW_EMBEDDINGS * EMBEDDING_DIM * 4
     with open(train_features_path, "r+b") as f:
@@ -418,8 +431,8 @@ def _build_features(
     with open(val_features_path, "r+b") as f:
         f.truncate(val_cursor * bytes_per_window)
 
-    train_ds = FeatureMemmapDataset(train_features_path, train_labels_path)
-    val_ds = FeatureMemmapDataset(val_features_path, val_labels_path)
+    train_ds = FeatureMemmapDataset(train_features_path, train_labels_path, train_source_ids_path)
+    val_ds = FeatureMemmapDataset(val_features_path, val_labels_path, val_source_ids_path)
 
     label_counts_train = {
         int(k): int(v)
@@ -434,12 +447,14 @@ def _build_features(
         "train": ShardManifest(
             features_path=train_features_path,
             labels_path=train_labels_path,
+            source_ids_path=train_source_ids_path,
             n_windows=train_cursor,
             label_counts=label_counts_train,
         ),
         "val": ShardManifest(
             features_path=val_features_path,
             labels_path=val_labels_path,
+            source_ids_path=val_source_ids_path,
             n_windows=val_cursor,
             label_counts=label_counts_val,
         ),
@@ -462,6 +477,10 @@ def _run(cfg: TrainRunConfig) -> None:
         state.run_dir = run_dir
         bus.publish("run_started", run_id=run_id, run_dir=str(run_dir), wake_word=cfg.wake_word)
         _save_config(run_dir, cfg)
+        for stale_name in ("wakeword.onnx", "best.pt", "best_candidate.pt", "result.json"):
+            stale_path = run_dir / stale_name
+            if stale_path.exists():
+                stale_path.unlink()
 
         # 1. Positive phrases
         positive_phrases = cfg.generation.positive_phrases or [cfg.wake_word]
@@ -482,7 +501,19 @@ def _run(cfg: TrainRunConfig) -> None:
         # Synthesized with the same emphasis as positives so the model strongly
         # learns to reject them.
         negative_wavs: list[Path] = []
-        hard_negative_phrases = cfg.generation.negative_phrases or []
+        positive_phrase_lowers = {p.lower().strip() for p in positive_phrases}
+        hard_negative_phrases = [
+            p
+            for p in (cfg.generation.negative_phrases or [])
+            if p.lower().strip() not in positive_phrase_lowers
+        ]
+        skipped_hard_negatives = len(cfg.generation.negative_phrases or []) - len(hard_negative_phrases)
+        if skipped_hard_negatives:
+            bus.log(
+                f"Skipped {skipped_hard_negatives} hard negative phrase(s) "
+                "because they exactly match configured positive phrases.",
+                level="warning",
+            )
         if hard_negative_phrases:
             bus.phase(
                 "generate:hard_negatives",
@@ -508,6 +539,7 @@ def _run(cfg: TrainRunConfig) -> None:
             cfg.wake_word,
             cfg.generation.n_adversarial_phrases,
             seed=cfg.training.seed,
+            forbidden_phrases=positive_phrases,
         )
         bus.phase("generate:adversarial", detail=f"{len(adv_phrases)} phrases")
         negative_wavs.extend(
@@ -537,6 +569,22 @@ def _run(cfg: TrainRunConfig) -> None:
         )
         bus.log(f"Corpora ready: {list(corpora.keys())}")
 
+        oww_feature_paths: dict[str, Path] = {}
+        if (
+            cfg.datasets.use_openwakeword_negative_features
+            or cfg.datasets.use_openwakeword_validation_features
+        ):
+            bus.phase("download:openwakeword_features")
+            oww_feature_paths = ensure_openwakeword_feature_files(
+                use_training=cfg.datasets.use_openwakeword_negative_features,
+                use_validation=cfg.datasets.use_openwakeword_validation_features,
+                progress=lambda name, frac: bus.progress(f"download:{name}", frac),
+            )
+            bus.log(
+                "openWakeWord feature banks ready: "
+                + ", ".join(f"{k}={v.name}" for k, v in oww_feature_paths.items())
+            )
+
         if state.cancel_flag.is_set():
             raise RuntimeError("cancelled")
 
@@ -549,6 +597,20 @@ def _run(cfg: TrainRunConfig) -> None:
             cfg=cfg,
             run_dir=run_dir,
         )
+        if "acav100m" in oww_feature_paths:
+            external_train = ExternalNegativeFeatureDataset(oww_feature_paths["acav100m"])
+            train_ds = CombinedFeatureDataset([train_ds, external_train])
+            bus.log(
+                f"Added ACAV100M generic negatives to training: "
+                f"{len(external_train):,} windows"
+            )
+        if "validation" in oww_feature_paths:
+            external_val = ExternalNegativeFeatureDataset(oww_feature_paths["validation"])
+            val_ds = CombinedFeatureDataset([val_ds, external_val])
+            bus.log(
+                f"Added official openWakeWord validation negatives: "
+                f"{len(external_val):,} windows"
+            )
 
         if state.cancel_flag.is_set():
             raise RuntimeError("cancelled")
@@ -579,6 +641,11 @@ def _run(cfg: TrainRunConfig) -> None:
                     "wake_word": cfg.wake_word,
                     "best_val_loss": result.best_val_loss,
                     "best_val_recall_at_p95": result.best_val_recall,
+                    "best_val_recall_at_target_fp": result.best_val_recall_at_target_fp,
+                    "best_val_fp_per_hour": result.best_val_fp_per_hour,
+                    "calibration_threshold_raw": result.best_threshold,
+                    "recommended_runtime_threshold": 0.5,
+                    "recommended_threshold": 0.5,
                     "best_step": result.best_step,
                     "onnx_path": str(final_path),
                     "history": result.history,

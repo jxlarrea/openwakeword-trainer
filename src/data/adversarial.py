@@ -207,7 +207,7 @@ def _generate_prefix_negatives(wake_word: str) -> list[str]:
     # Strip the actual wake word (and any concatenation containing it) so we
     # never accidentally label a positive sample as negative.
     wake_lower = wake_word.lower().strip()
-    return [p for p in out if p != wake_lower and wake_lower not in p]
+    return sorted(p for p in out if p != wake_lower and wake_lower not in p)
 
 
 def _phonetic_neighbors(phrase: str) -> list[str]:
@@ -229,7 +229,7 @@ def _phonetic_neighbors(phrase: str) -> list[str]:
     for a, b in swaps:
         if a in p:
             candidates.add(p.replace(a, b))
-    return [c for c in candidates if c != p]
+    return sorted(c for c in candidates if c != p)
 
 
 def build_adversarial_phrases(
@@ -237,6 +237,7 @@ def build_adversarial_phrases(
     n: int,
     seed: int = 0,
     extra_phrases: list[str] | None = None,
+    forbidden_phrases: list[str] | None = None,
 ) -> list[str]:
     """Return up to ``n`` adversarial phrases.
 
@@ -248,6 +249,26 @@ def build_adversarial_phrases(
       5. Random pair combinations to bulk up to ``n``.
     """
     rng = random.Random(seed)
+    forbidden = {
+        p.lower().strip()
+        for p in ([wake_word] + (forbidden_phrases or []))
+        if p and p.strip()
+    }
+
+    def is_forbidden(phrase: str) -> bool:
+        p = phrase.lower().strip()
+        for f in forbidden:
+            if f == p:
+                return True
+            # Multi-word positives must never appear inside a negative phrase
+            # ("ok nabu, please" should not be a negative). For single-word
+            # wake words, substring filtering is too aggressive: "stopwatch",
+            # "stopping", and "stop sign" are useful hard negatives for
+            # "stop", not mislabeled positives.
+            if " " in f and f in p:
+                return True
+        return False
+
     pool: list[str] = []
     pool.extend(_generate_prefix_negatives(wake_word))
     pool.extend(GENERIC_NEGATIVE_PHRASES)
@@ -261,17 +282,30 @@ def build_adversarial_phrases(
     unique: list[str] = []
     for p in pool:
         p = p.strip()
-        if p and p not in seen:
+        if p and p not in seen and not is_forbidden(p):
             seen.add(p)
             unique.append(p)
 
-    # Bulk up to n via random pair combinations.
+    # Bulk up to n via bounded random pair combinations. This used to sample
+    # pairs in a while-loop until it reached n, which can run forever when the
+    # valid combination space is smaller than n (common for short words such as
+    # "stop"). Shuffle the finite pair space instead.
     extra: list[str] = []
     base_for_combine = unique[:]
-    while len(unique) + len(extra) < n and len(base_for_combine) >= 2:
-        a, b = rng.sample(base_for_combine, 2)
+    pair_indices = [
+        (i, j)
+        for i in range(len(base_for_combine))
+        for j in range(len(base_for_combine))
+        if i != j
+    ]
+    rng.shuffle(pair_indices)
+    for i, j in pair_indices:
+        if len(unique) + len(extra) >= n:
+            break
+        a = base_for_combine[i]
+        b = base_for_combine[j]
         combined = f"{a}, {b}"
-        if combined not in seen:
+        if combined not in seen and not is_forbidden(combined):
             seen.add(combined)
             extra.append(combined)
     unique.extend(extra)

@@ -6,11 +6,18 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-  // ---------- Auto run-name from wake word ----------
+  // ---------- Sessions ----------
 
   const wakeInput = $("input[name='wake_word']");
   const runNameInput = $("#run-name-input");
-  let lastAutoRunName = "";
+  const sessionIdInput = $("#session-id-input");
+  const sessionSelect = $("#session-select");
+  const createSessionBtn = $("#create-session-btn");
+  const deleteSessionBtn = $("#delete-session-btn");
+  const newSessionWakeWord = $("#new-session-wake-word");
+  const sessionSummary = $("#session-summary");
+  const configCard = $("#config");
+  let currentSession = null;
 
   function slugify(s) {
     return String(s || "")
@@ -20,18 +27,169 @@
       .replace(/^_+|_+$/g, "");
   }
 
-  function applyAutoRunName() {
-    if (!wakeInput || !runNameInput) return;
-    const slug = slugify(wakeInput.value);
-    // Only overwrite if the user hasn't typed their own value.
-    if (!runNameInput.value || runNameInput.value === lastAutoRunName) {
-      runNameInput.value = slug;
+  function fmtBytes(n) {
+    if (!Number.isFinite(n) || n <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) {
+      n /= 1024;
+      i += 1;
     }
-    lastAutoRunName = slug;
+    return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
   }
-  wakeInput?.addEventListener("input", applyAutoRunName);
-  // Init from server-rendered value
-  applyAutoRunName();
+
+  function setFormEnabled(enabled) {
+    configCard?.classList.toggle("disabled-card", !enabled);
+    $$("#train-form input, #train-form select, #train-form textarea, #train-form button").forEach((el) => {
+      if (el.id === "cancel-btn") return;
+      el.disabled = !enabled;
+    });
+    if (wakeInput) wakeInput.readOnly = true;
+    if (runNameInput) runNameInput.readOnly = true;
+  }
+
+  function setChecked(form, name, value) {
+    const el = form.querySelector(`input[name="${name}"]`);
+    if (el) el.checked = Boolean(value);
+  }
+
+  function setValue(form, name, value) {
+    const el = form.querySelector(`[name="${name}"]`);
+    if (el && value !== undefined && value !== null) el.value = value;
+  }
+
+  function fillSessionForm(session) {
+    const form = $("#train-form");
+    if (!form || !session?.config) return;
+    const cfg = session.config;
+    currentSession = session;
+    setFormEnabled(true);
+    if (sessionIdInput) sessionIdInput.value = session.id;
+    if (wakeInput) wakeInput.value = cfg.wake_word || session.wake_word || "";
+    if (runNameInput) runNameInput.value = session.id;
+
+    const gen = cfg.generation || {};
+    const aug = cfg.augmentation || {};
+    const ds = cfg.datasets || {};
+    const tr = cfg.training || {};
+    setValue(form, "positive_phrases", (gen.positive_phrases || []).join("\n"));
+    setValue(form, "negative_phrases", (gen.negative_phrases || []).join("\n"));
+    setValue(form, "n_positive_per_phrase_per_voice", gen.n_positive_per_phrase_per_voice);
+    setValue(form, "n_negative_per_phrase_per_voice", gen.n_negative_per_phrase_per_voice);
+    setValue(form, "n_adversarial_phrases", gen.n_adversarial_phrases);
+    setValue(form, "n_adversarial_per_phrase_per_voice", gen.n_adversarial_per_phrase_per_voice);
+    setValue(form, "elevenlabs_model", gen.elevenlabs_model);
+    setChecked(form, "use_elevenlabs", gen.use_elevenlabs);
+
+    $$("#config input[name='piper_voice']").forEach((cb) => {
+      cb.checked = (gen.piper_voices || []).some((v) => (v.voice_key || v) === cb.value);
+    });
+    $$("#config input[name='elevenlabs_voice_id']").forEach((cb) => {
+      cb.checked = (gen.elevenlabs_voice_ids || []).includes(cb.value);
+    });
+
+    setValue(form, "augmentations_per_clip", aug.augmentations_per_clip);
+    setValue(form, "rir_probability", aug.rir_probability);
+    setValue(form, "background_noise_probability", aug.background_noise_probability);
+
+    setChecked(form, "use_mit_rirs", ds.use_mit_rirs !== false);
+    setChecked(form, "use_musan_noise", ds.use_musan_noise !== false);
+    setChecked(form, "use_musan_music", ds.use_musan_music !== false);
+    setChecked(form, "use_fsd50k", ds.use_fsd50k !== false);
+    setChecked(form, "use_common_voice_negatives", ds.use_common_voice_negatives !== false);
+    setChecked(form, "use_openwakeword_negative_features", ds.use_openwakeword_negative_features !== false);
+    setChecked(form, "use_openwakeword_validation_features", ds.use_openwakeword_validation_features !== false);
+    setValue(form, "common_voice_subset", ds.common_voice_subset);
+
+    setValue(form, "model_type", tr.model_type);
+    setValue(form, "layer_dim", tr.layer_dim);
+    setValue(form, "n_blocks", tr.n_blocks);
+    setValue(form, "learning_rate", tr.learning_rate);
+    setValue(form, "batch_size", tr.batch_size);
+    setValue(form, "max_steps", tr.max_steps);
+    setValue(form, "val_every_n_steps", tr.val_every_n_steps);
+    setValue(form, "early_stop_patience", tr.early_stop_patience);
+    setValue(form, "target_false_positives_per_hour", tr.target_false_positives_per_hour);
+    setValue(form, "seed", tr.seed);
+
+    if (deleteSessionBtn) deleteSessionBtn.disabled = false;
+    if (sessionSummary) {
+      sessionSummary.textContent =
+        `${session.wake_word} (${session.id}) - cache ${fmtBytes(session.size_bytes || 0)}` +
+        (session.has_model ? " - model ready" : "");
+    }
+  }
+
+  async function refreshSessions(selectId) {
+    const res = await fetch("/api/sessions");
+    const sessions = await res.json();
+    if (!sessionSelect) return sessions;
+    sessionSelect.innerHTML = `<option value="">Create or select a session...</option>`;
+    sessions.forEach((s) => {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = `${s.wake_word}${s.has_model ? " - model ready" : ""}`;
+      sessionSelect.appendChild(opt);
+    });
+    if (selectId) {
+      sessionSelect.value = selectId;
+      await loadSession(selectId);
+    }
+    return sessions;
+  }
+
+  async function loadSession(id) {
+    if (!id) {
+      currentSession = null;
+      setFormEnabled(false);
+      if (deleteSessionBtn) deleteSessionBtn.disabled = true;
+      if (sessionSummary) sessionSummary.textContent = "Select or create a session to configure training.";
+      return;
+    }
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
+    if (!res.ok) return;
+    fillSessionForm(await res.json());
+  }
+
+  sessionSelect?.addEventListener("change", (e) => loadSession(e.target.value));
+  createSessionBtn?.addEventListener("click", async () => {
+    const wake = newSessionWakeWord?.value?.trim();
+    if (!wake) {
+      newSessionWakeWord?.focus();
+      return;
+    }
+    const res = await fetch("/api/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ wake_word: wake }),
+    });
+    if (!res.ok) {
+      alert(await res.text());
+      return;
+    }
+    const session = await res.json();
+    if (newSessionWakeWord) newSessionWakeWord.value = "";
+    await refreshSessions(session.id);
+  });
+  deleteSessionBtn?.addEventListener("click", async () => {
+    if (!currentSession) return;
+    const ok = confirm(
+      `Delete session "${currentSession.wake_word}" and all cached WAVs/features/checkpoints?`
+    );
+    if (!ok) return;
+    const res = await fetch(`/api/sessions/${encodeURIComponent(currentSession.id)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      alert(await res.text());
+      return;
+    }
+    currentSession = null;
+    await refreshSessions();
+    await loadSession("");
+    refreshModels();
+  });
+  setFormEnabled(false);
 
   // ---------- Voice list filtering / select-all ----------
 
@@ -135,13 +293,15 @@
       "use_musan_music",
       "use_fsd50k",
       "use_common_voice_negatives",
+      "use_openwakeword_negative_features",
+      "use_openwakeword_validation_features",
     ];
     const anyCorpus = corpusBoxes.some(
       (name) => form.querySelector(`input[name="${name}"]`)?.checked
     );
     if (!anyCorpus) {
       errors.push(
-        "Enable at least one augmentation corpus (MIT IR, MUSAN, FSD50K, or Common Voice)."
+        "Enable at least one augmentation/negative dataset."
       );
       const corpusFieldset = form.querySelector(
         'input[name="use_mit_rirs"]'
@@ -173,6 +333,10 @@
 
     const fd = new FormData(form);
     const payload = formToPayload(fd);
+    if (!payload.session_id) {
+      showValidationErrors(form, ["Select or create a session first."], sessionSelect);
+      return;
+    }
     const res = await fetch("/api/train/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -218,6 +382,7 @@
     const elVoices = fd.getAll("elevenlabs_voice_id");
     return {
       wake_word: String(v("wake_word")).trim(),
+      session_id: String(v("session_id")).trim(),
       run_name: String(v("run_name")).trim(),
       generation: {
         positive_phrases: String(v("positive_phrases"))
@@ -248,6 +413,8 @@
         use_musan_music: vBool("use_musan_music"),
         use_fsd50k: vBool("use_fsd50k"),
         use_common_voice_negatives: vBool("use_common_voice_negatives"),
+        use_openwakeword_negative_features: vBool("use_openwakeword_negative_features"),
+        use_openwakeword_validation_features: vBool("use_openwakeword_validation_features"),
         common_voice_subset: vNum("common_voice_subset", 15000),
       },
       training: {
@@ -341,6 +508,32 @@
     return String(v);
   }
 
+  function fmtPct(v) {
+    return typeof v === "number" ? v.toFixed(0) + "%" : "n/a";
+  }
+
+  function fmtGb(v) {
+    return typeof v === "number" ? v.toFixed(1) + " GB" : "n/a";
+  }
+
+  function updateSystemMetrics(d) {
+    if ("cpu_percent" in d) setMetric("CPU", fmtPct(d.cpu_percent));
+    if ("ram_percent" in d) {
+      setMetric(
+        "RAM",
+        `${fmtPct(d.ram_percent)} (${fmtGb(d.ram_used_gb)} / ${fmtGb(d.ram_total_gb)})`
+      );
+    }
+    if ("gpu_percent" in d) setMetric("GPU", fmtPct(d.gpu_percent));
+    if ("gpu_mem_percent" in d) {
+      setMetric(
+        "GPU VRAM",
+        `${fmtPct(d.gpu_mem_percent)} (${fmtGb(d.gpu_mem_used_gb)} / ${fmtGb(d.gpu_mem_total_gb)})`
+      );
+    }
+    if ("gpu_temp_c" in d) setMetric("GPU Temp", Math.round(d.gpu_temp_c) + " C");
+  }
+
   const es = new EventSource("/api/events");
   es.addEventListener("phase", (e) => {
     const d = JSON.parse(e.data);
@@ -356,6 +549,10 @@
       if (k === "kind" || k === "ts") return;
       setMetric(k, fmt(d[k]));
     });
+  });
+  es.addEventListener("system", (e) => {
+    const d = JSON.parse(e.data);
+    updateSystemMetrics(d);
   });
   es.addEventListener("log", (e) => {
     const d = JSON.parse(e.data);
@@ -557,5 +754,8 @@
 
   fetch("/api/train/status")
     .then((r) => r.json())
-    .then((s) => setRunState(s.status));
+    .then((s) => {
+      setRunState(s.status);
+      if (s.system) updateSystemMetrics(s.system);
+    });
 })();
