@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.config_schema import TrainingConfig
@@ -43,6 +44,10 @@ class TrainResult:
     best_val_recall: float
     best_val_recall_at_target_fp: float
     best_val_fp_per_hour: float
+    best_val_recall_at_0_5: float
+    best_val_fp_per_hour_at_0_5: float
+    best_positive_median_score: float
+    best_positive_p10_score: float
     best_threshold: float
     best_step: int
     history: list[dict]
@@ -90,29 +95,59 @@ def _make_loader(
     )
 
 
-def _weighted_bce(
+def _cosine_warmup_lr(
+    step: int,
+    total_steps: int,
+    base_lr: float,
+    warmup_fraction: float,
+    hold_fraction: float,
+) -> float:
+    warmup_steps = int(total_steps * max(0.0, warmup_fraction))
+    hold_steps = int(total_steps * max(0.0, hold_fraction))
+    if warmup_steps > 0 and step < warmup_steps:
+        return base_lr * step / max(1, warmup_steps)
+    if step < warmup_steps + hold_steps:
+        return base_lr
+    decay_steps = max(1, total_steps - warmup_steps - hold_steps)
+    progress = min(1.0, max(0.0, (step - warmup_steps - hold_steps) / decay_steps))
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _scheduled_negative_weight(cfg: TrainingConfig, step: int) -> float:
+    progress = min(1.0, max(0.0, step / max(1, int(cfg.max_steps))))
+    return 1.0 + (float(cfg.max_negative_loss_weight) - 1.0) * progress
+
+
+def _weighted_loss(
     probs: torch.Tensor,
     labels: torch.Tensor,
     cfg: TrainingConfig,
+    negative_weight: float | None = None,
 ) -> torch.Tensor:
-    """BCE with extra pressure on false positives.
+    """Reference-style focal/BCE loss with scheduled negative pressure.
 
     Wake-word models are deployed into hours of non-wake-word audio, so a
-    symmetric BCE objective is too forgiving. Keep positives at weight 1 and
-    make negatives more expensive, with an extra bump only for negatives that
-    are actually scoring as likely wake-word windows.
-
-    Normalize by the sum of weights instead of averaging raw weighted losses.
-    Otherwise changing the negative weights also changes the optimizer's
-    effective learning rate and can make later training collapse toward
-    "predict negative for everything".
+    symmetric BCE objective is too forgiving. Focal loss keeps attention on
+    decision-boundary examples, label smoothing prevents extreme calibration,
+    and the negative weight ramps up over training instead of slamming the
+    model into "everything is negative" from step 1.
     """
-    per_item = nn.functional.binary_cross_entropy(probs, labels, reduction="none")
+    raw_labels = labels
+    if cfg.label_smoothing > 0:
+        labels = labels * (1.0 - float(cfg.label_smoothing)) + 0.5 * float(cfg.label_smoothing)
+
+    per_item = F.binary_cross_entropy(probs, labels, reduction="none")
+    if cfg.use_focal_loss:
+        p_t = probs * labels + (1.0 - probs) * (1.0 - labels)
+        per_item = ((1.0 - p_t) ** float(cfg.focal_gamma)) * per_item
+
+    if negative_weight is None:
+        negative_weight = float(cfg.negative_loss_weight)
     weights = torch.ones_like(labels)
     neg_mask = labels < 0.5
     weights = torch.where(
         neg_mask,
-        torch.full_like(weights, float(cfg.negative_loss_weight)),
+        torch.full_like(weights, float(negative_weight)),
         weights,
     )
     hard_neg_mask = neg_mask & (probs.detach() >= float(cfg.hard_negative_threshold))
@@ -121,7 +156,37 @@ def _weighted_bce(
         weights * float(cfg.hard_negative_loss_weight),
         weights,
     )
-    return (per_item * weights).sum() / torch.clamp(weights.sum(), min=1.0)
+    loss = (per_item * weights).sum() / torch.clamp(weights.sum(), min=1.0)
+
+    # Confidence/separation terms are deliberately separate from BCE. They let
+    # a run ask for "true wake words should peak high" without solving that by
+    # globally weakening negative pressure and reintroducing false positives.
+    pos_weight = torch.clamp(raw_labels, min=0.0, max=1.0)
+    neg_weight_soft = torch.clamp(1.0 - raw_labels, min=0.0, max=1.0)
+
+    if cfg.positive_confidence_weight > 0 and pos_weight.sum() > 0:
+        pos_gap = F.relu(float(cfg.positive_confidence_target) - probs)
+        pos_loss = (pos_gap.square() * pos_weight).sum() / torch.clamp(pos_weight.sum(), min=1.0)
+        loss = loss + float(cfg.positive_confidence_weight) * pos_loss
+
+    if cfg.negative_confidence_weight > 0 and neg_weight_soft.sum() > 0:
+        neg_gap = F.relu(probs - float(cfg.negative_confidence_target))
+        neg_loss = (neg_gap.square() * neg_weight_soft).sum() / torch.clamp(neg_weight_soft.sum(), min=1.0)
+        loss = loss + float(cfg.negative_confidence_weight) * neg_loss
+
+    if cfg.separation_loss_weight > 0:
+        pos_probs = probs[raw_labels >= 0.75]
+        neg_probs = probs[raw_labels <= 0.25]
+        if pos_probs.numel() > 0 and neg_probs.numel() > 0:
+            k_pos = min(int(cfg.separation_top_k), pos_probs.numel())
+            k_neg = min(int(cfg.separation_top_k), neg_probs.numel())
+            weakest_pos = torch.topk(pos_probs, k=k_pos, largest=False).values
+            hardest_neg = torch.topk(neg_probs, k=k_neg, largest=True).values
+            pairwise_gap = weakest_pos[:, None] - hardest_neg[None, :]
+            sep_loss = F.relu(float(cfg.separation_margin) - pairwise_gap).mean()
+            loss = loss + float(cfg.separation_loss_weight) * sep_loss
+
+    return loss
 
 
 def _evaluate(
@@ -159,6 +224,9 @@ def _evaluate(
             "threshold": 0.5,
             "threshold_p95": 0.5,
             "fp_per_hour_p95": 0.0,
+            "positive_median_score": 0.0,
+            "positive_p10_score": 0.0,
+            "positive_p90_score": 0.0,
         }
     probs = np.concatenate(all_probs)
     labels = np.concatenate(all_labels)
@@ -249,6 +317,15 @@ def _evaluate(
     fp_count_at_0_5 = false_positive_events(fixed_threshold)
     fp_per_hour_at_0_5 = fp_count_at_0_5 / neg_hours if neg_hours > 0 else 0.0
     recall_at_0_5 = positive_recall(fixed_threshold)
+    if pos_clip_scores is not None and pos_clip_scores.size > 0:
+        positive_median_score = float(np.median(pos_clip_scores))
+        positive_p10_score = float(np.quantile(pos_clip_scores, 0.10))
+        positive_p90_score = float(np.quantile(pos_clip_scores, 0.90))
+    else:
+        pos_scores = probs[pos_mask]
+        positive_median_score = float(np.median(pos_scores)) if pos_scores.size else 0.0
+        positive_p10_score = float(np.quantile(pos_scores, 0.10)) if pos_scores.size else 0.0
+        positive_p90_score = float(np.quantile(pos_scores, 0.90)) if pos_scores.size else 0.0
 
     # Select the operating threshold by the configured false-positive target.
     # This is the threshold that will be baked into the exported ONNX so a
@@ -278,6 +355,9 @@ def _evaluate(
         "threshold": chosen_threshold,
         "threshold_p95": p95_threshold,
         "fp_per_hour_p95": fp_per_hour_p95,
+        "positive_median_score": positive_median_score,
+        "positive_p10_score": positive_p10_score,
+        "positive_p90_score": positive_p90_score,
     }
 
 
@@ -285,8 +365,56 @@ def _is_exportable(metrics: dict[str, float], cfg: TrainingConfig) -> bool:
     return (
         metrics.get("recall_at_target_fp", 0.0) >= cfg.min_recall_at_target_fp_for_export
         and metrics["fp_per_hour"] <= cfg.target_false_positives_per_hour
+        and metrics.get("threshold", 1.0) <= cfg.max_calibration_threshold_for_export
+        and metrics.get("recall_at_0_5", 0.0) >= cfg.min_recall_at_0_5_for_export
+        and metrics.get("fp_per_hour_at_0_5", math.inf) <= cfg.max_fp_per_hour_at_0_5_for_export
+        and metrics.get("positive_median_score", 0.0) >= cfg.min_positive_median_score_for_export
+        and metrics.get("positive_p10_score", 0.0) >= cfg.min_positive_p10_score_for_export
         and not math.isnan(metrics["loss"])
     )
+
+
+def _export_gate_failures(metrics: dict[str, float], cfg: TrainingConfig) -> list[str]:
+    failures: list[str] = []
+    if metrics.get("recall_at_target_fp", 0.0) < cfg.min_recall_at_target_fp_for_export:
+        failures.append(
+            "recall@targetFP="
+            f"{metrics.get('recall_at_target_fp', 0.0):.3f} "
+            f"< {cfg.min_recall_at_target_fp_for_export:.3f}"
+        )
+    if metrics.get("fp_per_hour", math.inf) > cfg.target_false_positives_per_hour:
+        failures.append(
+            f"FP/hr={metrics.get('fp_per_hour', math.inf):.2f} "
+            f"> {cfg.target_false_positives_per_hour:.2f}"
+        )
+    if metrics.get("threshold", 1.0) > cfg.max_calibration_threshold_for_export:
+        failures.append(
+            f"calibration_threshold={metrics.get('threshold', 1.0):.3f} "
+            f"> {cfg.max_calibration_threshold_for_export:.3f}"
+        )
+    if metrics.get("recall_at_0_5", 0.0) < cfg.min_recall_at_0_5_for_export:
+        failures.append(
+            f"raw_recall@0.5={metrics.get('recall_at_0_5', 0.0):.3f} "
+            f"< {cfg.min_recall_at_0_5_for_export:.3f}"
+        )
+    if metrics.get("fp_per_hour_at_0_5", math.inf) > cfg.max_fp_per_hour_at_0_5_for_export:
+        failures.append(
+            f"rawFP/hr@0.5={metrics.get('fp_per_hour_at_0_5', math.inf):.2f} "
+            f"> {cfg.max_fp_per_hour_at_0_5_for_export:.2f}"
+        )
+    if metrics.get("positive_median_score", 0.0) < cfg.min_positive_median_score_for_export:
+        failures.append(
+            f"pos_median={metrics.get('positive_median_score', 0.0):.3f} "
+            f"< {cfg.min_positive_median_score_for_export:.3f}"
+        )
+    if metrics.get("positive_p10_score", 0.0) < cfg.min_positive_p10_score_for_export:
+        failures.append(
+            f"pos_p10={metrics.get('positive_p10_score', 0.0):.3f} "
+            f"< {cfg.min_positive_p10_score_for_export:.3f}"
+        )
+    if math.isnan(metrics.get("loss", math.nan)):
+        failures.append("val_loss is NaN")
+    return failures
 
 
 def _checkpoint_score(metrics: dict[str, float], cfg: TrainingConfig) -> tuple:
@@ -302,13 +430,22 @@ def _checkpoint_score(metrics: dict[str, float], cfg: TrainingConfig) -> tuple:
         return (
             1,
             float(metrics.get("recall_at_target_fp", 0.0)),
+            float(metrics.get("recall_at_0_5", 0.0)),
+            -float(metrics.get("threshold", 1.0)),
             -float(metrics["fp_per_hour"]),
+            -float(metrics.get("fp_per_hour_at_0_5", math.inf)),
+            float(metrics.get("positive_median_score", 0.0)),
             float(metrics.get("recall_at_p95", 0.0)),
             loss_score,
         )
     return (
         0,
+        -float(len(_export_gate_failures(metrics, cfg))),
         float(metrics.get("recall_at_target_fp", 0.0)),
+        float(metrics.get("recall_at_0_5", 0.0)),
+        -float(metrics.get("threshold", 1.0)),
+        -float(metrics.get("fp_per_hour_at_0_5", math.inf)),
+        float(metrics.get("positive_median_score", 0.0)),
         float(metrics.get("recall_at_p95", 0.0)),
         -float(metrics["fp_per_hour"]),
         loss_score,
@@ -460,7 +597,12 @@ def _fine_tune_hard_negatives(
         model.train()
         optimizer.zero_grad()
         probs = model(x).squeeze(-1)
-        loss = _weighted_bce(probs, y, cfg)
+        loss = _weighted_loss(
+            probs,
+            y,
+            cfg,
+            negative_weight=float(cfg.max_negative_loss_weight),
+        )
         loss.backward()
         optimizer.step()
 
@@ -479,6 +621,8 @@ def _fine_tune_hard_negatives(
                 val_fp_per_hour=metrics["fp_per_hour"],
                 val_recall_at_0_5=metrics["recall_at_0_5"],
                 val_fp_per_hour_at_0_5=metrics["fp_per_hour_at_0_5"],
+                positive_median_score=metrics["positive_median_score"],
+                positive_p10_score=metrics["positive_p10_score"],
                 threshold=metrics["threshold"],
             )
             bus.log(
@@ -488,6 +632,8 @@ def _fine_tune_hard_negatives(
                 f"FP/hr={metrics['fp_per_hour']:.2f} "
                 f"recall@0.5={metrics['recall_at_0_5']:.3f} "
                 f"rawFP/hr@0.5={metrics['fp_per_hour_at_0_5']:.2f} "
+                f"pos_med={metrics['positive_median_score']:.3f} "
+                f"pos_p10={metrics['positive_p10_score']:.3f} "
                 f"threshold={metrics['threshold']:.6f}"
             )
             score = _checkpoint_score(metrics, cfg)
@@ -510,6 +656,142 @@ def _fine_tune_hard_negatives(
     return best_score, best_metrics, best_step, best_exportable
 
 
+def _refresh_hard_negatives(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainingConfig,
+    train_ds: FeatureMemmapDataset,
+    val_loader: DataLoader,
+    device: torch.device,
+    refresh_index: int,
+    global_step: int,
+    cancel_flag=None,
+) -> tuple[int, dict[str, float] | None]:
+    """Briefly train on mined hard negatives, then re-evaluate.
+
+    Random negative sampling is dominated by easy negatives, but FP/hour is set
+    by the rare high-scoring tail. On a plateau, mine that tail from the train
+    shard and run a short corrective burst instead of letting BCE keep improving
+    on easy examples while the operating metric degrades.
+    """
+
+    if (
+        not cfg.hard_negative_refresh_on_plateau
+        or cfg.hard_negative_refresh_steps <= 0
+        or cfg.hard_negative_refresh_top_k <= 0
+    ):
+        return 0, None
+
+    labels = np.asarray(train_ds.labels[:], dtype=np.int64)
+    pos_indices = np.flatnonzero(labels == 1)
+    if pos_indices.size == 0:
+        return 0, None
+
+    bus.log(
+        "Plateau hard-negative refresh "
+        f"{refresh_index}/{cfg.max_hard_negative_refreshes}: mining top "
+        f"{cfg.hard_negative_refresh_top_k:,} negatives from training shard..."
+    )
+    hard_neg_indices = _mine_hard_negatives(
+        model,
+        train_ds,
+        device,
+        top_k=cfg.hard_negative_refresh_top_k,
+        batch_size=max(4096, cfg.batch_size * 2),
+    )
+    if hard_neg_indices.size == 0:
+        bus.log("No hard negatives found for plateau refresh.", level="warning")
+        return 0, None
+
+    rng = np.random.default_rng(cfg.seed + 101 + refresh_index)
+    pos_per_batch = max(
+        1,
+        min(
+            cfg.batch_size - 1,
+            int(cfg.batch_size * cfg.hard_negative_refresh_positive_fraction),
+        ),
+    )
+    neg_per_batch = cfg.batch_size - pos_per_batch
+    steps_done = 0
+    for local_step in range(1, cfg.hard_negative_refresh_steps + 1):
+        if cancel_flag is not None and cancel_flag.is_set():
+            break
+        pidx = rng.choice(pos_indices, size=pos_per_batch, replace=True)
+        nidx = rng.choice(hard_neg_indices, size=neg_per_batch, replace=True)
+        ndcs = np.concatenate([pidx, nidx])
+        y_np = np.concatenate(
+            [
+                np.ones(pos_per_batch, dtype=np.float32),
+                np.zeros(neg_per_batch, dtype=np.float32),
+            ]
+        )
+        order = rng.permutation(ndcs.size)
+        ndcs = ndcs[order]
+        y_np = y_np[order]
+
+        x = torch.from_numpy(_dataset_features_at(train_ds, ndcs)).to(device)
+        y = torch.from_numpy(y_np).to(device)
+        model.train()
+        optimizer.zero_grad()
+        probs = model(x).squeeze(-1)
+        loss = _weighted_loss(
+            probs,
+            y,
+            cfg,
+            negative_weight=float(cfg.max_negative_loss_weight),
+        )
+        loss.backward()
+        optimizer.step()
+        steps_done += 1
+
+        if local_step % 100 == 0 or local_step == cfg.hard_negative_refresh_steps:
+            bus.metric(
+                step=global_step + steps_done,
+                max_steps=cfg.max_steps,
+                train_loss=float(loss.item()),
+            )
+            bus.progress(
+                "train",
+                min(1.0, (global_step + steps_done) / cfg.max_steps),
+                detail=(
+                    f"hard-negative refresh {refresh_index} "
+                    f"{local_step}/{cfg.hard_negative_refresh_steps}"
+                ),
+            )
+
+    if steps_done == 0:
+        return 0, None
+
+    metrics = _evaluate(model, val_loader, device, cfg)
+    metrics["step"] = global_step + steps_done
+    metrics["phase"] = "hard_negative_refresh"
+    bus.metric(
+        step=metrics["step"],
+        val_loss=metrics["loss"],
+        val_accuracy=metrics["accuracy"],
+        val_recall_at_p95=metrics["recall_at_p95"],
+        val_recall_at_target_fp=metrics["recall_at_target_fp"],
+        val_fp_per_hour=metrics["fp_per_hour"],
+        val_recall_at_0_5=metrics["recall_at_0_5"],
+        val_fp_per_hour_at_0_5=metrics["fp_per_hour_at_0_5"],
+        positive_median_score=metrics["positive_median_score"],
+        positive_p10_score=metrics["positive_p10_score"],
+        threshold=metrics["threshold"],
+    )
+    bus.log(
+        f"hard-refresh step={metrics['step']} val_loss={metrics['loss']:.4f} "
+        f"recall@p95={metrics['recall_at_p95']:.3f} "
+        f"recall@targetFP={metrics['recall_at_target_fp']:.3f} "
+        f"FP/hr={metrics['fp_per_hour']:.2f} "
+        f"recall@0.5={metrics['recall_at_0_5']:.3f} "
+        f"rawFP/hr@0.5={metrics['fp_per_hour_at_0_5']:.2f} "
+        f"pos_med={metrics['positive_median_score']:.3f} "
+        f"pos_p10={metrics['positive_p10_score']:.3f} "
+        f"threshold={metrics['threshold']:.5f}"
+    )
+    return steps_done, metrics
+
+
 def train(
     cfg: TrainingConfig,
     train_ds: FeatureMemmapDataset,
@@ -526,7 +808,15 @@ def train(
     bus.log(f"Device: {device}")
 
     model = build_model(cfg.model_type, cfg.layer_dim, cfg.n_blocks).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    current_lr = float(cfg.learning_rate)
+    lr_scale = 1.0
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=current_lr,
+        weight_decay=float(cfg.weight_decay),
+    )
+    lr_reductions = 0
+    hard_negative_refreshes = 0
 
     train_loader = _make_loader(
         train_ds,
@@ -544,10 +834,24 @@ def train(
     bus.log(
         "Training objective: "
         f"positive_sample_fraction={cfg.positive_sample_fraction:.2f}, "
-        f"negative_loss_weight={cfg.negative_loss_weight:.2f}, "
+        f"negative_loss_weight=1.00->{cfg.max_negative_loss_weight:.0f}, "
         f"hard_negative_threshold={cfg.hard_negative_threshold:.2f}, "
         f"hard_negative_loss_weight={cfg.hard_negative_loss_weight:.2f}, "
-        "weighted_loss=normalized"
+        f"focal_loss={cfg.use_focal_loss}, "
+        f"label_smoothing={cfg.label_smoothing:.3f}, "
+        f"mixup_alpha={cfg.mixup_alpha:.2f}, "
+        f"positive_confidence={cfg.positive_confidence_weight:.2f}@{cfg.positive_confidence_target:.2f}, "
+        f"negative_confidence={cfg.negative_confidence_weight:.2f}@{cfg.negative_confidence_target:.2f}, "
+        f"separation={cfg.separation_loss_weight:.2f}/margin={cfg.separation_margin:.2f}, "
+        f"export_gates=threshold<={cfg.max_calibration_threshold_for_export:.2f}, "
+        f"raw_recall@0.5>={cfg.min_recall_at_0_5_for_export:.2f}, "
+        f"rawFP/hr@0.5<={cfg.max_fp_per_hour_at_0_5_for_export:.2f}, "
+        f"pos_median>={cfg.min_positive_median_score_for_export:.2f}, "
+        f"pos_p10>={cfg.min_positive_p10_score_for_export:.2f}, "
+        f"weight_decay={cfg.weight_decay:.2e}, "
+        f"lr={current_lr:.2e}, "
+        "lr_schedule=warmup_hold_cosine, "
+        f"lr_reduce_on_plateau={cfg.lr_reduce_on_plateau}"
     )
 
     history: list[dict] = []
@@ -574,10 +878,30 @@ def train(
         x = x.to(device, non_blocking=True)
         y = y.float().to(device, non_blocking=True)
 
+        if cfg.mixup_alpha > 0:
+            lam = torch.distributions.Beta(
+                float(cfg.mixup_alpha), float(cfg.mixup_alpha)
+            ).sample().to(device)
+            perm = torch.randperm(x.size(0), device=device)
+            x = lam * x + (1.0 - lam) * x[perm]
+            y = lam * y + (1.0 - lam) * y[perm]
+
+        current_lr = _cosine_warmup_lr(
+            step,
+            cfg.max_steps,
+            float(cfg.learning_rate),
+            float(cfg.lr_warmup_fraction),
+            float(cfg.lr_hold_fraction),
+        )
+        current_lr = max(float(cfg.min_learning_rate), current_lr * lr_scale)
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
+        negative_weight = _scheduled_negative_weight(cfg, step)
+
         model.train()
         optimizer.zero_grad()
         p = model(x).squeeze(-1)
-        loss = _weighted_bce(p, y, cfg)
+        loss = _weighted_loss(p, y, cfg, negative_weight=negative_weight)
         loss.backward()
         optimizer.step()
 
@@ -608,6 +932,8 @@ def train(
                 val_fp_per_hour=metrics["fp_per_hour"],
                 val_recall_at_0_5=metrics["recall_at_0_5"],
                 val_fp_per_hour_at_0_5=metrics["fp_per_hour_at_0_5"],
+                positive_median_score=metrics["positive_median_score"],
+                positive_p10_score=metrics["positive_p10_score"],
                 threshold=metrics["threshold"],
             )
             bus.log(
@@ -617,6 +943,8 @@ def train(
                 f"FP/hr={metrics['fp_per_hour']:.2f} "
                 f"recall@0.5={metrics['recall_at_0_5']:.3f} "
                 f"rawFP/hr@0.5={metrics['fp_per_hour_at_0_5']:.2f} "
+                f"pos_med={metrics['positive_median_score']:.3f} "
+                f"pos_p10={metrics['positive_p10_score']:.3f} "
                 f"threshold={metrics['threshold']:.5f}"
             )
             score = _checkpoint_score(metrics, cfg)
@@ -635,8 +963,90 @@ def train(
                         f"step={step} recall@targetFP={metrics['recall_at_target_fp']:.3f} "
                         f"FP/hr={metrics['fp_per_hour']:.2f}"
                     )
+                else:
+                    failures = _export_gate_failures(metrics, cfg)
+                    if failures:
+                        bus.log(
+                            "Best candidate is not exportable yet: "
+                            + "; ".join(failures),
+                            level="warning",
+                        )
             else:
                 no_improve += 1
+                can_reduce_lr = (
+                    cfg.lr_reduce_on_plateau
+                    and best_score is not None
+                    and no_improve >= cfg.lr_reduce_patience
+                    and lr_reductions < cfg.max_lr_reductions
+                    and current_lr > cfg.min_learning_rate
+                    and (out_dir / "best_candidate.pt").exists()
+                )
+                if can_reduce_lr:
+                    next_lr = max(
+                        float(cfg.min_learning_rate),
+                        current_lr * float(cfg.lr_reduce_factor),
+                    )
+                    if next_lr < current_lr:
+                        # The monitored metric can degrade while BCE loss keeps
+                        # improving because the metric is dominated by the
+                        # long-tail negative scores. Rewind to the best metric
+                        # checkpoint and reset Adam so stale moments from the
+                        # degraded weights do not push us back off the cliff.
+                        model.load_state_dict(
+                            torch.load(out_dir / "best_candidate.pt", map_location=device)
+                        )
+                        lr_scale *= float(cfg.lr_reduce_factor)
+                        current_lr = next_lr
+                        optimizer = torch.optim.AdamW(
+                            model.parameters(),
+                            lr=current_lr,
+                            weight_decay=float(cfg.weight_decay),
+                        )
+                        lr_reductions += 1
+                        no_improve = 0
+                        train_iter = iter(train_loader)
+                        bus.log(
+                            "Validation metric plateaued; restored best "
+                            f"checkpoint from step={best_step}, reduced LR to "
+                            f"{current_lr:.2e} ({lr_reductions}/"
+                            f"{cfg.max_lr_reductions})."
+                        )
+                        if (
+                            cfg.hard_negative_refresh_on_plateau
+                            and hard_negative_refreshes < cfg.max_hard_negative_refreshes
+                        ):
+                            hard_negative_refreshes += 1
+                            refresh_steps, refresh_metrics = _refresh_hard_negatives(
+                                model,
+                                optimizer,
+                                cfg,
+                                train_ds,
+                                val_loader,
+                                device,
+                                hard_negative_refreshes,
+                                step,
+                                cancel_flag=cancel_flag,
+                            )
+                            step += refresh_steps
+                            if refresh_metrics is not None:
+                                history.append(refresh_metrics)
+                                score = _checkpoint_score(refresh_metrics, cfg)
+                                if best_score is None or score > best_score:
+                                    best_score = score
+                                    best_metrics = refresh_metrics.copy()
+                                    best_step = int(refresh_metrics["step"])
+                                    best_exportable = _is_exportable(refresh_metrics, cfg)
+                                    torch.save(model.state_dict(), out_dir / "best_candidate.pt")
+                                    if best_exportable:
+                                        torch.save(model.state_dict(), out_dir / "best.pt")
+                                        bus.log(
+                                            "New exportable hard-refresh checkpoint: "
+                                            f"step={best_step} "
+                                            "recall@targetFP="
+                                            f"{refresh_metrics['recall_at_target_fp']:.3f} "
+                                            f"FP/hr={refresh_metrics['fp_per_hour']:.2f}"
+                                        )
+                        continue
                 if no_improve >= cfg.early_stop_patience and step >= cfg.early_stop_min_steps:
                     bus.log(
                         f"Early stop after {no_improve} evals without improvement "
@@ -660,6 +1070,11 @@ def train(
     best_path = out_dir / "best.pt"
     if not best_exportable and (out_dir / "best_candidate.pt").exists():
         model.load_state_dict(torch.load(out_dir / "best_candidate.pt", map_location=device))
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=current_lr,
+            weight_decay=float(cfg.weight_decay),
+        )
         (
             best_score,
             best_metrics,
@@ -688,13 +1103,26 @@ def train(
             "fp_per_hour": math.inf,
             "threshold": 0.5,
         }
+        failures = _export_gate_failures(candidate, cfg)
+        failure_detail = "; ".join(failures) if failures else "unknown export gate failure"
         msg = (
             "No exportable checkpoint found. "
             f"Best candidate: step={best_step}, "
             f"recall@targetFP={candidate.get('recall_at_target_fp', 0.0):.3f} "
             f"(required >= {cfg.min_recall_at_target_fp_for_export:.3f}), "
             f"FP/hr={candidate['fp_per_hour']:.2f} "
-            f"(required <= {cfg.target_false_positives_per_hour:.2f}). "
+            f"(required <= {cfg.target_false_positives_per_hour:.2f}), "
+            f"threshold={candidate.get('threshold', 1.0):.3f} "
+            f"(required <= {cfg.max_calibration_threshold_for_export:.3f}), "
+            f"raw_recall@0.5={candidate.get('recall_at_0_5', 0.0):.3f} "
+            f"(required >= {cfg.min_recall_at_0_5_for_export:.3f}), "
+            f"rawFP/hr@0.5={candidate.get('fp_per_hour_at_0_5', math.inf):.2f} "
+            f"(required <= {cfg.max_fp_per_hour_at_0_5_for_export:.2f}), "
+            f"pos_median={candidate.get('positive_median_score', 0.0):.3f} "
+            f"(required >= {cfg.min_positive_median_score_for_export:.3f}), "
+            f"pos_p10={candidate.get('positive_p10_score', 0.0):.3f} "
+            f"(required >= {cfg.min_positive_p10_score_for_export:.3f}). "
+            f"Failed gates: {failure_detail}. "
             "Refusing to export/publish an unusable wake-word model."
         )
         bus.log(msg, level="error")
@@ -715,6 +1143,10 @@ def train(
         f"recall@p95={best_metrics['recall_at_p95']:.3f}, "
         f"recall@targetFP={best_metrics['recall_at_target_fp']:.3f}, "
         f"FP/hr={best_metrics['fp_per_hour']:.2f}, "
+        f"raw_recall@0.5={best_metrics['recall_at_0_5']:.3f}, "
+        f"rawFP/hr@0.5={best_metrics['fp_per_hour_at_0_5']:.2f}, "
+        f"pos_med={best_metrics['positive_median_score']:.3f}, "
+        f"pos_p10={best_metrics['positive_p10_score']:.3f}, "
         f"onnx_max_abs_diff={parity_diff:.2e})"
     )
 
@@ -724,6 +1156,10 @@ def train(
         best_val_recall=best_metrics["recall_at_p95"],
         best_val_recall_at_target_fp=best_metrics["recall_at_target_fp"],
         best_val_fp_per_hour=best_metrics["fp_per_hour"],
+        best_val_recall_at_0_5=best_metrics["recall_at_0_5"],
+        best_val_fp_per_hour_at_0_5=best_metrics["fp_per_hour_at_0_5"],
+        best_positive_median_score=best_metrics["positive_median_score"],
+        best_positive_p10_score=best_metrics["positive_p10_score"],
         best_threshold=best_metrics["threshold"],
         best_step=best_step,
         history=history,

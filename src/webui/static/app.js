@@ -176,6 +176,15 @@
     setValue(form, "layer_dim", tr.layer_dim);
     setValue(form, "n_blocks", tr.n_blocks);
     setValue(form, "learning_rate", tr.learning_rate);
+    setValue(form, "weight_decay", tr.weight_decay);
+    setChecked(form, "use_focal_loss", tr.use_focal_loss !== false);
+    setValue(form, "focal_gamma", tr.focal_gamma);
+    setValue(form, "label_smoothing", tr.label_smoothing);
+    setValue(form, "mixup_alpha", tr.mixup_alpha);
+    setValue(form, "max_negative_loss_weight", tr.max_negative_loss_weight);
+    setValue(form, "lr_warmup_fraction", tr.lr_warmup_fraction);
+    setValue(form, "lr_hold_fraction", tr.lr_hold_fraction);
+    setChecked(form, "lr_reduce_on_plateau", tr.lr_reduce_on_plateau === true);
     setValue(form, "batch_size", tr.batch_size);
     setValue(form, "positive_sample_fraction", tr.positive_sample_fraction);
     setValue(form, "negative_loss_weight", tr.negative_loss_weight);
@@ -190,6 +199,11 @@
     setValue(form, "early_stop_min_steps", tr.early_stop_min_steps);
     setValue(form, "target_false_positives_per_hour", tr.target_false_positives_per_hour);
     setValue(form, "min_recall_at_target_fp_for_export", tr.min_recall_at_target_fp_for_export);
+    setValue(form, "max_calibration_threshold_for_export", tr.max_calibration_threshold_for_export);
+    setValue(form, "min_recall_at_0_5_for_export", tr.min_recall_at_0_5_for_export);
+    setValue(form, "max_fp_per_hour_at_0_5_for_export", tr.max_fp_per_hour_at_0_5_for_export);
+    setValue(form, "min_positive_median_score_for_export", tr.min_positive_median_score_for_export);
+    setValue(form, "min_positive_p10_score_for_export", tr.min_positive_p10_score_for_export);
     setValue(form, "seed", tr.seed);
 
     if (deleteSessionBtn) deleteSessionBtn.disabled = runStatus === "running";
@@ -503,13 +517,13 @@
           .split("\n")
           .map((s) => s.trim())
           .filter(Boolean),
-        n_positive_per_phrase_per_voice: vNum("n_positive_per_phrase_per_voice", 4),
+        n_positive_per_phrase_per_voice: vNum("n_positive_per_phrase_per_voice", 8),
         negative_phrases: String(v("negative_phrases"))
           .split("\n")
           .map((s) => s.trim())
           .filter(Boolean),
-        n_negative_per_phrase_per_voice: vNum("n_negative_per_phrase_per_voice", 4),
-        n_adversarial_phrases: vNum("n_adversarial_phrases", 3000),
+        n_negative_per_phrase_per_voice: vNum("n_negative_per_phrase_per_voice", 5),
+        n_adversarial_phrases: vNum("n_adversarial_phrases", 8000),
         n_adversarial_per_phrase_per_voice: vNum("n_adversarial_per_phrase_per_voice", 1),
         piper_voices: piperVoices,
         use_kokoro: vBool("use_kokoro"),
@@ -525,7 +539,7 @@
       },
       augmentation: {
         rir_probability: vNum("rir_probability", 0.9),
-        background_noise_probability: vNum("background_noise_probability", 0.7),
+        background_noise_probability: vNum("background_noise_probability", 0.75),
         use_tablet_far_field_augmentation: vBool("use_tablet_far_field_augmentation"),
         tablet_far_field_probability: vNum("tablet_far_field_probability", 0.6),
         augmentations_per_clip: vNum("augmentations_per_clip", 6),
@@ -539,28 +553,42 @@
         use_common_voice_negatives: vBool("use_common_voice_negatives"),
         use_openwakeword_negative_features: vBool("use_openwakeword_negative_features"),
         use_openwakeword_validation_features: vBool("use_openwakeword_validation_features"),
-        common_voice_subset: vNum("common_voice_subset", 20000),
+        common_voice_subset: vNum("common_voice_subset", 100000),
       },
       training: {
         model_type: v("model_type") || "dnn",
-        layer_dim: vNum("layer_dim", 128),
+        layer_dim: vNum("layer_dim", 64),
         n_blocks: vNum("n_blocks", 3),
         learning_rate: vNum("learning_rate", 0.0001),
+        weight_decay: vNum("weight_decay", 0.01),
+        use_focal_loss: vBool("use_focal_loss"),
+        focal_gamma: vNum("focal_gamma", 2),
+        label_smoothing: vNum("label_smoothing", 0.05),
+        mixup_alpha: vNum("mixup_alpha", 0.2),
+        max_negative_loss_weight: vNum("max_negative_loss_weight", 1000),
+        lr_warmup_fraction: vNum("lr_warmup_fraction", 0.2),
+        lr_hold_fraction: vNum("lr_hold_fraction", 0.33),
+        lr_reduce_on_plateau: vBool("lr_reduce_on_plateau"),
         batch_size: vNum("batch_size", 2048),
-        positive_sample_fraction: vNum("positive_sample_fraction", 0.35),
-        negative_loss_weight: vNum("negative_loss_weight", 3),
-        hard_negative_loss_weight: vNum("hard_negative_loss_weight", 2),
-        hard_negative_threshold: vNum("hard_negative_threshold", 0.7),
+        positive_sample_fraction: vNum("positive_sample_fraction", 0.08),
+        negative_loss_weight: vNum("negative_loss_weight", 1),
+        hard_negative_loss_weight: vNum("hard_negative_loss_weight", 1),
+        hard_negative_threshold: vNum("hard_negative_threshold", 0.9),
         hard_negative_mining_top_k: vNum("hard_negative_mining_top_k", 50000),
         hard_negative_finetune_steps: vNum("hard_negative_finetune_steps", 0),
         hard_negative_finetune_positive_fraction: vNum("hard_negative_finetune_positive_fraction", 0.5),
-        max_steps: vNum("max_steps", 200000),
+        max_steps: vNum("max_steps", 50000),
         val_every_n_steps: vNum("val_every_n_steps", 500),
-        early_stop_patience: vNum("early_stop_patience", 30),
+        early_stop_patience: vNum("early_stop_patience", 40),
         early_stop_min_steps: vNum("early_stop_min_steps", 30000),
         target_false_positives_per_hour: vNum("target_false_positives_per_hour", 0.5),
-        min_recall_at_target_fp_for_export: vNum("min_recall_at_target_fp_for_export", 0.62),
-        seed: vNum("seed", 42),
+        min_recall_at_target_fp_for_export: vNum("min_recall_at_target_fp_for_export", 0.7),
+        max_calibration_threshold_for_export: vNum("max_calibration_threshold_for_export", 0.8),
+        min_recall_at_0_5_for_export: vNum("min_recall_at_0_5_for_export", 0.8),
+        max_fp_per_hour_at_0_5_for_export: vNum("max_fp_per_hour_at_0_5_for_export", 10),
+        min_positive_median_score_for_export: vNum("min_positive_median_score_for_export", 0.75),
+        min_positive_p10_score_for_export: vNum("min_positive_p10_score_for_export", 0.35),
+        seed: vNum("seed", 4041),
       },
     };
   }

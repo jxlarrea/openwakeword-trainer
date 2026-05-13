@@ -115,10 +115,10 @@
         </label>
       </div>
       <div class="check-row">
-        <label class="inline"><input type="checkbox" name="use_kokoro_for_negatives"> Use Kokoro for hard negatives</label>
-        <small class="hint">Optional. Keep off unless your hard negatives are short and important.</small>
+        <label class="inline"><input type="checkbox" name="use_kokoro_for_negatives" checked> Use Kokoro for hard negatives</label>
+        <small class="hint">Adds higher-quality renders for hard negatives so near-match phrases are rejected more reliably.</small>
       </div>
-      <label>Kokoro hard negatives per phrase per voice
+        <label>Kokoro hard negatives per phrase per voice
         <input type="number" name="n_kokoro_negative_per_phrase_per_voice" value="1" min="0" max="8" required>
       </label>
     </fieldset>
@@ -152,11 +152,15 @@
       <legend>Sample volume</legend>
       <div class="grid">
         <label>Positives per phrase per voice
-          <input type="number" name="n_positive_per_phrase_per_voice" value="4" min="1" max="32" required>
-          <small class="hint">How many TTS renders per (phrase, voice) combo. 4 = typical.</small>
+          <input type="number" name="n_positive_per_phrase_per_voice" value="8" min="1" max="32" required>
+          <small class="hint">How many TTS renders per (phrase, voice) combo. 8 improves clean-speech confidence.</small>
+        </label>
+        <label>Hard negatives per phrase per voice
+          <input type="number" name="n_negative_per_phrase_per_voice" value="5" min="0" max="32" required>
+          <small class="hint">How many Piper renders per hard-negative phrase/voice combo.</small>
         </label>
         <label>Adversarial phrases
-          <input type="number" name="n_adversarial_phrases" value="3000" min="100" max="20000" required>
+          <input type="number" name="n_adversarial_phrases" value="8000" min="100" max="20000" required>
           <small class="hint">Size of the auto-generated negative pool. More = broader false-positive coverage.</small>
         </label>
         <label>Adversarial per phrase per voice
@@ -205,8 +209,8 @@
         <small class="hint">Official negative validation feature bank for FP/hr calibration.</small>
       </div>
       <label>Common Voice subset size
-        <input type="number" name="common_voice_subset" value="20000" min="500" max="200000" required>
-        <small class="hint">How many Common Voice clips to fetch. 10-20k is plenty.</small>
+        <input type="number" name="common_voice_subset" value="100000" min="500" max="200000" required>
+        <small class="hint">How many Common Voice clips to fetch. 100k gives strong generic-speech negatives on DGX-class hardware.</small>
       </label>
     </fieldset>
 
@@ -222,7 +226,7 @@
           <small class="hint">Probability of applying a random room impulse response per clip.</small>
         </label>
         <label>Background noise p
-          <input type="number" name="background_noise_probability" value="0.7" min="0" max="1" step="0.05" required>
+          <input type="number" name="background_noise_probability" value="0.75" min="0" max="1" step="0.05" required>
           <small class="hint">Probability of mixing in noise/music/speech background per clip.</small>
         </label>
         <label>Tablet far-field p
@@ -243,8 +247,8 @@
           <small class="hint">DNN matches the openWakeWord reference. RNN (LSTM) is experimental.</small>
         </label>
         <label>Layer dim
-          <input type="number" name="layer_dim" value="128" min="32" max="512" required>
-          <small class="hint">Hidden layer width. 128 is plenty for wake-word detection.</small>
+          <input type="number" name="layer_dim" value="64" min="16" max="512" required>
+          <small class="hint">Hidden layer width. 64x3 matches the current high-quality default.</small>
         </label>
         <label>FC blocks
           <input type="number" name="n_blocks" value="3" min="1" max="6" required>
@@ -252,27 +256,55 @@
         </label>
         <label>Learning rate
           <input type="number" name="learning_rate" value="0.0001" min="0.000001" max="0.01" step="any" required>
-          <small class="hint">Adam learning rate. Default 1e-4.</small>
+          <small class="hint">AdamW learning rate. Default 1e-4.</small>
+        </label>
+        <label>Weight decay
+          <input type="number" name="weight_decay" value="0.01" min="0" max="1" step="any" required>
+          <small class="hint">AdamW regularization used by the reference-style trainer.</small>
         </label>
         <label>Batch size
           <input type="number" name="batch_size" value="2048" min="32" max="8192" required>
           <small class="hint">Training batch size. DGX Spark handles 2048+ easily.</small>
         </label>
         <label>Positive sample fraction
-          <input type="number" name="positive_sample_fraction" value="0.35" min="0.01" max="0.95" step="0.01" required>
-          <small class="hint">Fraction of each weighted training batch drawn from positives.</small>
+          <input type="number" name="positive_sample_fraction" value="0.08" min="0.01" max="0.95" step="0.01" required>
+          <small class="hint">Fraction of each weighted training batch drawn from positives. Low values keep generic negatives dominant.</small>
         </label>
-        <label>Negative loss weight
-          <input type="number" name="negative_loss_weight" value="3" min="0" max="100" step="0.1" required>
-          <small class="hint">How strongly ordinary negatives are penalized during training.</small>
+        <label>Base negative loss weight
+          <input type="number" name="negative_loss_weight" value="1" min="0" max="100" step="0.1" required>
+          <small class="hint">Initial negative class weight before the scheduled ramp.</small>
+        </label>
+        <label>Max negative loss weight
+          <input type="number" name="max_negative_loss_weight" value="1000" min="1" max="10000" step="1" required>
+          <small class="hint">Scheduled negative weight at the end of training.</small>
         </label>
         <label>Hard-negative loss weight
-          <input type="number" name="hard_negative_loss_weight" value="2" min="0" max="100" step="0.1" required>
+          <input type="number" name="hard_negative_loss_weight" value="1" min="0" max="100" step="0.1" required>
           <small class="hint">Extra multiplier for negatives currently scoring above the hard-negative threshold.</small>
         </label>
         <label>Hard-negative threshold
-          <input type="number" name="hard_negative_threshold" value="0.7" min="0" max="1" step="0.01" required>
+          <input type="number" name="hard_negative_threshold" value="0.9" min="0" max="1" step="0.01" required>
           <small class="hint">Only negatives scoring above this receive extra hard-negative loss.</small>
+        </label>
+        <label>Focal loss gamma
+          <input type="number" name="focal_gamma" value="2" min="0" max="8" step="0.1" required>
+          <small class="hint">Focuses learning on hard examples near the decision boundary.</small>
+        </label>
+        <label>Label smoothing
+          <input type="number" name="label_smoothing" value="0.05" min="0" max="0.5" step="0.01" required>
+          <small class="hint">Prevents overconfident output calibration.</small>
+        </label>
+        <label>Mixup alpha
+          <input type="number" name="mixup_alpha" value="0.2" min="0" max="2" step="0.05" required>
+          <small class="hint">Embedding-space mixup regularization.</small>
+        </label>
+        <label>LR warmup fraction
+          <input type="number" name="lr_warmup_fraction" value="0.2" min="0" max="1" step="0.01" required>
+          <small class="hint">Fraction of training spent warming up the learning rate.</small>
+        </label>
+        <label>LR hold fraction
+          <input type="number" name="lr_hold_fraction" value="0.33" min="0" max="1" step="0.01" required>
+          <small class="hint">Fraction of training holding peak learning rate before cosine decay.</small>
         </label>
         <label>Hard-negative mining top K
           <input type="number" name="hard_negative_mining_top_k" value="50000" min="0" max="500000" step="1000" required>
@@ -287,7 +319,7 @@
           <small class="hint">Positive fraction used only during mined hard-negative fine-tuning.</small>
         </label>
         <label>Max steps
-          <input type="number" name="max_steps" value="200000" min="500" max="500000" required>
+          <input type="number" name="max_steps" value="50000" min="500" max="500000" required>
           <small class="hint">Hard cap on training steps. Early-stop usually kicks in well before this.</small>
         </label>
         <label>Validate every N steps
@@ -295,23 +327,51 @@
           <small class="hint">How often to run validation + check early-stop.</small>
         </label>
         <label>Early stop patience
-          <input type="number" name="early_stop_patience" value="30" min="1" max="50" required>
+          <input type="number" name="early_stop_patience" value="40" min="1" max="100" required>
           <small class="hint">Stop after this many evals without recall@p95 improvement.</small>
         </label>
+        <div class="check-row">
+          <label class="inline"><input type="checkbox" name="use_focal_loss" checked> Use focal loss</label>
+          <small class="hint">Reference-style objective for sparse wake-word positives.</small>
+        </div>
+        <div class="check-row">
+          <label class="inline"><input type="checkbox" name="lr_reduce_on_plateau"> Reduce LR on plateau</label>
+          <small class="hint">Off by default with the warmup/hold/cosine schedule.</small>
+        </div>
         <label>Target FP/hr
           <input type="number" name="target_false_positives_per_hour" value="0.5" min="0" max="10" step="0.05" required>
           <small class="hint">Stop training early if val FP/hr drops below this with good recall.</small>
         </label>
         <label>Minimum recall for export
-          <input type="number" name="min_recall_at_target_fp_for_export" value="0.62" min="0" max="1" step="0.01" required>
+          <input type="number" name="min_recall_at_target_fp_for_export" value="0.7" min="0" max="1" step="0.01" required>
           <small class="hint">Required validation recall at the target FP/hr before publishing an ONNX model.</small>
+        </label>
+        <label>Max calibration threshold
+          <input type="number" name="max_calibration_threshold_for_export" value="0.8" min="0.5" max="1" step="0.01" required>
+          <small class="hint">Rejects models that only pass by hiding behind an extreme raw threshold.</small>
+        </label>
+        <label>Minimum raw recall @ 0.5
+          <input type="number" name="min_recall_at_0_5_for_export" value="0.8" min="0" max="1" step="0.01" required>
+          <small class="hint">Requires the uncalibrated model to detect positives at the normal 0.5 threshold.</small>
+        </label>
+        <label>Max raw FP/hr @ 0.5
+          <input type="number" name="max_fp_per_hour_at_0_5_for_export" value="10" min="0" max="500" step="0.1" required>
+          <small class="hint">Rejects models that would false-trigger heavily before threshold calibration.</small>
+        </label>
+        <label>Minimum positive median score
+          <input type="number" name="min_positive_median_score_for_export" value="0.75" min="0" max="1" step="0.01" required>
+          <small class="hint">Requires positive validation clips to have strong raw scores.</small>
+        </label>
+        <label>Minimum positive p10 score
+          <input type="number" name="min_positive_p10_score_for_export" value="0.35" min="0" max="1" step="0.01" required>
+          <small class="hint">Guards against too many weak positives in the lower tail.</small>
         </label>
         <label>Early stop minimum steps
           <input type="number" name="early_stop_min_steps" value="30000" min="500" max="200000" step="500" required>
           <small class="hint">Training will not early-stop before this step count.</small>
         </label>
         <label>Seed
-          <input type="number" name="seed" value="42" required>
+          <input type="number" name="seed" value="4041" required>
           <small class="hint">Random seed for reproducibility.</small>
         </label>
       </div>

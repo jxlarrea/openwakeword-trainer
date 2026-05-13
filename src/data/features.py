@@ -141,6 +141,23 @@ class FeatureExtractor:
         # Output shape is typically (N, 1, 1, 96); squeeze.
         return out.reshape(out.shape[0], -1).astype(np.float32)
 
+    def fixed_classifier_input(self, audio_int16: np.ndarray) -> np.ndarray:
+        """Return one streaming-compatible classifier input for a clip.
+
+        Reference openWakeWord-style training uses one fixed example per
+        augmented clip. If the clip produces more than 16 embedding timesteps,
+        keep the last 16 because inference asks whether the wake word occurred
+        at the trailing edge of the rolling audio buffer. If it produces fewer,
+        left-pad so the real audio remains anchored to the end.
+        """
+        emb = self.embeddings(audio_int16)
+        if emb.shape[0] >= CLASSIFIER_WINDOW_EMBEDDINGS:
+            return emb[-CLASSIFIER_WINDOW_EMBEDDINGS:].astype(np.float32)
+        out = np.zeros((CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM), dtype=np.float32)
+        if emb.shape[0] > 0:
+            out[-emb.shape[0] :] = emb
+        return out
+
     def classifier_inputs(self, audio_int16: np.ndarray) -> np.ndarray:
         """Slide a 16-embedding window over a clip; return (M, 16, 96).
 

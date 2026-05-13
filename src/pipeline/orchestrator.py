@@ -38,6 +38,7 @@ from src.data.adversarial import build_adversarial_phrases
 from src.data.dataset import (
     CombinedFeatureDataset,
     ExternalNegativeFeatureDataset,
+    FEATURE_LABELING_VERSION,
     FeatureMemmapDataset,
     ShardManifest,
     allocate_memmap,
@@ -590,6 +591,7 @@ def _feature_input_signature(
     h = hashlib.sha256()
     payload = {
         "version": FEATURE_RESUME_VERSION,
+        "feature_labeling_version": FEATURE_LABELING_VERSION,
         "wake_word": cfg.wake_word,
         "generation": cfg.generation.model_dump(mode="json"),
         "augmentation": cfg.augmentation.model_dump(mode="json"),
@@ -1347,6 +1349,10 @@ def _run(cfg: TrainRunConfig) -> None:
                     "best_val_recall_at_p95": result.best_val_recall,
                     "best_val_recall_at_target_fp": result.best_val_recall_at_target_fp,
                     "best_val_fp_per_hour": result.best_val_fp_per_hour,
+                    "best_val_recall_at_0_5": result.best_val_recall_at_0_5,
+                    "best_val_fp_per_hour_at_0_5": result.best_val_fp_per_hour_at_0_5,
+                    "best_positive_median_score": result.best_positive_median_score,
+                    "best_positive_p10_score": result.best_positive_p10_score,
                     "calibration_threshold_raw": result.best_threshold,
                     "recommended_runtime_threshold": 0.5,
                     "recommended_threshold": 0.5,

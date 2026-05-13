@@ -22,7 +22,7 @@ class GenerationConfig(BaseModel):
     )
     # Defaults tuned for the DGX Spark (GB10, 128 GB unified memory). Smaller
     # hosts may want to reduce sample volume and batch size.
-    n_positive_per_phrase_per_voice: int = 4
+    n_positive_per_phrase_per_voice: int = 8
 
     # User-supplied hard negatives - phrases the model must NOT trigger on.
     # Typical use: paste false-triggers observed in production
@@ -33,16 +33,16 @@ class GenerationConfig(BaseModel):
         default_factory=list,
         description="Hard-negative phrases observed to false-trigger. Same emphasis as positives.",
     )
-    n_negative_per_phrase_per_voice: int = 4
+    n_negative_per_phrase_per_voice: int = 5
 
-    n_adversarial_phrases: int = 3000
+    n_adversarial_phrases: int = 8000
     n_adversarial_per_phrase_per_voice: int = 1
 
     piper_voices: list[VoiceSelection] = Field(default_factory=list)
     use_kokoro: bool = True
     kokoro_voices: list[str] = Field(default_factory=list)
     n_kokoro_positive_per_phrase_per_voice: int = 2
-    use_kokoro_for_negatives: bool = False
+    use_kokoro_for_negatives: bool = True
     n_kokoro_negative_per_phrase_per_voice: int = 1
     kokoro_speed_min: float = 0.9
     kokoro_speed_max: float = 1.1
@@ -63,7 +63,7 @@ class AugmentationConfig(BaseModel):
     """Per-clip augmentation knobs."""
 
     rir_probability: float = 0.9
-    background_noise_probability: float = 0.7
+    background_noise_probability: float = 0.75
     background_noise_min_snr_db: float = 3.0
     background_noise_max_snr_db: float = 30.0
     gaussian_noise_probability: float = 0.3
@@ -92,7 +92,7 @@ class DatasetConfig(BaseModel):
     use_musan_music: bool = True
     use_fsd50k: bool = True
     use_common_voice_negatives: bool = True
-    common_voice_subset: int = 20000  # DGX Spark default
+    common_voice_subset: int = 100000  # DGX Spark default
     use_openwakeword_negative_features: bool = True
     use_openwakeword_validation_features: bool = True
 
@@ -102,25 +102,55 @@ class TrainingConfig(BaseModel):
 
     # DGX Spark defaults: large batch, longer schedule, more patience.
     model_type: Literal["dnn", "rnn"] = "dnn"
-    layer_dim: int = 128
+    layer_dim: int = 64
     n_blocks: int = 3
     learning_rate: float = 1e-4
+    weight_decay: float = 1e-2
+    use_focal_loss: bool = True
+    focal_gamma: float = 2.0
+    label_smoothing: float = 0.05
+    mixup_alpha: float = 0.20
+    positive_confidence_target: float = 0.90
+    positive_confidence_weight: float = 0.0
+    negative_confidence_target: float = 0.10
+    negative_confidence_weight: float = 0.0
+    separation_margin: float = 0.50
+    separation_loss_weight: float = 0.0
+    separation_top_k: int = 128
+    max_negative_loss_weight: float = 1000.0
+    lr_warmup_fraction: float = 0.20
+    lr_hold_fraction: float = 0.33
+    lr_reduce_on_plateau: bool = False
+    lr_reduce_patience: int = 4
+    lr_reduce_factor: float = 0.5
+    min_learning_rate: float = 1e-6
+    max_lr_reductions: int = 4
     batch_size: int = 2048
-    positive_sample_fraction: float = 0.35
-    negative_loss_weight: float = 3.0
-    hard_negative_loss_weight: float = 2.0
-    hard_negative_threshold: float = 0.70
+    positive_sample_fraction: float = 0.08
+    negative_loss_weight: float = 1.0
+    hard_negative_loss_weight: float = 1.0
+    hard_negative_threshold: float = 0.90
     hard_negative_mining_top_k: int = 50_000
     hard_negative_finetune_steps: int = 0
     hard_negative_finetune_positive_fraction: float = 0.50
-    max_steps: int = 200_000
+    hard_negative_refresh_on_plateau: bool = False
+    hard_negative_refresh_top_k: int = 20_000
+    hard_negative_refresh_steps: int = 300
+    hard_negative_refresh_positive_fraction: float = 0.50
+    max_hard_negative_refreshes: int = 3
+    max_steps: int = 50_000
     val_every_n_steps: int = 500
     target_false_positives_per_hour: float = 0.5
     min_recall_at_p95_for_export: float = 0.80
-    min_recall_at_target_fp_for_export: float = 0.62
+    min_recall_at_target_fp_for_export: float = 0.70
+    max_calibration_threshold_for_export: float = 0.80
+    min_recall_at_0_5_for_export: float = 0.80
+    max_fp_per_hour_at_0_5_for_export: float = 10.0
+    min_positive_median_score_for_export: float = 0.75
+    min_positive_p10_score_for_export: float = 0.35
     early_stop_min_steps: int = 30_000
-    early_stop_patience: int = 30
-    seed: int = 42
+    early_stop_patience: int = 40
+    seed: int = 4041
 
 
 class TrainRunConfig(BaseModel):

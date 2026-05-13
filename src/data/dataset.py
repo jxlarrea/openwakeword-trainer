@@ -4,12 +4,12 @@ Workflow per training run:
   1. Generate positive WAVs (Piper + optional ElevenLabs)
   2. Generate adversarial WAVs (same TTS path)
   3. Build the augmenter (RIRs + background-noise pools)
-  4. For each clip, augment N times, extract (M, 16, 96) classifier inputs,
-     append to a memmap. Label per row.
+  4. For each clip, augment N times, align to one fixed ~2 s training window,
+     extract one (16, 96) classifier input, append to a memmap. Label per row.
   5. Save train / val / test memmap shards.
 
-The memmap layout is one big float32 array of shape (total_windows, 16, 96)
-plus a uint8 labels array of shape (total_windows,).
+The memmap layout is one big float32 array of shape (total_examples, 16, 96)
+plus a uint8 labels array of shape (total_examples,).
 """
 from __future__ import annotations
 
@@ -25,19 +25,17 @@ from torch.utils.data import Dataset
 
 from src.data.features import (
     CLASSIFIER_WINDOW_EMBEDDINGS,
-    EMBEDDING_HOP_FRAMES,
     EMBEDDING_DIM,
-    EMBEDDING_WINDOW_FRAMES,
     FeatureExtractor,
     float32_to_int16,
 )
 
 logger = logging.getLogger(__name__)
 
-# Pad short clips to this many samples (3 s at 16 kHz). The openWakeWord
-# classifier window covers ~1.28 s, so we need clips at least ~2 s to yield even
-# one window. Padding with silence on both sides also adds positional variability.
-MIN_CLIP_SAMPLES = 16_000 * 3
+# Reference openWakeWord-style training uses one fixed clip per example.
+# 2 seconds at 16 kHz produces exactly one 16-timestep classifier input.
+TRAINING_CLIP_SAMPLES = 16_000 * 2
+_POSITIVE_END_JITTER_SAMPLES = int(0.2 * 16_000)
 
 
 @dataclass
@@ -241,18 +239,18 @@ def _active_audio_bounds(audio: np.ndarray) -> tuple[int, int]:
     return start, max(start + 1, end)
 
 
-def _pad_to_min_length(
+def _align_training_clip(
     audio: np.ndarray,
+    label: int,
     rng: np.random.Generator,
     active_start: int | None = None,
     active_end: int | None = None,
 ) -> tuple[np.ndarray, int, int]:
-    """Pad audio with silence so the result is at least MIN_CLIP_SAMPLES long.
+    """Return one fixed-size training clip and speech bounds inside it.
 
-    Returns (padded_audio, speech_start_samples, speech_end_samples). Speech
-    range is the slice of the padded array that contains the original audio
-    (the rest is zero-pad). If audio was already long enough, speech spans
-    the whole array.
+    Positives are end-aligned with small jitter so the model learns the
+    streaming question: "did the wake word just finish?" Negatives are centered
+    when short and randomly cropped when long.
     """
     audio = audio.astype(np.float32)
     if active_start is None or active_end is None:
@@ -260,64 +258,40 @@ def _pad_to_min_length(
     active_start = max(0, min(int(active_start), audio.size))
     active_end = max(active_start + 1, min(int(active_end), audio.size))
 
-    if audio.size >= MIN_CLIP_SAMPLES:
-        return audio, active_start, active_end
-    out = np.zeros(MIN_CLIP_SAMPLES, dtype=np.float32)
-    max_offset = MIN_CLIP_SAMPLES - audio.size
-    offset = int(rng.integers(0, max_offset + 1))
+    if label == 1:
+        speech = audio[active_start:active_end]
+        if speech.size >= TRAINING_CLIP_SAMPLES:
+            speech = speech[-TRAINING_CLIP_SAMPLES:]
+        out = np.zeros(TRAINING_CLIP_SAMPLES, dtype=np.float32)
+        jitter = int(rng.integers(0, _POSITIVE_END_JITTER_SAMPLES + 1))
+        end_pos = max(1, TRAINING_CLIP_SAMPLES - jitter)
+        start_pos = max(0, end_pos - speech.size)
+        clip_start = max(0, speech.size - (end_pos - start_pos))
+        used = speech[clip_start : clip_start + (end_pos - start_pos)]
+        out[start_pos : start_pos + used.size] = used
+        return out, start_pos, start_pos + used.size
+
+    if audio.size >= TRAINING_CLIP_SAMPLES:
+        max_start = audio.size - TRAINING_CLIP_SAMPLES
+        if active_end - active_start < TRAINING_CLIP_SAMPLES:
+            center = (active_start + active_end) // 2
+            start = center - TRAINING_CLIP_SAMPLES // 2
+            jitter = int(rng.integers(-TRAINING_CLIP_SAMPLES // 8, TRAINING_CLIP_SAMPLES // 8 + 1))
+            start += jitter
+            start = max(0, min(max_start, start))
+        else:
+            start = int(rng.integers(active_start, max(active_start + 1, active_end - TRAINING_CLIP_SAMPLES + 1)))
+            start = max(0, min(max_start, start))
+        out = audio[start : start + TRAINING_CLIP_SAMPLES].astype(np.float32, copy=False)
+        return out, max(0, active_start - start), max(1, min(TRAINING_CLIP_SAMPLES, active_end - start))
+
+    out = np.zeros(TRAINING_CLIP_SAMPLES, dtype=np.float32)
+    offset = (TRAINING_CLIP_SAMPLES - audio.size) // 2
     out[offset : offset + audio.size] = audio
     return out, offset + active_start, offset + active_end
 
 
-# openWakeWord advances one embedding every 8 mel frames. The ONNX mel model
-# uses 160-sample frame hops, so classifier windows advance every 1,280 samples
-# (80 ms). A classifier input of 16 embeddings spans the first embedding's
-# 76-frame receptive field plus 15 embedding hops: ~1.96 s.
-_MEL_FRAME_HOP_SAMPLES = 160
-_SAMPLES_PER_CLASSIFIER_HOP = EMBEDDING_HOP_FRAMES * _MEL_FRAME_HOP_SAMPLES
-_SAMPLES_PER_CLASSIFIER_WINDOW = (
-    (CLASSIFIER_WINDOW_EMBEDDINGS - 1) * EMBEDDING_HOP_FRAMES
-    + EMBEDDING_WINDOW_FRAMES
-) * _MEL_FRAME_HOP_SAMPLES
-_POSITIVE_MIN_SPEECH_COVERAGE = 0.85
-
-
-def _filter_speech_windows(
-    windows: np.ndarray, speech_start: int, speech_end: int
-) -> np.ndarray:
-    """Keep positive windows that contain the completed wake phrase.
-
-    A wake phrase should not be labeled positive until the model has enough
-    context to hear the whole phrase. Prefix-heavy windows are exactly how a
-    model learns "ok/oh/open..." instead of "ok nabu".
-    """
-    if windows.shape[0] == 0:
-        return windows
-    speech_len = max(1, speech_end - speech_start)
-    keep: list[int] = []
-    for k in range(windows.shape[0]):
-        ws = k * _SAMPLES_PER_CLASSIFIER_HOP
-        we = ws + _SAMPLES_PER_CLASSIFIER_WINDOW
-        overlap = max(0, min(we, speech_end) - max(ws, speech_start))
-        phrase_complete = we >= speech_end
-        if phrase_complete and overlap / speech_len >= _POSITIVE_MIN_SPEECH_COVERAGE:
-            keep.append(k)
-    if not keep:
-        # Fall back to the window with maximum speech coverage, preferring one
-        # that ends after the phrase if possible. This keeps long/slow phrases
-        # trainable without accepting early prefix-only windows.
-        best_idx = 0
-        best_score = (-1, -1.0)
-        for k in range(windows.shape[0]):
-            ws = k * _SAMPLES_PER_CLASSIFIER_HOP
-            we = ws + _SAMPLES_PER_CLASSIFIER_WINDOW
-            overlap = max(0, min(we, speech_end) - max(ws, speech_start))
-            score = (1 if we >= speech_end else 0, overlap / speech_len)
-            if score > best_score:
-                best_idx = k
-                best_score = score
-        keep = [best_idx]
-    return windows[keep]
+FEATURE_LABELING_VERSION = "fixed_end_aligned_examples_v1"
 
 
 # ============================================================================
@@ -402,7 +376,7 @@ def _augment_one_clip(task: dict) -> dict | None:
             audio = _resample_poly(audio, 16_000 // g, sr // g).astype(_np.float32)
 
         rng = _np.random.default_rng(seed)
-        audio, speech_start, speech_end = _pad_to_min_length(audio, rng)
+        audio, _, _ = _align_training_clip(audio, label, rng)
 
         all_windows: list[_np.ndarray] = []
         for _ in range(n_augs):
@@ -415,11 +389,8 @@ def _augment_one_clip(task: dict) -> dict | None:
             except Exception:
                 aug = audio
             int16 = float32_to_int16(aug)
-            windows = _WORKER_EXTRACTOR.classifier_inputs(int16)
-            if label == 1:
-                windows = _filter_speech_windows(windows, speech_start, speech_end)
-            if windows.shape[0] > 0:
-                all_windows.append(windows)
+            feature = _WORKER_EXTRACTOR.fixed_classifier_input(int16)
+            all_windows.append(feature[None, ...])
 
         if not all_windows:
             return {"n_windows": 0, "windows_bytes": b"", "task_index": task_index}
@@ -468,9 +439,9 @@ def build_features_from_wavs_parallel(
     checkpoint_callback=None,
     checkpoint_every: int = 500,
 ) -> int:
-    """Full end-to-end pipeline in workers (augment + mel + embedding + filter).
+    """Full end-to-end pipeline in workers (align + augment + mel + embedding).
 
-    Main process only writes pre-computed classifier windows to the memmap.
+    Main process only writes pre-computed fixed classifier examples to the memmap.
     With CUDA available in each worker (one CUDA context per process), this
     keeps the GPU fed continuously rather than waiting on Python overhead in
     a single drainer thread.
@@ -643,9 +614,10 @@ def build_features_from_wavs(
             g = gcd(sr, 16_000)
             audio = resample_poly(audio, 16_000 // g, sr // g).astype(np.float32)
 
-        # Ensure each clip is long enough to produce at least one classifier window.
-        # Track the speech region so we can drop silent-padding windows for positives.
-        audio, speech_start, speech_end = _pad_to_min_length(audio, rng)
+        # Match the reference training shape: one fixed 2 s example per
+        # augmented clip. Positives are end-aligned, negatives are centered or
+        # cropped to a single fixed window.
+        audio, _, _ = _align_training_clip(audio, label, rng)
 
         for variant in augment_clip(
             audio,
@@ -655,17 +627,8 @@ def build_features_from_wavs(
             n_variants=augmentations_per_clip,
         ):
             int16 = float32_to_int16(variant)
-            windows = extractor.classifier_inputs(int16)
-            # CRITICAL: for positive clips, drop classifier windows that are
-            # mostly silent padding. Without this, the model learns
-            # "silence = wake word" because each positive's 6 windows include
-            # 3-5 silence-only ones all labeled 1. Negatives keep all windows
-            # since silence-labeled-negative is a useful training signal.
-            if label == 1:
-                windows = _filter_speech_windows(windows, speech_start, speech_end)
-            if windows.shape[0] == 0:
-                continue
-            n_new = windows.shape[0]
+            windows = extractor.fixed_classifier_input(int16)[None, ...]
+            n_new = 1
             if cursor + n_new > out_features.shape[0]:
                 # Truncate to fit the pre-allocated memmap.
                 n_new = out_features.shape[0] - cursor
@@ -683,14 +646,10 @@ def build_features_from_wavs(
     return cursor
 
 
-def estimate_window_count(n_clips: int, augmentations_per_clip: int, avg_windows_per_clip: int = 16) -> int:
-    """Conservative estimate of how many classifier-windows a clip set will yield.
+def estimate_window_count(n_clips: int, augmentations_per_clip: int, avg_windows_per_clip: int = 1) -> int:
+    """Estimate fixed examples produced by the reference-style extractor.
 
-    With clips padded to MIN_CLIP_SAMPLES (3 s) and openWakeWord's 80 ms
-    embedding hop, each padded clip usually yields about 13 classifier windows.
-    Positive filtering keeps fewer than this, while negative clips keep all
-    windows, so the default must be above the old 6-window estimate or feature
-    extraction truncates the negative set before all clips are processed.
+    Every augmented WAV contributes exactly one (16, 96) classifier input.
     """
     return max(1, n_clips * augmentations_per_clip * avg_windows_per_clip)
 
