@@ -1,5 +1,5 @@
 <h1 align="center" style="border-bottom: none">
-   <img alt="OpenWakeWord Trainer" src="https://raw.githubusercontent.com/jxlarrea/openwakeword-trainer/refs/heads/main/src/assets/logo.png" width="650" />
+   <img alt="OpenWakeWord Trainer" src="https://raw.githubusercontent.com/jxlarrea/openwakeword-trainer/refs/heads/main/src/assets/logo-wide.png" width="650" />
 </h1>
 
 <p align="center">
@@ -213,7 +213,7 @@ Inside `/data`:
 | BUT ReverbDB RIR-only release | ~9 GB download, larger after extraction |
 | MUSAN (noise + music + speech) | ~26 GB |
 | FSD50K dev + eval (clips/) | ~34 GB |
-| Common Voice subset (20k clips) | ~4-6 GB |
+| Common Voice subset (100k clips) | ~20-30 GB |
 | openWakeWord ACAV100M feature bank | ~17 GB |
 | openWakeWord validation feature bank | ~177 MB |
 | Cached Piper voice models | ~120 MB per multi-speaker voice, ~60 MB per single-speaker |
@@ -292,7 +292,7 @@ The Start button is disabled/hidden while a run is in progress, and the Cancel b
 
 ## Example trained models
 
-The `trained-models/` folder contains models trained with this project, including the ONNX file plus the config/checkpoint metadata used to produce it. Use them as examples of the exported artifact format, or copy the ONNX into your openWakeWord runtime to test it directly.
+The `trained_models/` folder contains models trained with this project, including the ONNX file plus the config/checkpoint metadata used to produce it. Use them as examples of the exported artifact format, or copy the ONNX into your openWakeWord runtime to test it directly.
 
 ## Hard-negative iteration workflow
 
@@ -316,13 +316,12 @@ To force a fresh regeneration (e.g. after changing voice selection), create a ne
 
 The trainer optimizes for low false positives, not just low validation loss:
 
-- Negative samples are weighted more heavily than positives.
-- Negatives that currently score above the hard-negative threshold receive extra loss weight.
-- Weighted BCE is normalized by total sample weight so changing class weights does not also change the effective learning rate.
-- Post-training hard-negative fine-tuning is available but disabled by default; the base loss already applies moderate hard-negative pressure during normal training.
-- Validation reports both `recall@p95` and `recall@targetFP`.
-- Export is refused unless the best checkpoint meets the configured minimum recall and FP/hr requirements.
-- The shipped default export gate is `0.5` FP/hr with `0.62` minimum recall at that target FP rate.
+- Negative pressure ramps up during training so generic speech/noise remains dominant without crushing early positive learning.
+- Focal loss, label smoothing, mixup, AdamW, and a warmup/hold/cosine LR schedule are enabled by default.
+- Optional positive-confidence, negative-confidence, and separation losses are available for experiments, but are off in the shipped v7 defaults.
+- Validation reports target-threshold metrics and raw `0.5` metrics, including `recall@targetFP`, `FP/hr`, `raw recall@0.5`, `raw FP/hr@0.5`, positive median score, and positive p10 score.
+- Export is refused unless the best checkpoint meets both calibrated and raw-score quality gates.
+- The shipped default export gates are `0.5` FP/hr target recall >= `0.70`, calibration threshold <= `0.80`, raw recall@0.5 >= `0.80`, raw FP/hr@0.5 <= `10`, positive median >= `0.75`, and positive p10 >= `0.35`.
 - Low-quality runs still produce logs and diagnostics, but they are not exported or published as usable models.
 - The selected operating threshold is baked into the exported ONNX so a runtime threshold of `0.5` maps to the validated threshold.
 - Successful runs publish both `/data/models/<session>.onnx` and `/data/models/<session>.zip`. The zip contains the ONNX model, `training_config.json`, `checkpoint.pt`, and `checkpoint_metadata.json`.
@@ -386,17 +385,17 @@ Defaults pair `workers * threads = 20` to match DGX Spark's 20 Grace cores exact
 Defaults are tuned for high-quality, low-false-positive models on the DGX Spark, including noisy/far-field tablet use. Further knobs:
 
 - **More voices, more accents.** High/medium Piper voices are the default quality set. Toggle every English Piper voice only if you want more variety and are willing to test whether lower-quality voices help your phrase. Enable ElevenLabs (`ELEVENLABS_API_KEY`) for additional accent variations.
-- **Use Kokoro for natural positives.** Kokoro is on by default with 2 positive renders per phrase/voice. Enable Kokoro hard negatives only for short, important false-trigger phrases.
+- **Use Kokoro for natural positives and hard negatives.** Kokoro is on by default with 2 positive renders per phrase/voice and 1 hard-negative render per phrase/voice.
 - **More augmentations per clip.** Bump from 6 to 8. Each WAV becomes more variants, forcing the classifier to learn channel-invariant cues. Linearly grows feature-extraction time.
 - **Tablet / far-field deployments.** BUT ReverbDB, Tablet far-field augmentation, `RIR p = 0.9`, and 6 augmentations per clip are the defaults. Increase tablet far-field probability toward `0.8` for harsher off-axis environments.
-- **More adversarial phrases.** From 3,000 to 10,000+. The main failure mode of a wake-word classifier is firing on phonetically-similar phrases.
-- **More Common Voice.** 20k is the default speech-negative pool; 50k+ helps with rare-accent generalization.
+- **More adversarial phrases.** The default is 8,000. Increase toward 10,000+ for especially confusable wake words.
+- **More Common Voice.** 100k is the default speech-negative pool on DGX-class hardware; lower this on smaller machines if disk/time is tight.
 - **Keep ACAV100M and validation negatives enabled.** They are the biggest generic false-positive guardrail and make FP/hr calibration meaningful.
 - **Higher batch size** on big GPUs (DGX Spark handles 4096+).
 
 What NOT to tune unless you really know:
 
-- Augmentation probabilities. Default `RIR p = 0.9`, `noise p = 0.7` is tuned for tablet/far-field robustness. Pushing higher trades clean/direct recall for noise/room robustness; pushing lower trades robustness for clean-mic recall.
+- Augmentation probabilities. Default `RIR p = 0.9`, `noise p = 0.75` is tuned for tablet/far-field robustness. Pushing higher trades clean/direct recall for noise/room robustness; pushing lower trades robustness for clean-mic recall.
 - Min SNR (currently `3 dB`). Going negative (noise louder than signal) makes the model brittle to noise-as-signal false-triggers. Use hard-negatives instead.
 
 ## Known limitations
