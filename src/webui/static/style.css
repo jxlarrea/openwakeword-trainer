@@ -24,6 +24,7 @@ html, body {
   min-height: 100vh;
   font-size: 14px;
   line-height: 1.45;
+  overflow-x: hidden;
 }
 
 a { color: var(--accent); text-decoration: none; }
@@ -246,6 +247,107 @@ fieldset.invalid {
   box-shadow: 0 0 0 1px rgba(248, 81, 73, 0.25);
 }
 
+/* ---------------- Training setup ---------------- */
+
+.setup-panel {
+  margin-top: 6px;
+}
+.setup-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.standard-controls {
+  margin-top: 14px;
+}
+.standard-summary {
+  background: rgba(88, 166, 255, 0.08);
+  border: 1px solid rgba(88, 166, 255, 0.35);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+.standard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+}
+.standard-grid.compact {
+  grid-template-columns: minmax(260px, 1.25fr) minmax(180px, 0.75fr) minmax(300px, 2fr);
+  align-items: start;
+}
+.control-label {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 8px;
+  min-height: 19px;
+}
+.compact-control {
+  margin-bottom: 12px;
+}
+.compact-control input,
+.compact-control select,
+.compact-control textarea {
+  margin-top: 0;
+}
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.segmented label {
+  position: relative;
+  overflow: hidden;
+  margin: 0;
+}
+.segmented input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.segmented span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  border-radius: 6px;
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-weight: 700;
+}
+.segmented input:checked + span {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.optuna-note {
+  min-height: 58px;
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.optuna-note strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+body.training-mode-standard .advanced-only {
+  display: none;
+}
+body.training-mode-advanced #standard-controls {
+  display: none;
+}
+
 input, textarea, select {
   background: var(--field-bg);
   color: var(--text);
@@ -305,7 +407,7 @@ textarea {
   }
   .main-nav { margin: 0; width: 100%; }
   .topbar-right { width: 100%; }
-  .grid, .grid-2 { grid-template-columns: 1fr; }
+  .grid, .grid-2, .setup-grid, .standard-grid, .standard-grid.compact { grid-template-columns: 1fr; }
   .session-layout,
   .session-actions { grid-template-columns: 1fr; }
   .span-2 { grid-column: span 1; }
@@ -463,6 +565,29 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 8px;
+}
+.live-panel {
+  margin-top: 16px;
+}
+.live-panel canvas {
+  display: block;
+  width: 100%;
+  height: 180px;
+  background: #06090e;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+#live-log {
+  max-height: 240px;
+  overflow: auto;
+  background: #06090e;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
 }
 #stress-result {
   margin-top: 14px;

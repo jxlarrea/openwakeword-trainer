@@ -27,9 +27,9 @@
   <div id="session-summary" class="session-summary">Select or create a session to configure training.</div>
 </section>
 
-<section id="config" class="card disabled-card">
+<section id="config" class="card disabled-card" hidden>
   <h2>2. Configure training run</h2>
-  <form id="train-form" autocomplete="off">
+  <form id="train-form" autocomplete="off" novalidate>
     <input type="hidden" name="session_id" id="session-id-input">
 
     <div class="grid-2">
@@ -44,6 +44,79 @@
         <small class="hint">Stable id for cached data and exported artifacts. Example: ok_nabu_v2.</small>
       </label>
     </div>
+
+    <fieldset class="setup-panel">
+      <legend>Training setup</legend>
+      <div class="setup-grid">
+        <label>Training mode
+          <select id="training-mode-select" name="ui_training_mode">
+            <option value="standard" selected>Standard</option>
+            <option value="advanced">Advanced</option>
+          </select>
+          <small class="hint">Standard keeps only the high-impact controls visible. Advanced shows every setting.</small>
+        </label>
+        <label>Profile
+          <select id="profile-select" name="ui_profile">
+            <option value="standard">Standard</option>
+            <option value="tablet" selected>Wall-Mounted Tablet</option>
+          </select>
+          <small class="hint">Profiles set the recipe before any manual adjustments.</small>
+        </label>
+        <label>Training strategy
+          <select id="training-strategy-select" name="ui_training_strategy">
+            <option value="single" selected>Single model</option>
+            <option value="optuna" disabled>Optuna optimization (coming soon)</option>
+          </select>
+          <small class="hint">Optuna belongs here: generate once, train many candidates, keep the best.</small>
+        </label>
+      </div>
+
+      <div id="standard-controls" class="standard-controls">
+        <div class="standard-summary" id="profile-summary">
+          Optimized for wall-mounted tablets, off-axis speech, room echo, and TV/media playback.
+        </div>
+        <div class="standard-grid">
+          <label>Positive sample budget
+            <input type="number" id="std-positive-budget" min="1000" max="300000" step="1000" value="200000">
+            <small class="hint">Approximate clean wake-word TTS samples to generate before augmentation.</small>
+          </label>
+          <label>Negative sample budget
+            <input type="number" id="std-negative-budget" min="1000" max="300000" step="1000" value="240000">
+            <small class="hint">Approximate adversarial/negative TTS samples to generate before augmentation.</small>
+          </label>
+          <label>Augmentation rounds
+            <input type="number" id="std-augmentation-rounds" min="0" max="10" step="1" value="6">
+            <small class="hint">Each round adds room, noise, and device variation.</small>
+          </label>
+          <label>Training steps
+            <input type="number" id="std-training-steps" min="20000" max="300000" step="5000" value="50000">
+            <small class="hint">Longer schedules can improve quality but cost more time.</small>
+          </label>
+          <label>False-positive penalty
+            <input type="number" id="std-fp-penalty" min="50" max="2000" step="50" value="1000">
+            <small class="hint">Higher values push harder against false triggers.</small>
+          </label>
+        </div>
+        <div class="standard-grid compact">
+          <div class="compact-control">
+            <div class="control-label">Layer size</div>
+            <div class="segmented">
+              <label><input type="radio" name="std_layer_size" value="32"><span>32</span></label>
+              <label><input type="radio" name="std_layer_size" value="64" checked><span>64</span></label>
+              <label><input type="radio" name="std_layer_size" value="96"><span>96</span></label>
+            </div>
+          </div>
+          <label class="compact-control">NN depth
+            <input type="number" id="std-nn-depth" min="1" max="5" step="1" value="3">
+            <small class="hint">3 is the balanced 64x3 reference shape.</small>
+          </label>
+          <div class="optuna-note">
+            <strong>Optuna Optimization</strong>
+            <span>Planned as a strategy after feature extraction: reuse the same cached features, train 5-25 model candidates, and export the strongest checkpoint.</span>
+          </div>
+        </div>
+      </div>
+    </fieldset>
 
     <div class="grid-2">
       <fieldset class="phrase-box">
@@ -60,7 +133,7 @@
       </fieldset>
     </div>
 
-    <fieldset>
+    <fieldset class="advanced-only">
       <legend>Piper voices (English)</legend>
       <div class="voice-controls">
         <button type="button" id="select-all-voices">Select all</button>
@@ -82,7 +155,7 @@
       <small class="hint">More voices = more accent / pitch diversity in training data. Multi-speaker voices (libritts) cover hundreds of speakers each.</small>
     </fieldset>
 
-    <fieldset>
+    <fieldset class="advanced-only">
       <legend>Kokoro voices (English)</legend>
       <div class="check-row">
         <label class="inline"><input type="checkbox" name="use_kokoro" checked> Use Kokoro for positive phrases</label>
@@ -104,8 +177,8 @@
       </div>
       <div class="grid">
         <label>Kokoro positives per phrase per voice
-          <input type="number" name="n_kokoro_positive_per_phrase_per_voice" value="3" min="0" max="16" required>
-          <small class="hint">Extra high-quality renders per phrase/voice. 3 is the current v23 tablet/default recipe.</small>
+          <input type="number" name="n_kokoro_positive_per_phrase_per_voice" value="3" min="0" max="10000" required>
+          <small class="hint">Extra high-quality renders per phrase/voice. 3 is the current tablet/default recipe.</small>
         </label>
         <label>Kokoro speed min
           <input type="number" name="kokoro_speed_min" value="0.9" min="0.5" max="2" step="0.05" required>
@@ -123,19 +196,23 @@
       </label>
     </fieldset>
 
-    <fieldset>
+    <fieldset class="advanced-only">
       <legend>Sample volume</legend>
       <div class="grid">
+        <label>Positive sample budget
+          <input type="number" name="positive_sample_budget" value="0" min="0" max="300000" step="1000" required>
+          <small class="hint">0 uses exact per-voice counts below. Standard profiles set this to an openwakeword.com-style total.</small>
+        </label>
         <label>Positives per phrase per voice
-          <input type="number" name="n_positive_per_phrase_per_voice" value="10" min="1" max="32" required>
-          <small class="hint">How many TTS renders per (phrase, voice) combo. 10 improves clean-speech confidence.</small>
+          <input type="number" name="n_positive_per_phrase_per_voice" value="10" min="1" max="10000" required>
+          <small class="hint">Used only when positive sample budget is 0.</small>
         </label>
         <label>Hard negatives per phrase per voice
           <input type="number" name="n_negative_per_phrase_per_voice" value="5" min="0" max="32" required>
           <small class="hint">How many Piper renders per hard-negative phrase/voice combo.</small>
         </label>
         <label>Adversarial phrases
-          <input type="number" name="n_adversarial_phrases" value="8000" min="100" max="20000" required>
+          <input type="number" name="n_adversarial_phrases" value="8000" min="100" max="300000" required>
           <small class="hint">Size of the auto-generated negative pool. More = broader false-positive coverage.</small>
         </label>
         <label>Adversarial per phrase per voice
@@ -149,7 +226,7 @@
       </div>
     </fieldset>
 
-    <fieldset>
+    <fieldset class="advanced-only">
       <legend>Augmentation corpora</legend>
       <div class="check-row">
         <label class="inline"><input type="checkbox" name="use_mit_rirs" checked> MIT IR Survey (room reverb)</label>
@@ -189,7 +266,7 @@
       </label>
     </fieldset>
 
-    <fieldset>
+    <fieldset class="advanced-only">
       <legend>Augmentation probabilities</legend>
       <div class="check-row">
         <label class="inline"><input type="checkbox" name="use_tablet_far_field_augmentation" checked> Tablet far-field augmentation</label>
@@ -211,7 +288,7 @@
       </div>
     </fieldset>
 
-    <fieldset>
+    <fieldset class="advanced-only">
       <legend>Classifier + training</legend>
       <div class="grid">
         <label>Model type

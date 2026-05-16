@@ -11,7 +11,17 @@ from typing import Any
 
 import numpy as np
 import soundfile as sf
-from fastapi import APIRouter, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -53,6 +63,93 @@ logger = logging.getLogger(__name__)
 
 _BASE_DIR = Path(__file__).parent
 _TEMPLATES = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
+
+_OWW_WAKE_SENSITIVITY_OFFSETS = {
+    "Slightly sensitive": 0.10,
+    "Moderately sensitive": 0.00,
+    "Very sensitive": -0.10,
+}
+_OWW_STOP_SENSITIVITY_OFFSETS = {
+    "Slightly sensitive": 0.05,
+    "Moderately sensitive": 0.00,
+    "Very sensitive": -0.05,
+}
+_BORDERLINE_CONFIRM_MARGIN = 0.03
+_WAKE_CONFIRM_MIN_FRAMES = 1
+_BORDERLINE_CONFIRM_WINDOW_FRAMES = 8
+_LIVE_SAMPLE_RATE = 16_000
+_LIVE_MIN_CONTEXT_SECONDS = 3.0
+_LIVE_ROLLING_SECONDS = 4.0
+
+
+class _LiveConfirmationGate:
+    """Voice Satellite-style OWW confirmation gate for the live tester."""
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = Path(model_name).stem
+        self.pending = False
+        self.pending_frame = -1
+        self.pending_score = 0.0
+        self.frame_index = 0
+
+    @property
+    def _is_stop(self) -> bool:
+        return self.model_name == "stop" or self.model_name.startswith("stop_")
+
+    def reset(self) -> None:
+        self.pending = False
+        self.pending_frame = -1
+        self.pending_score = 0.0
+        self.frame_index = 0
+
+    def process(self, score: float, cutoff: float) -> tuple[bool, str, str | None]:
+        self.frame_index += 1
+        if score <= cutoff:
+            was_pending = self.pending
+            self.pending = False
+            self.pending_frame = -1
+            self.pending_score = 0.0
+            return False, "below", "cleared pending candidate" if was_pending else None
+
+        if self._is_stop and score >= cutoff + _BORDERLINE_CONFIRM_MARGIN:
+            self.pending = False
+            self.pending_frame = -1
+            self.pending_score = 0.0
+            return True, "immediate", "stop high-confidence trigger"
+
+        if self.pending:
+            frame_gap = self.frame_index - self.pending_frame
+            if frame_gap <= 0:
+                self.pending_score = max(self.pending_score, score)
+                return False, "parked", None
+            if frame_gap <= _BORDERLINE_CONFIRM_WINDOW_FRAMES:
+                if not self._is_stop and frame_gap < _WAKE_CONFIRM_MIN_FRAMES:
+                    self.pending_score = max(self.pending_score, score)
+                    return False, "parked", None
+                first_score = self.pending_score
+                self.pending = False
+                self.pending_frame = -1
+                self.pending_score = 0.0
+                return (
+                    True,
+                    "confirmed",
+                    f"confirmed first={first_score:.3f} second={score:.3f} frames={frame_gap}",
+                )
+            log = f"confirm expired score={score:.3f} frames={frame_gap}"
+        else:
+            log = f"candidate parked score={score:.3f} cutoff={cutoff:.3f}"
+
+        self.pending = True
+        self.pending_frame = self.frame_index
+        self.pending_score = score
+        return False, "parked", log
+
+
+def _live_effective_cutoff(model_name: str, base_cutoff: float, sensitivity: str) -> float:
+    stem = Path(model_name).stem
+    is_stop = stem == "stop" or stem.startswith("stop_")
+    offsets = _OWW_STOP_SENSITIVITY_OFFSETS if is_stop else _OWW_WAKE_SENSITIVITY_OFFSETS
+    return float(np.clip(base_cutoff + offsets.get(sensitivity, 0.0), 0.05, 0.99))
 
 
 def _decode_uploaded_audio(data: bytes) -> tuple[np.ndarray, int]:
@@ -407,6 +504,157 @@ def register_routes(api: APIRouter) -> None:
             "score_curve": [{"t": t, "s": s} for t, s in result.score_curve],
         }
 
+    @api.websocket("/api/test/live")
+    async def live_test(websocket: WebSocket):
+        await websocket.accept()
+        try:
+            init = await websocket.receive_json()
+            model_name = str(init.get("model_name") or "").strip()
+            if not model_name:
+                await websocket.send_json({"type": "error", "message": "model_name is required"})
+                await websocket.close(code=1008)
+                return
+
+            models_dir = get_settings().models_dir.resolve()
+            model_path = (models_dir / model_name).resolve()
+            if (
+                not str(model_path).startswith(str(models_dir))
+                or not model_path.exists()
+                or model_path.suffix != ".onnx"
+            ):
+                await websocket.send_json({"type": "error", "message": "model not found"})
+                await websocket.close(code=1008)
+                return
+
+            base_cutoff = _bounded_float(init.get("threshold"), 0.5, 0.0, 1.0)
+            sensitivity = str(init.get("sensitivity") or "Moderately sensitive")
+            cutoff = _live_effective_cutoff(model_name, base_cutoff, sensitivity)
+            tester = ModelTester(model_path)
+            gate = _LiveConfirmationGate(model_name)
+            samples = np.empty(0, dtype=np.float32)
+            total_samples = 0
+            peak_score = 0.0
+
+            await websocket.send_json(
+                {
+                    "type": "ready",
+                    "model_name": model_name,
+                    "base_threshold": base_cutoff,
+                    "sensitivity": sensitivity,
+                    "cutoff": cutoff,
+                    "sample_rate": _LIVE_SAMPLE_RATE,
+                    "message": "server-side live inference ready",
+                }
+            )
+
+            while True:
+                msg = await websocket.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                if msg.get("text") is not None:
+                    try:
+                        payload = json.loads(msg["text"])
+                    except json.JSONDecodeError:
+                        continue
+                    if payload.get("type") == "stop":
+                        await websocket.send_json({"type": "log", "level": "info", "message": "live test stopped"})
+                        break
+                    if payload.get("type") == "config":
+                        base_cutoff = _bounded_float(payload.get("threshold"), base_cutoff, 0.0, 1.0)
+                        sensitivity = str(payload.get("sensitivity") or sensitivity)
+                        cutoff = _live_effective_cutoff(model_name, base_cutoff, sensitivity)
+                        gate.reset()
+                        await websocket.send_json(
+                            {
+                                "type": "config",
+                                "base_threshold": base_cutoff,
+                                "sensitivity": sensitivity,
+                                "cutoff": cutoff,
+                                "message": f"sensitivity={sensitivity}, cutoff={cutoff:.3f}",
+                            }
+                        )
+                    continue
+
+                chunk = msg.get("bytes")
+                if not chunk:
+                    continue
+                if len(chunk) % 4:
+                    await websocket.send_json(
+                        {"type": "log", "level": "warning", "message": "dropped malformed PCM chunk"}
+                    )
+                    continue
+
+                audio = np.frombuffer(chunk, dtype=np.float32).copy()
+                if audio.size == 0:
+                    continue
+                audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+                audio = np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
+                total_samples += int(audio.size)
+                samples = np.concatenate([samples, audio])
+                max_samples = int(_LIVE_ROLLING_SECONDS * _LIVE_SAMPLE_RATE)
+                if samples.size > max_samples:
+                    samples = samples[-max_samples:]
+
+                current_time = total_samples / _LIVE_SAMPLE_RATE
+                rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+                if samples.size < int(_LIVE_MIN_CONTEXT_SECONDS * _LIVE_SAMPLE_RATE):
+                    await websocket.send_json(
+                        {
+                            "type": "score",
+                            "t": current_time,
+                            "score": 0.0,
+                            "rms": rms,
+                            "cutoff": cutoff,
+                            "triggered": False,
+                            "gate": "warming",
+                            "peak": peak_score,
+                            "message": "warming up context",
+                        }
+                    )
+                    continue
+
+                try:
+                    result = await asyncio.to_thread(
+                        tester.score_audio,
+                        samples.copy(),
+                        _LIVE_SAMPLE_RATE,
+                        cutoff,
+                    )
+                    score = float(result.score_curve[-1][1] if result.score_curve else 0.0)
+                except Exception as exc:
+                    await websocket.send_json(
+                        {"type": "error", "message": f"inference failed: {exc}"}
+                    )
+                    continue
+
+                peak_score = max(peak_score, score)
+                triggered, gate_state, gate_log = gate.process(score, cutoff)
+                event = {
+                    "type": "score",
+                    "t": current_time,
+                    "score": score,
+                    "rms": rms,
+                    "cutoff": cutoff,
+                    "triggered": triggered,
+                    "gate": gate_state,
+                    "peak": peak_score,
+                }
+                if gate_log:
+                    event["message"] = gate_log
+                await websocket.send_json(event)
+        except WebSocketDisconnect:
+            return
+        except Exception as exc:
+            logger.exception("Live tester failed")
+            try:
+                await websocket.send_json({"type": "error", "message": str(exc)})
+            except Exception:
+                pass
+            try:
+                await websocket.close(code=1011)
+            except Exception:
+                pass
+
     @api.post("/api/test/stress")
     async def stress_test(payload: dict):
         payload = payload or {}
@@ -574,6 +822,7 @@ def _form_to_config_payload(form) -> dict:
         "run_name": form.get("run_name", "").strip(),
         "generation": {
             "positive_phrases": positive_phrases,
+            "positive_sample_budget": _int("positive_sample_budget", 0),
             "n_positive_per_phrase_per_voice": _int("n_positive_per_phrase_per_voice", 10),
             "negative_phrases": negative_phrases,
             "n_negative_per_phrase_per_voice": _int("n_negative_per_phrase_per_voice", 5),

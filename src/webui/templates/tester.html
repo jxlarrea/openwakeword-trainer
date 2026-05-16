@@ -22,6 +22,14 @@
         <input type="number" id="test-threshold" name="threshold" value="0.5" min="0" max="1" step="0.01">
         <small class="hint">Score above this triggers a detection. Lower = more sensitive.</small>
       </label>
+      <label>Sensitivity
+        <select id="live-sensitivity" name="sensitivity">
+          <option value="Slightly sensitive">Slightly sensitive</option>
+          <option value="Moderately sensitive" selected>Moderately sensitive</option>
+          <option value="Very sensitive">Very sensitive</option>
+        </select>
+        <small class="hint">Matches Voice Satellite openWakeWord sensitivity offsets.</small>
+      </label>
     </div>
 
     <div class="actions test-actions">
@@ -42,56 +50,37 @@
       <button type="button" id="record-btn" class="primary">Record from mic</button>
       <button type="button" id="stop-record-btn" class="danger" disabled>Stop recording</button>
       <button type="submit" class="primary">Run test on selected audio</button>
+      <button type="button" id="live-start-btn" class="primary">Start live mic</button>
+      <button type="button" id="live-stop-btn" class="danger" disabled>Stop live mic</button>
       <span id="mic-hint" class="pill"></span>
     </div>
   </form>
   <div id="test-result"></div>
-</section>
-
-<section id="stress-test" class="card">
-  <h2>False-positive stress test</h2>
-  <form id="stress-form">
-    <div class="grid">
-      <label>Threshold
-        <input type="number" id="stress-threshold" name="threshold" value="0.5" min="0" max="1" step="0.01">
-        <small class="hint">Uses the model selected above. For exported trainer models, 0.5 is the calibrated runtime threshold.</small>
-      </label>
-      <label>Max windows per source
-        <input type="number" id="stress-max-windows" name="max_windows" value="1000000" min="0" step="100000">
-        <small class="hint">0 means full source. One million windows is about 22.2 hours of negatives.</small>
-      </label>
-      <label>Batch size
-        <input type="number" id="stress-batch-size" name="batch_size" value="8192" min="1" max="65536" step="1024">
-        <small class="hint">Larger is faster when memory allows.</small>
-      </label>
+  <section id="live-panel" class="live-panel" hidden>
+    <div class="metrics">
+      <div class="metric-tile">
+        <div class="name">Live score</div>
+        <div class="value" id="live-score">0.000</div>
+      </div>
+      <div class="metric-tile">
+        <div class="name">Peak</div>
+        <div class="value" id="live-peak">0.000</div>
+      </div>
+      <div class="metric-tile">
+        <div class="name">Cutoff</div>
+        <div class="value" id="live-cutoff">0.500</div>
+      </div>
+      <div class="metric-tile">
+        <div class="name">Gate</div>
+        <div class="value" id="live-gate">idle</div>
+      </div>
     </div>
-
-    <fieldset>
-      <legend>Sources</legend>
-      <div class="check-row">
-        <label class="inline"><input type="checkbox" name="include_session" checked> Session train/val feature shards</label>
-        <small class="hint">Uses <code>/data/runs/&lt;model name&gt;</code> when available.</small>
-      </div>
-      <div class="check-row">
-        <label class="inline"><input type="checkbox" name="include_validation" checked> openWakeWord validation negatives</label>
-        <small class="hint">Official validation negative bank used for FP/hr calibration.</small>
-      </div>
-      <div class="check-row">
-        <label class="inline"><input type="checkbox" name="include_acav100m"> ACAV100M negatives</label>
-        <small class="hint">Large generic negative bank. Full sweep is slower; keep the window limit for quick checks.</small>
-      </div>
-      <div class="check-row">
-        <label class="inline"><input type="checkbox" name="use_cuda"> Use CUDA provider</label>
-        <small class="hint">Usually leave off while training or serving another GPU workload.</small>
-      </div>
-    </fieldset>
-
-    <div class="actions test-actions">
-      <button type="submit" id="stress-run-btn" class="primary">Run stress test</button>
-      <span id="stress-status" class="pill"></span>
-    </div>
-  </form>
-  <div id="stress-result"></div>
+    <canvas id="live-score-canvas" width="900" height="180"></canvas>
+    <details open>
+      <summary>Live inference log</summary>
+      <pre id="live-log"></pre>
+    </details>
+  </section>
 </section>
 
 {% endblock %}

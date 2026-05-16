@@ -22,6 +22,11 @@ class GenerationConfig(BaseModel):
     )
     # Defaults tuned for the DGX Spark (GB10, 128 GB unified memory). Smaller
     # hosts may want to reduce sample volume and batch size.
+    # If > 0, the pipeline derives per-voice Piper/Kokoro render counts to
+    # reach approximately this many clean positive TTS samples. This is used by
+    # the simplified Web UI profiles. A value of 0 preserves the exact advanced
+    # per-phrase/per-voice knobs below.
+    positive_sample_budget: int = 0
     n_positive_per_phrase_per_voice: int = 10
 
     # User-supplied hard negatives - phrases the model must NOT trigger on.

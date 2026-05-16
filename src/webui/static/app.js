@@ -19,7 +19,6 @@
   const sessionSummary = $("#session-summary");
   const configCard = $("#config");
   const testForm = $("#test-form");
-  const stressForm = $("#stress-form");
   const progressCancelBtn = $("#progress-cancel-btn");
   const progressStatusPill = $("#progress-status-pill");
   const progressCard = $("#progress");
@@ -59,6 +58,7 @@
 
   function setFormEnabled(enabled) {
     const canEdit = enabled && runStatus !== "running";
+    if (configCard) configCard.hidden = !enabled;
     configCard?.classList.toggle("disabled-card", !canEdit);
     $$("#train-form input, #train-form select, #train-form textarea, #train-form button").forEach((el) => {
       if (el.id === "cancel-btn") return;
@@ -77,7 +77,7 @@
   }
 
   function setTestFormEnabled(enabled) {
-    [testForm, stressForm].forEach((form) => {
+    [testForm].forEach((form) => {
       if (!form) return;
       form.querySelectorAll("input, select, textarea, button").forEach((el) => {
         if (!enabled) {
@@ -113,6 +113,166 @@
     if (el && value !== undefined && value !== null) el.value = value;
   }
 
+  const TRAINING_PROFILES = {
+    standard: {
+      summary:
+        "Standard uses an official/openWakeWord-style 64x3 recipe with moderate false-positive pressure and 3 augmentation rounds.",
+      positiveBudget: 200000,
+      negativeBudget: 200000,
+      augmentationRounds: 3,
+      trainingSteps: 115000,
+      fpPenalty: 250,
+      layerSize: 64,
+      nnDepth: 3,
+      values: {
+        positive_sample_budget: 200000,
+        n_positive_per_phrase_per_voice: 8,
+        n_kokoro_positive_per_phrase_per_voice: 2,
+        augmentations_per_clip: 3,
+        use_tablet_far_field_augmentation: false,
+        tablet_far_field_probability: 0,
+        rir_probability: 0.9,
+        background_noise_probability: 0.75,
+        max_steps: 115000,
+        early_stop_min_steps: 30000,
+        max_negative_loss_weight: 250,
+        layer_dim: 64,
+        n_blocks: 3,
+      },
+    },
+    tablet: {
+      summary:
+        "Optimized for wall-mounted tablets, off-axis speech, room echo, and TV/media playback.",
+      positiveBudget: 200000,
+      negativeBudget: 240000,
+      augmentationRounds: 6,
+      trainingSteps: 50000,
+      fpPenalty: 1000,
+      layerSize: 64,
+      nnDepth: 3,
+      values: {
+        positive_sample_budget: 200000,
+        n_positive_per_phrase_per_voice: 10,
+        n_kokoro_positive_per_phrase_per_voice: 3,
+        augmentations_per_clip: 6,
+        use_tablet_far_field_augmentation: true,
+        tablet_far_field_probability: 0.75,
+        rir_probability: 0.9,
+        background_noise_probability: 0.75,
+        max_steps: 50000,
+        early_stop_min_steps: 30000,
+        max_negative_loss_weight: 1000,
+        layer_dim: 64,
+        n_blocks: 3,
+        min_curve_recall_for_export: 0.6,
+        min_curve_confirmation_rate_for_export: 0.25,
+        min_tablet_curve_median_peak_for_export: 0,
+        min_tablet_curve_p10_peak_for_export: 0,
+      },
+    },
+  };
+
+  function setStandardLayer(size) {
+    const radio = document.querySelector(`input[name="std_layer_size"][value="${size}"]`);
+    if (radio) radio.checked = true;
+  }
+
+  function getStandardLayer() {
+    return Number(document.querySelector('input[name="std_layer_size"]:checked')?.value || 64);
+  }
+
+  function selectedPiperVoiceCount(form) {
+    const count = form.querySelectorAll('input[name="piper_voice"]:checked').length;
+    return count || 30;
+  }
+
+  function setCheckbox(form, name, value) {
+    const el = form.querySelector(`input[name="${name}"]`);
+    if (el) el.checked = Boolean(value);
+  }
+
+  function sampleBudgetToAdversarialPhrases(form, sampleBudget) {
+    const voices = selectedPiperVoiceCount(form);
+    return Math.max(100, Math.round(Number(sampleBudget || 0) / voices));
+  }
+
+  function setTrainingMode(mode) {
+    const next = mode === "advanced" ? "advanced" : "standard";
+    document.body.classList.toggle("training-mode-standard", next === "standard");
+    document.body.classList.toggle("training-mode-advanced", next === "advanced");
+    const select = $("#training-mode-select");
+    if (select && select.value !== next) select.value = next;
+  }
+
+  function applyTrainingProfile(profileName) {
+    const form = $("#train-form");
+    const profile = TRAINING_PROFILES[profileName] || TRAINING_PROFILES.tablet;
+    if (!form) return;
+
+    $("#profile-summary") && ($("#profile-summary").textContent = profile.summary);
+    const profileSelect = $("#profile-select");
+    if (profileSelect && profileSelect.value !== profileName) profileSelect.value = profileName;
+
+    $("#std-positive-budget") && ($("#std-positive-budget").value = profile.positiveBudget);
+    $("#std-negative-budget") && ($("#std-negative-budget").value = profile.negativeBudget);
+    $("#std-augmentation-rounds") && ($("#std-augmentation-rounds").value = profile.augmentationRounds);
+    $("#std-training-steps") && ($("#std-training-steps").value = profile.trainingSteps);
+    $("#std-fp-penalty") && ($("#std-fp-penalty").value = profile.fpPenalty);
+    $("#std-nn-depth") && ($("#std-nn-depth").value = profile.nnDepth);
+    setStandardLayer(profile.layerSize);
+
+    Object.entries(profile.values).forEach(([name, value]) => {
+      if (typeof value === "boolean") setCheckbox(form, name, value);
+      else setValue(form, name, value);
+    });
+    setValue(
+      form,
+      "n_adversarial_phrases",
+      sampleBudgetToAdversarialPhrases(form, profile.negativeBudget)
+    );
+    setValue(form, "n_adversarial_per_phrase_per_voice", 1);
+  }
+
+  function applyStandardControlsToForm() {
+    const form = $("#train-form");
+    if (!form || $("#training-mode-select")?.value === "advanced") return;
+    const positiveBudget = Number($("#std-positive-budget")?.value || 200000);
+    const negativeBudget = Number($("#std-negative-budget")?.value || 240000);
+    const augmentationRounds = Number($("#std-augmentation-rounds")?.value || 6);
+    const trainingSteps = Number($("#std-training-steps")?.value || 50000);
+    const fpPenalty = Number($("#std-fp-penalty")?.value || 1000);
+    const layerSize = getStandardLayer();
+    const nnDepth = Number($("#std-nn-depth")?.value || 3);
+
+    setValue(form, "positive_sample_budget", positiveBudget);
+    setValue(form, "n_adversarial_phrases", sampleBudgetToAdversarialPhrases(form, negativeBudget));
+    setValue(form, "n_adversarial_per_phrase_per_voice", 1);
+    setValue(form, "augmentations_per_clip", augmentationRounds);
+    setValue(form, "max_steps", trainingSteps);
+    setValue(form, "max_negative_loss_weight", fpPenalty);
+    setValue(form, "layer_dim", layerSize);
+    setValue(form, "n_blocks", nnDepth);
+  }
+
+  function syncStandardControlsFromForm(form) {
+    if (!form) return;
+    const profile = form.querySelector('[name="use_tablet_far_field_augmentation"]')?.checked
+      ? "tablet"
+      : "standard";
+    const profileSelect = $("#profile-select");
+    if (profileSelect) profileSelect.value = profile;
+    $("#profile-summary") && ($("#profile-summary").textContent = TRAINING_PROFILES[profile].summary);
+    const adv = Number(form.querySelector('[name="n_adversarial_phrases"]')?.value || 0);
+    const positiveBudget = Number(form.querySelector('[name="positive_sample_budget"]')?.value || 0);
+    $("#std-positive-budget") && ($("#std-positive-budget").value = positiveBudget || TRAINING_PROFILES[profile].positiveBudget);
+    $("#std-negative-budget") && ($("#std-negative-budget").value = adv * selectedPiperVoiceCount(form));
+    $("#std-augmentation-rounds") && ($("#std-augmentation-rounds").value = form.querySelector('[name="augmentations_per_clip"]')?.value || 6);
+    $("#std-training-steps") && ($("#std-training-steps").value = form.querySelector('[name="max_steps"]')?.value || 50000);
+    $("#std-fp-penalty") && ($("#std-fp-penalty").value = form.querySelector('[name="max_negative_loss_weight"]')?.value || 1000);
+    $("#std-nn-depth") && ($("#std-nn-depth").value = form.querySelector('[name="n_blocks"]')?.value || 3);
+    setStandardLayer(form.querySelector('[name="layer_dim"]')?.value || 64);
+  }
+
   function fillSessionForm(session) {
     const form = $("#train-form");
     if (!form || !session?.config) return;
@@ -130,6 +290,7 @@
     const tr = cfg.training || {};
     setValue(form, "positive_phrases", (gen.positive_phrases || []).join("\n"));
     setValue(form, "negative_phrases", (gen.negative_phrases || []).join("\n"));
+    setValue(form, "positive_sample_budget", gen.positive_sample_budget);
     setValue(form, "n_positive_per_phrase_per_voice", gen.n_positive_per_phrase_per_voice);
     setValue(form, "n_negative_per_phrase_per_voice", gen.n_negative_per_phrase_per_voice);
     setValue(form, "n_adversarial_phrases", gen.n_adversarial_phrases);
@@ -220,6 +381,8 @@
     setValue(form, "min_tablet_curve_confirmation_rate_for_export", tr.min_tablet_curve_confirmation_rate_for_export);
     setValue(form, "curve_confirmation_min_gap_ms", tr.curve_confirmation_min_gap_ms);
     setValue(form, "seed", tr.seed);
+    syncStandardControlsFromForm(form);
+    setTrainingMode($("#training-mode-select")?.value || "standard");
 
     if (deleteSessionBtn) deleteSessionBtn.disabled = runStatus === "running";
     if (sessionSummary) {
@@ -306,6 +469,31 @@
     refreshModels();
   });
   setFormEnabled(false);
+  const trainForm = $("#train-form");
+  if (trainForm) trainForm.noValidate = true;
+
+  $("#training-mode-select")?.addEventListener("change", (e) => {
+    setTrainingMode(e.target.value);
+    applyStandardControlsToForm();
+  });
+  $("#profile-select")?.addEventListener("change", (e) => {
+    applyTrainingProfile(e.target.value);
+  });
+  [
+    "#std-positive-budget",
+    "#std-negative-budget",
+    "#std-augmentation-rounds",
+    "#std-training-steps",
+    "#std-fp-penalty",
+    "#std-nn-depth",
+  ].forEach((sel) => {
+    $(sel)?.addEventListener("input", applyStandardControlsToForm);
+  });
+  $$('input[name="std_layer_size"]').forEach((el) => {
+    el.addEventListener("change", applyStandardControlsToForm);
+  });
+  setTrainingMode($("#training-mode-select")?.value || "standard");
+  applyTrainingProfile($("#profile-select")?.value || "tablet");
 
   // ---------- Voice list filtering / select-all ----------
 
@@ -372,12 +560,40 @@
     const errors = [];
     let firstInvalid = null;
 
-    // Native HTML5 first - lets the browser highlight required fields,
-    // out-of-range numbers, etc., with its built-in messages.
-    if (!form.checkValidity()) {
-      form.reportValidity();
-      const firstNative = form.querySelector(":invalid");
-      return { errors: ["Some required fields are missing or out of range."], firstInvalid: firstNative };
+    // Native HTML5 checks are only used in Advanced mode. Standard mode uses
+    // explicit range checks below so hidden exact-knob fields and browser
+    // step/base arithmetic cannot block production-scale budgets.
+    const standardMode = $("#training-mode-select")?.value !== "advanced";
+    if (!standardMode) {
+      const invalidControls = Array.from(form.elements).filter((el) => {
+        if (!(el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement)) {
+          return false;
+        }
+        if (el.disabled || el.type === "hidden") return false;
+        return !el.checkValidity();
+      });
+      if (invalidControls.length) {
+        firstInvalid = invalidControls[0];
+        firstInvalid.reportValidity();
+        return { errors: ["Some required fields are missing or out of range."], firstInvalid };
+      }
+    } else {
+      const numberRules = [
+        ["#std-positive-budget", "Positive sample budget", 1000, 300000],
+        ["#std-negative-budget", "Negative sample budget", 1000, 300000],
+        ["#std-augmentation-rounds", "Augmentation rounds", 0, 10],
+        ["#std-training-steps", "Training steps", 20000, 300000],
+        ["#std-fp-penalty", "False-positive penalty", 50, 2000],
+        ["#std-nn-depth", "NN depth", 1, 5],
+      ];
+      numberRules.forEach(([selector, label, min, max]) => {
+        const el = $(selector);
+        const value = Number(el?.value);
+        if (!el || !Number.isFinite(value) || value < min || value > max) {
+          errors.push(`${label} must be between ${min} and ${max}.`);
+          if (!firstInvalid) firstInvalid = el;
+        }
+      });
     }
 
     // Custom: at least one voice source.
@@ -431,6 +647,7 @@
   $("#train-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const form = e.target;
+    applyStandardControlsToForm();
 
     const { errors, firstInvalid } = validateTrainForm(form);
     if (errors.length) {
@@ -506,6 +723,7 @@
           .split("\n")
           .map((s) => s.trim())
           .filter(Boolean),
+        positive_sample_budget: vNum("positive_sample_budget", 0),
         n_positive_per_phrase_per_voice: vNum("n_positive_per_phrase_per_voice", 10),
         negative_phrases: String(v("negative_phrases"))
           .split("\n")
@@ -611,7 +829,7 @@
 
     const isRunning = runStatus === "running";
     const progressBelongsToCurrentSession =
-      !currentSession || !progressRunId || currentSession.id === progressRunId;
+      !progressRunId || (currentSession && currentSession.id === progressRunId);
     const showProgress =
       isRunning ||
       ((hasRunProgress || !["idle", ""].includes(runStatus)) && progressBelongsToCurrentSession);
@@ -713,8 +931,7 @@
       progress.run_id ||
       progress.phase ||
       (progress.progress || []).length ||
-      Object.keys(progress.metrics || {}).length ||
-      (progress.logs || []).length
+      Object.keys(progress.metrics || {}).length
     );
     if (progress.phase?.name && phaseBanner) {
       phaseBanner.textContent =
@@ -802,8 +1019,10 @@
   });
   es.addEventListener("log", (e) => {
     const d = JSON.parse(e.data);
-    hasRunProgress = true;
-    if (progressCard) progressCard.hidden = false;
+    if (progressRunId || hasRunProgress || runStatus === "running") {
+      hasRunProgress = true;
+      if (progressCard) progressCard.hidden = false;
+    }
     appendLog(d.level, d.message, d.ts);
   });
   es.addEventListener("run_started", (e) => {
@@ -916,168 +1135,37 @@
   });
   updateModelInfo();
 
-  $("#stress-form")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const modelName = $("#test-model")?.value;
-    if (!modelName) {
-      alert("No model selected.");
-      return;
-    }
-    const form = e.target;
-    const fd = new FormData(form);
-    const payload = {
-      model_name: modelName,
-      threshold: Number(fd.get("threshold") || 0.5),
-      max_windows: Number(fd.get("max_windows") || 0),
-      batch_size: Number(fd.get("batch_size") || 8192),
-      include_session: fd.has("include_session"),
-      include_validation: fd.has("include_validation"),
-      include_acav100m: fd.has("include_acav100m"),
-      use_cuda: fd.has("use_cuda"),
-    };
-    const status = $("#stress-status");
-    const btn = $("#stress-run-btn");
-    if (status) {
-      status.textContent = "running...";
-      status.className = "pill running";
-    }
-    if (btn) btn.disabled = true;
-    try {
-      const res = await fetch("/api/test/stress", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        throw new Error(await res.text());
-      }
-      const result = await res.json();
-      renderStressResult(result);
-      if (status) {
-        status.textContent = "complete";
-        status.className = "pill succeeded";
-      }
-    } catch (err) {
-      if (status) {
-        status.textContent = "failed";
-        status.className = "pill failed";
-      }
-      alert("Stress test failed: " + (err?.message || err));
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  });
-
-  function fmtScore(v) {
-    return typeof v === "number" && Number.isFinite(v) ? v.toFixed(4) : "-";
-  }
-
-  function fmtRate(v) {
-    return typeof v === "number" && Number.isFinite(v) ? v.toFixed(3) : "-";
-  }
-
-  function renderStressResult(report) {
-    const out = $("#stress-result");
-    if (!out) return;
-    const reports = report.reports || [];
-    const negativeReports = reports.filter((r) => r.kind === "negative");
-    const totalHours = negativeReports.reduce((acc, r) => acc + (Number(r.hours) || 0), 0);
-    const totalEvents = negativeReports.reduce((acc, r) => acc + (Number(r.events) || 0), 0);
-    const aggregateFpHr = totalHours > 0 ? totalEvents / totalHours : 0;
-    const skipped = report.skipped_sources || [];
-
-    const rows = reports.map((r) => {
-      const s = r.score || {};
-      if (r.kind === "positive") {
-        const count = r.clips ?? r.windows ?? 0;
-        return `
-          <tr>
-            <td>${escapeHtml(r.name)}</td>
-            <td>positive</td>
-            <td>${Number(count).toLocaleString()}</td>
-            <td>-</td>
-            <td>-</td>
-            <td>${fmtRate(r.recall)}</td>
-            <td>${fmtScore(s.p10)}</td>
-            <td>${fmtScore(s.p50)}</td>
-            <td>${fmtScore(s.max)}</td>
-          </tr>
-        `;
-      }
-      return `
-        <tr>
-          <td>${escapeHtml(r.name)}</td>
-          <td>negative</td>
-          <td>${Number(r.windows || 0).toLocaleString()}</td>
-          <td>${fmtRate(r.hours)}</td>
-          <td>${Number(r.events || 0).toLocaleString()}</td>
-          <td>${fmtRate(r.fp_per_hour)}</td>
-          <td>${fmtScore(s.p99)}</td>
-          <td>${fmtScore(s.p99_9)}</td>
-          <td>${fmtScore(s.max)}</td>
-        </tr>
-      `;
-    }).join("");
-
-    const skippedHtml = skipped.length
-      ? `<p class="hint">Skipped: ${skipped.map((s) => `${escapeHtml(s.name)} (${escapeHtml(s.reason)})`).join(", ")}</p>`
-      : "";
-
-    out.innerHTML = `
-      <div class="metrics stress-summary">
-        <div class="metric-tile">
-          <div class="name">Aggregate FP/hr</div>
-          <div class="value">${fmtRate(aggregateFpHr)}</div>
-        </div>
-        <div class="metric-tile">
-          <div class="name">Negative hours</div>
-          <div class="value">${fmtRate(totalHours)}</div>
-        </div>
-        <div class="metric-tile">
-          <div class="name">Events</div>
-          <div class="value">${Number(totalEvents || 0).toLocaleString()}</div>
-        </div>
-        <div class="metric-tile">
-          <div class="name">Provider</div>
-          <div class="value">${escapeHtml((report.providers || []).join(", ") || "-")}</div>
-        </div>
-      </div>
-      <div class="table-wrap">
-        <table class="session-table stress-table">
-          <thead>
-            <tr>
-              <th>Source</th>
-              <th>Kind</th>
-              <th>Windows / clips</th>
-              <th>Hours</th>
-              <th>Events</th>
-              <th>FP/hr or recall</th>
-              <th>p99 / p10</th>
-              <th>p99.9 / p50</th>
-              <th>Max</th>
-            </tr>
-          </thead>
-          <tbody>${rows || `<tr><td colspan="9" class="empty-row">No reports returned.</td></tr>`}</tbody>
-        </table>
-      </div>
-      ${skippedHtml}
-    `;
-  }
-
   // ---------- Mic recording with HTTPS gate ----------
 
   let mediaRecorder = null;
   let recordedChunks = [];
+  let liveSocket = null;
+  let liveAudioContext = null;
+  let liveStream = null;
+  let liveSource = null;
+  let liveProcessor = null;
+  let liveScores = [];
 
   const isSecure = window.isSecureContext || location.hostname === "localhost" || location.hostname === "127.0.0.1";
   const recordBtn = $("#record-btn");
   const stopBtn = $("#stop-record-btn");
+  const liveStartBtn = $("#live-start-btn");
+  const liveStopBtn = $("#live-stop-btn");
   const micHint = $("#mic-hint");
+  const livePanel = $("#live-panel");
+  const liveLogEl = $("#live-log");
+  const liveCanvas = $("#live-score-canvas");
+  const liveSensitivity = $("#live-sensitivity");
+  const testThresholdInput = $("#test-threshold");
 
   if (!isSecure) {
     if (recordBtn) {
       recordBtn.disabled = true;
       recordBtn.title = "Microphone recording requires HTTPS (or localhost).";
+    }
+    if (liveStartBtn) {
+      liveStartBtn.disabled = true;
+      liveStartBtn.title = "Live microphone testing requires HTTPS (or localhost).";
     }
     if (micHint) {
       micHint.textContent = "mic disabled - HTTPS required";
@@ -1086,6 +1174,230 @@
   } else if (micHint) {
     micHint.textContent = "mic ready";
   }
+
+  function liveWsUrl() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${location.host}/api/test/live`;
+  }
+
+  function appendLiveLog(level, message) {
+    if (!liveLogEl) return;
+    const ts = new Date().toLocaleTimeString();
+    liveLogEl.textContent += `[${ts}] ${level || "info"}: ${message}\n`;
+    liveLogEl.scrollTop = liveLogEl.scrollHeight;
+  }
+
+  function setLiveMetric(id, value) {
+    const el = $(id);
+    if (el) el.textContent = value;
+  }
+
+  function drawLiveGraph(cutoff) {
+    if (!liveCanvas) return;
+    const ctx = liveCanvas.getContext("2d");
+    const w = liveCanvas.width;
+    const h = liveCanvas.height;
+    ctx.fillStyle = "#06090e";
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = "#30363d";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i += 1) {
+      const y = (i / 4) * h;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+    const thY = h - Math.max(0, Math.min(1, cutoff || 0.5)) * h;
+    ctx.strokeStyle = "#d29922";
+    ctx.beginPath();
+    ctx.moveTo(0, thY);
+    ctx.lineTo(w, thY);
+    ctx.stroke();
+    if (!liveScores.length) return;
+    ctx.strokeStyle = "#58a6ff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    liveScores.forEach((p, i) => {
+      const x = (i / Math.max(1, liveScores.length - 1)) * w;
+      const y = h - Math.max(0, Math.min(1, p.score)) * h;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    const last = liveScores[liveScores.length - 1];
+    if (last?.triggered) {
+      ctx.fillStyle = "#3fb950";
+      ctx.beginPath();
+      ctx.arc(w - 12, h - Math.max(0, Math.min(1, last.score)) * h, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function downsampleFloat32(input, inputRate, outputRate) {
+    if (inputRate === outputRate) return new Float32Array(input);
+    const ratio = inputRate / outputRate;
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i += 1) {
+      const start = Math.floor(i * ratio);
+      const end = Math.min(input.length, Math.floor((i + 1) * ratio));
+      let sum = 0;
+      let count = 0;
+      for (let j = start; j < end; j += 1) {
+        sum += input[j];
+        count += 1;
+      }
+      out[i] = count ? sum / count : input[start] || 0;
+    }
+    return out;
+  }
+
+  function currentLiveConfig() {
+    return {
+      model_name: $("#test-model")?.value || "",
+      threshold: Number(testThresholdInput?.value || 0.5),
+      sensitivity: liveSensitivity?.value || "Moderately sensitive",
+    };
+  }
+
+  function sendLiveConfig() {
+    if (liveSocket?.readyState !== WebSocket.OPEN) return;
+    liveSocket.send(JSON.stringify({ type: "config", ...currentLiveConfig() }));
+  }
+
+  async function stopLiveMic() {
+    if (liveProcessor) {
+      liveProcessor.disconnect();
+      liveProcessor.onaudioprocess = null;
+      liveProcessor = null;
+    }
+    if (liveSource) {
+      liveSource.disconnect();
+      liveSource = null;
+    }
+    if (liveStream) {
+      liveStream.getTracks().forEach((t) => t.stop());
+      liveStream = null;
+    }
+    if (liveAudioContext) {
+      await liveAudioContext.close().catch(() => {});
+      liveAudioContext = null;
+    }
+    if (liveSocket && liveSocket.readyState === WebSocket.OPEN) {
+      liveSocket.send(JSON.stringify({ type: "stop" }));
+      liveSocket.close();
+    }
+    liveSocket = null;
+    if (liveStartBtn) liveStartBtn.disabled = !isSecure;
+    if (liveStopBtn) liveStopBtn.disabled = true;
+    if (recordBtn) recordBtn.disabled = !isSecure;
+    if (micHint && isSecure) micHint.textContent = "mic ready";
+  }
+
+  async function startLiveMic() {
+    const cfg = currentLiveConfig();
+    if (!cfg.model_name) {
+      alert("No model selected.");
+      return;
+    }
+    if (!isSecure || liveSocket) return;
+    liveScores = [];
+    if (liveLogEl) liveLogEl.textContent = "";
+    if (livePanel) livePanel.hidden = false;
+    setLiveMetric("#live-score", "0.000");
+    setLiveMetric("#live-peak", "0.000");
+    setLiveMetric("#live-gate", "starting");
+    drawLiveGraph(cfg.threshold);
+
+    liveSocket = new WebSocket(liveWsUrl());
+    liveSocket.binaryType = "arraybuffer";
+    liveSocket.onopen = async () => {
+      liveSocket.send(JSON.stringify(cfg));
+      try {
+        liveStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
+        liveAudioContext = new AudioContext();
+        liveSource = liveAudioContext.createMediaStreamSource(liveStream);
+        liveProcessor = liveAudioContext.createScriptProcessor(4096, 1, 1);
+        liveProcessor.onaudioprocess = (ev) => {
+          const input = ev.inputBuffer.getChannelData(0);
+          ev.outputBuffer.getChannelData(0).fill(0);
+          if (liveSocket?.readyState !== WebSocket.OPEN) return;
+          const pcm16k = downsampleFloat32(input, liveAudioContext.sampleRate, 16000);
+          if (pcm16k.byteLength) liveSocket.send(pcm16k.buffer);
+        };
+        liveSource.connect(liveProcessor);
+        liveProcessor.connect(liveAudioContext.destination);
+        if (liveStartBtn) liveStartBtn.disabled = true;
+        if (liveStopBtn) liveStopBtn.disabled = false;
+        if (recordBtn) recordBtn.disabled = true;
+        if (micHint) micHint.textContent = "live mic running";
+        appendLiveLog("info", "live microphone stream started");
+      } catch (err) {
+        appendLiveLog("error", err?.message || err);
+        alert("Live mic failed: " + (err?.message || err));
+        stopLiveMic();
+      }
+    };
+    liveSocket.onmessage = (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (msg.type === "ready" || msg.type === "config") {
+        setLiveMetric("#live-cutoff", Number(msg.cutoff || 0).toFixed(3));
+        setLiveMetric("#live-gate", msg.type === "ready" ? "ready" : "updated");
+        appendLiveLog("info", msg.message || `cutoff=${Number(msg.cutoff || 0).toFixed(3)}`);
+        drawLiveGraph(Number(msg.cutoff || 0.5));
+        return;
+      }
+      if (msg.type === "score") {
+        liveScores.push(msg);
+        if (liveScores.length > 240) liveScores = liveScores.slice(-240);
+        setLiveMetric("#live-score", Number(msg.score || 0).toFixed(3));
+        setLiveMetric("#live-peak", Number(msg.peak || 0).toFixed(3));
+        setLiveMetric("#live-cutoff", Number(msg.cutoff || 0).toFixed(3));
+        setLiveMetric("#live-gate", msg.gate || "-");
+        drawLiveGraph(Number(msg.cutoff || 0.5));
+        if (msg.triggered) {
+          appendLiveLog(
+            "detect",
+            `triggered score=${Number(msg.score).toFixed(3)} cutoff=${Number(msg.cutoff).toFixed(3)} gate=${msg.gate}`
+          );
+        } else if (msg.message && msg.gate !== "warming") {
+          appendLiveLog("info", msg.message);
+        }
+        return;
+      }
+      if (msg.type === "log" || msg.type === "error") {
+        appendLiveLog(msg.level || msg.type, msg.message || "");
+      }
+    };
+    liveSocket.onclose = () => {
+      appendLiveLog("info", "live microphone stream closed");
+      stopLiveMic();
+    };
+    liveSocket.onerror = () => {
+      appendLiveLog("error", "live WebSocket error");
+    };
+  }
+
+  liveStartBtn?.addEventListener("click", startLiveMic);
+  liveStopBtn?.addEventListener("click", stopLiveMic);
+  liveSensitivity?.addEventListener("change", sendLiveConfig);
+  testThresholdInput?.addEventListener("change", sendLiveConfig);
+  $("#test-model")?.addEventListener("change", () => {
+    if (liveSocket) stopLiveMic();
+  });
 
   recordBtn?.addEventListener("click", async () => {
     if (!isSecure) return;

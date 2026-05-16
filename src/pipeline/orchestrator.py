@@ -524,6 +524,58 @@ def _generate_kokoro_samples(
     return written
 
 
+def _resolve_positive_generation_counts(
+    cfg: TrainRunConfig,
+    phrases: list[str],
+) -> tuple[int, int]:
+    """Resolve Piper/Kokoro positive render counts from an optional total budget."""
+    phrase_count = max(1, len(phrases))
+    piper_voice_count = len(cfg.generation.piper_voices)
+    kokoro_voice_count = (
+        len(cfg.generation.kokoro_voices)
+        if cfg.generation.use_kokoro
+        else 0
+    )
+    budget = int(cfg.generation.positive_sample_budget or 0)
+    if budget <= 0:
+        return (
+            cfg.generation.n_positive_per_phrase_per_voice,
+            cfg.generation.n_kokoro_positive_per_phrase_per_voice,
+        )
+
+    if piper_voice_count <= 0 and kokoro_voice_count <= 0:
+        return (0, 0)
+
+    if piper_voice_count and kokoro_voice_count:
+        piper_budget = round(budget * 0.9)
+        kokoro_budget = max(0, budget - piper_budget)
+    elif piper_voice_count:
+        piper_budget = budget
+        kokoro_budget = 0
+    else:
+        piper_budget = 0
+        kokoro_budget = budget
+
+    def ceil_div(value: int, denom: int) -> int:
+        if value <= 0 or denom <= 0:
+            return 0
+        return max(1, (value + denom - 1) // denom)
+
+    piper_n = ceil_div(piper_budget, phrase_count * piper_voice_count)
+    kokoro_n = ceil_div(kokoro_budget, phrase_count * kokoro_voice_count)
+    resolved_total = (
+        phrase_count * piper_voice_count * piper_n
+        + phrase_count * kokoro_voice_count * kokoro_n
+    )
+    bus.log(
+        "Positive sample budget resolved: "
+        f"target={budget:,}, actual={resolved_total:,}, "
+        f"piper_per_phrase_per_voice={piper_n}, "
+        f"kokoro_per_phrase_per_voice={kokoro_n}"
+    )
+    return (piper_n, kokoro_n)
+
+
 def _atomic_write_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
@@ -1445,6 +1497,10 @@ def _run(cfg: TrainRunConfig) -> None:
 
         # 2. Positive phrases
         positive_phrases = cfg.generation.positive_phrases or [cfg.wake_word]
+        piper_positive_count, kokoro_positive_count = _resolve_positive_generation_counts(
+            cfg,
+            positive_phrases,
+        )
         kokoro = (
             KokoroGenerator()
             if cfg.generation.use_kokoro and cfg.generation.kokoro_voices
@@ -1455,7 +1511,7 @@ def _run(cfg: TrainRunConfig) -> None:
             positive_phrases,
             run_dir / "wavs" / "positive",
             cfg,
-            cfg.generation.n_positive_per_phrase_per_voice,
+            piper_positive_count,
             label="pos",
         )
         positive_wavs.extend(
@@ -1463,7 +1519,7 @@ def _run(cfg: TrainRunConfig) -> None:
                 positive_phrases,
                 run_dir / "wavs" / "positive",
                 cfg,
-                cfg.generation.n_kokoro_positive_per_phrase_per_voice,
+                kokoro_positive_count,
                 label="pos",
                 kokoro=kokoro,
             )
