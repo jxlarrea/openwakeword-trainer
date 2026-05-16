@@ -256,7 +256,7 @@ def register_routes(api: APIRouter) -> None:
             {
                 **_common_template_context(include_voices=False),
                 "active_page": "system",
-                "disk": disk_cache_summary(),
+                "disk": disk_cache_summary(include_sizes=False),
             },
         )
 
@@ -267,8 +267,8 @@ def register_routes(api: APIRouter) -> None:
         return list_sessions()
 
     @api.get("/api/system/disk")
-    def system_disk():
-        return disk_cache_summary()
+    def system_disk(refresh: bool = False, sizes: bool = True):
+        return disk_cache_summary(include_sizes=sizes, use_cache=not refresh)
 
     @api.delete("/api/system/sessions/{session_id}/cache")
     def system_session_cache_delete(session_id: str):
@@ -877,7 +877,7 @@ def _form_to_config_payload(form) -> dict:
             "hard_negative_mining_top_k": _int("hard_negative_mining_top_k", 50000),
             "hard_negative_finetune_steps": _int("hard_negative_finetune_steps", 0),
             "hard_negative_finetune_positive_fraction": _float("hard_negative_finetune_positive_fraction", 0.5),
-            "max_steps": _int("max_steps", 50000),
+            "max_steps": _int("max_steps", 115000),
             "val_every_n_steps": _int("val_every_n_steps", 500),
             "early_stop_patience": _int("early_stop_patience", 40),
             "early_stop_min_steps": _int("early_stop_min_steps", 30000),

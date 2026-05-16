@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import logging
 import gc
+import json
 import os
 import random
 from collections.abc import Iterator
 from itertools import groupby
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -93,10 +95,57 @@ def _worker_apply_ort_thread_cap() -> None:
         if sess_options.intra_op_num_threads == 0:
             sess_options.intra_op_num_threads = n_threads
             sess_options.inter_op_num_threads = 1
+        if _should_prefer_tensorrt(providers, ort):
+            providers = _with_tensorrt_provider(providers)
         return _orig_init(self, *args, sess_options=sess_options, providers=providers, **kwargs)
 
     ort.InferenceSession.__init__ = _patched_init
     _WORKER_ORT_PATCHED = True
+
+
+def _should_prefer_tensorrt(providers: Any, ort: Any) -> bool:
+    requested = os.environ.get("OWW_PIPER_USE_TENSORRT", "false").lower()
+    if requested in ("0", "false", "no", "off"):
+        return False
+    if requested == "auto":
+        from ctypes.util import find_library
+
+        if not find_library("nvinfer"):
+            return False
+    elif requested not in ("1", "true", "yes", "on"):
+        return False
+    if "TensorrtExecutionProvider" not in ort.get_available_providers():
+        return False
+    if providers is None:
+        return False
+    provider_names = []
+    for provider in providers:
+        provider_names.append(provider[0] if isinstance(provider, tuple) else provider)
+    return (
+        "CUDAExecutionProvider" in provider_names
+        and "TensorrtExecutionProvider" not in provider_names
+    )
+
+
+def _with_tensorrt_provider(providers: Any) -> list[Any]:
+    cache_dir = Path(
+        os.environ.get("OWW_TENSORRT_CACHE_DIR", "/data/cache/tensorrt/piper")
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    trt_provider = (
+        "TensorrtExecutionProvider",
+        {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": str(cache_dir),
+            "trt_timing_cache_enable": True,
+            "trt_timing_cache_path": str(cache_dir),
+        },
+    )
+    provider_list = list(providers or [])
+    has_cpu = any((p[0] if isinstance(p, tuple) else p) == "CPUExecutionProvider" for p in provider_list)
+    if not has_cpu:
+        provider_list.append("CPUExecutionProvider")
+    return [trt_provider, *provider_list]
 
 
 def _worker_init(use_cuda: bool = False) -> None:
@@ -136,6 +185,44 @@ def _worker_release_voice_cache() -> None:
     gc.collect()
 
 
+def _worker_write_outputs(
+    wav_path: Path,
+    audio: np.ndarray,
+    sample_rate: int,
+    task: dict[str, Any],
+) -> None:
+    """Write a generated sample from the worker that synthesized it."""
+    import soundfile as sf
+
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_wav = wav_path.with_suffix(wav_path.suffix + ".tmp")
+    sf.write(tmp_wav, audio, sample_rate, subtype="PCM_16", format="WAV")
+    tmp_wav.replace(wav_path)
+
+    metadata_path = wav_path.with_suffix(".json")
+    tmp_metadata = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    tmp_metadata.write_text(
+        json.dumps(
+            {
+                "engine": "piper",
+                "label": task.get("label", ""),
+                "text": task["text"],
+                "voice": task["voice_key"],
+                "sample_rate": sample_rate,
+                "metadata": {
+                    "speaker_id": task["speaker_id"],
+                    "length_scale": task["length_scale"],
+                    "noise_scale": task["noise_scale"],
+                    "noise_w_scale": task["noise_w_scale"],
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    tmp_metadata.replace(metadata_path)
+
+
 def _worker_synth(task: dict[str, Any]) -> dict[str, Any] | None:
     """Synthesize one task in a worker. Returns dict or None on failure."""
     try:
@@ -155,6 +242,10 @@ def _worker_synth(task: dict[str, Any]) -> dict[str, Any] | None:
             chunks.append(np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16))
         audio_int16 = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
         audio = _resample_to_16k(audio_int16, sample_rate)
+        if task.get("output_path"):
+            wav_path = Path(task["output_path"])
+            _worker_write_outputs(wav_path, audio, TARGET_SAMPLE_RATE, task)
+            return {"path": str(wav_path)}
         return {
             "audio_bytes": audio.tobytes(),
             "text": task["text"],
@@ -203,6 +294,7 @@ class PiperGenerator:
         info = get_voice_info(key)
         onnx_path, cfg_path = ensure_voice_downloaded(info)
         logger.info("Loading Piper voice: %s (cuda=%s)", key, self.use_cuda)
+        _worker_apply_ort_thread_cap()
         voice = PiperVoice.load(
             str(onnx_path),
             config_path=str(cfg_path),
@@ -376,7 +468,13 @@ class PiperGenerator:
         # nearly all RAM. Per-voice pools bound peak memory to
         # `workers * one voice`, and exiting the pool releases that cache.
         ctx = get_context("spawn")
-        max_tasks_per_child = int(os.environ.get("OWW_PIPER_MAX_TASKS_PER_CHILD", "250"))
+        # Pools are scoped to a single voice, so every worker can only hold one
+        # Piper ONNX session at a time. Recycling children inside that per-voice
+        # pool forces expensive session reloads and CUDA context churn during
+        # large positive/adversarial generations. Keep recycling opt-in for
+        # debugging unusual leaks, but default to disabled.
+        max_tasks_per_child = int(os.environ.get("OWW_PIPER_MAX_TASKS_PER_CHILD", "0"))
+        chunksize = max(1, int(os.environ.get("OWW_PIPER_CHUNKSIZE", str(chunksize))))
         pool_kwargs = {}
         if max_tasks_per_child > 0:
             pool_kwargs["maxtasksperchild"] = max_tasks_per_child
@@ -400,6 +498,56 @@ class PiperGenerator:
                         voice=result["voice"],
                         metadata=result["metadata"],
                     )
+
+    def iter_parallel_to_wavs(
+        self,
+        tasks: list[dict[str, Any]],
+        workers: int,
+        out_dir: Path,
+        label: str,
+        start_index: int = 0,
+        chunksize: int = 4,
+    ) -> Iterator[Path]:
+        """Synthesize tasks in workers and write WAV/metadata files there."""
+        if not tasks:
+            return
+
+        write_tasks: list[dict[str, Any]] = []
+        for offset, task in enumerate(tasks):
+            wav_path = out_dir / f"piper_{label}_{start_index + offset:07d}.wav"
+            write_task = dict(task)
+            write_task["output_path"] = str(wav_path)
+            write_task["label"] = label
+            write_tasks.append(write_task)
+
+        if workers <= 1:
+            for task in write_tasks:
+                result = _worker_synth(task)
+                if result is not None and result.get("path"):
+                    yield Path(result["path"])
+            return
+
+        from multiprocessing import get_context
+
+        ctx = get_context("spawn")
+        max_tasks_per_child = int(os.environ.get("OWW_PIPER_MAX_TASKS_PER_CHILD", "0"))
+        chunksize = max(1, int(os.environ.get("OWW_PIPER_CHUNKSIZE", str(chunksize))))
+        pool_kwargs = {}
+        if max_tasks_per_child > 0:
+            pool_kwargs["maxtasksperchild"] = max_tasks_per_child
+
+        sorted_tasks = sorted(write_tasks, key=lambda t: t["voice_key"])
+        for _voice_key, voice_group in groupby(sorted_tasks, key=lambda t: t["voice_key"]):
+            voice_tasks = list(voice_group)
+            with ctx.Pool(
+                processes=workers,
+                initializer=_worker_init,
+                initargs=(self.use_cuda,),
+                **pool_kwargs,
+            ) as pool:
+                for result in pool.imap_unordered(_worker_synth, voice_tasks, chunksize=chunksize):
+                    if result is not None and result.get("path"):
+                        yield Path(result["path"])
 
     def _inline_iter(self, tasks: list[dict[str, Any]]) -> Iterator[GeneratedSample]:
         """Inline (single-process) fallback. Same output contract as iter_parallel."""

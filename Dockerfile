@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 #
 # OpenWakeWord Trainer - CUDA build.
 #
@@ -33,6 +32,7 @@ ARG BUILD_PARALLEL=8
 # ============================================================================
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS ort-builder
 
+ARG CUDA_VERSION
 ARG ORT_VERSION
 ARG ORT_PIP_VERSION
 ARG ORT_BUILD_FROM_SOURCE
@@ -47,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ninja-build \
         ca-certificates curl \
     && ln -sf /usr/bin/python3.10 /usr/local/bin/python \
+    && ldconfig /usr/local/cuda-$(echo "${CUDA_VERSION}" | cut -d. -f1,2)/compat/ || true \
     && rm -rf /var/lib/apt/lists/*
 
 # Build dependencies. Ubuntu 22.04 ships cmake 3.22, but onnxruntime v1.20+
@@ -117,6 +118,8 @@ RUN set -eux; \
 # ============================================================================
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS base
 
+ARG CUDA_VERSION
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -133,6 +136,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git tini \
     && ln -sf /usr/bin/python3.10 /usr/local/bin/python \
     && ln -sf /usr/bin/python3.10 /usr/local/bin/python3 \
+    && ldconfig /usr/local/cuda-$(echo "${CUDA_VERSION}" | cut -d. -f1,2)/compat/ || true \
     && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/opt/venv

@@ -73,7 +73,7 @@
 
       <div id="standard-controls" class="standard-controls">
         <div class="standard-summary" id="profile-summary">
-          Optimized for wall-mounted tablets, off-axis speech, room echo, and TV/media playback.
+          Wall-mounted tablet defaults: the v24 recipe tuned for off-axis speech, room echo, TV/media playback, and low false positives.
         </div>
         <div class="standard-grid">
           <label>Positive sample budget
@@ -89,7 +89,7 @@
             <small class="hint">Each round adds room, noise, and device variation.</small>
           </label>
           <label>Training steps
-            <input type="number" id="std-training-steps" min="20000" max="300000" step="5000" value="50000">
+            <input type="number" id="std-training-steps" min="20000" max="300000" step="5000" value="115000">
             <small class="hint">Longer schedules can improve quality but cost more time.</small>
           </label>
           <label>False-positive penalty
@@ -200,7 +200,7 @@
       <legend>Sample volume</legend>
       <div class="grid">
         <label>Positive sample budget
-          <input type="number" name="positive_sample_budget" value="0" min="0" max="300000" step="1000" required>
+          <input type="number" name="positive_sample_budget" value="200000" min="0" max="300000" step="1000" required>
           <small class="hint">0 uses exact per-voice counts below. Standard profiles set this to an openwakeword.com-style total.</small>
         </label>
         <label>Positives per phrase per voice
@@ -371,7 +371,7 @@
           <small class="hint">Positive fraction used only during mined hard-negative fine-tuning.</small>
         </label>
         <label>Max steps
-          <input type="number" name="max_steps" value="50000" min="500" max="500000" required>
+          <input type="number" name="max_steps" value="115000" min="500" max="500000" required>
           <small class="hint">Hard cap on training steps. Early-stop usually kicks in well before this.</small>
         </label>
         <label>Validate every N steps
@@ -427,7 +427,7 @@
           <small class="hint">Number of held-out generated positive WAVs scored as full sliding curves.</small>
         </label>
         <label>Minimum curve recall
-          <input type="number" name="min_curve_recall_for_export" value="0.6" min="0" max="1" step="0.01" required>
+          <input type="number" name="min_curve_recall_for_export" value="0.65" min="0" max="1" step="0.01" required>
           <small class="hint">Fraction of held-out positive WAVs that must cross the runtime 0.5 threshold.</small>
         </label>
         <label>Minimum curve median peak
@@ -447,7 +447,7 @@
           <small class="hint">Median activation span required across held-out positive WAVs.</small>
         </label>
         <label>Minimum curve confirmation rate
-          <input type="number" name="min_curve_confirmation_rate_for_export" value="0.25" min="0" max="1" step="0.01" required>
+          <input type="number" name="min_curve_confirmation_rate_for_export" value="0.3" min="0" max="1" step="0.01" required>
           <small class="hint">Fraction of positives with a second above-threshold hit after the configured gap.</small>
         </label>
         <div class="check-row">

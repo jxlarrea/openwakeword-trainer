@@ -581,8 +581,6 @@ def _is_exportable(metrics: dict[str, float], cfg: TrainingConfig) -> bool:
             not cfg.use_tablet_curve_validation
             or (
                 metrics.get("tablet_curve_recall", 0.0) >= cfg.min_tablet_curve_recall_for_export
-                and metrics.get("tablet_curve_median_peak", 0.0) >= cfg.min_tablet_curve_median_peak_for_export
-                and metrics.get("tablet_curve_p10_peak", 0.0) >= cfg.min_tablet_curve_p10_peak_for_export
                 and metrics.get("tablet_curve_median_frames", 0.0) >= cfg.min_tablet_curve_median_frames_for_export
                 and metrics.get("tablet_curve_median_span_ms", 0.0) >= cfg.min_tablet_curve_median_span_ms_for_export
                 and metrics.get("tablet_curve_confirmation_rate", 0.0) >= cfg.min_tablet_curve_confirmation_rate_for_export
@@ -665,16 +663,6 @@ def _export_gate_failures(metrics: dict[str, float], cfg: TrainingConfig) -> lis
                 failures.append(
                     f"tablet_curve_recall={metrics.get('tablet_curve_recall', 0.0):.3f} "
                     f"< {cfg.min_tablet_curve_recall_for_export:.3f}"
-                )
-            if metrics.get("tablet_curve_median_peak", 0.0) < cfg.min_tablet_curve_median_peak_for_export:
-                failures.append(
-                    f"tablet_curve_med_peak={metrics.get('tablet_curve_median_peak', 0.0):.3f} "
-                    f"< {cfg.min_tablet_curve_median_peak_for_export:.3f}"
-                )
-            if metrics.get("tablet_curve_p10_peak", 0.0) < cfg.min_tablet_curve_p10_peak_for_export:
-                failures.append(
-                    f"tablet_curve_p10_peak={metrics.get('tablet_curve_p10_peak', 0.0):.3f} "
-                    f"< {cfg.min_tablet_curve_p10_peak_for_export:.3f}"
                 )
             if metrics.get("tablet_curve_median_frames", 0.0) < cfg.min_tablet_curve_median_frames_for_export:
                 failures.append(

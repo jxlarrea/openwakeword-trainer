@@ -142,32 +142,90 @@
     },
     tablet: {
       summary:
-        "Optimized for wall-mounted tablets, off-axis speech, room echo, and TV/media playback.",
+        "Wall-mounted tablet defaults: the v24 recipe tuned for off-axis speech, room echo, TV/media playback, and low false positives.",
       positiveBudget: 200000,
       negativeBudget: 240000,
       augmentationRounds: 6,
-      trainingSteps: 50000,
+      trainingSteps: 115000,
       fpPenalty: 1000,
       layerSize: 64,
       nnDepth: 3,
       values: {
         positive_sample_budget: 200000,
         n_positive_per_phrase_per_voice: 10,
+        n_negative_per_phrase_per_voice: 5,
+        n_adversarial_phrases: 8000,
+        n_adversarial_per_phrase_per_voice: 1,
+        use_kokoro: true,
         n_kokoro_positive_per_phrase_per_voice: 3,
+        use_kokoro_for_negatives: true,
+        n_kokoro_negative_per_phrase_per_voice: 1,
+        kokoro_speed_min: 0.9,
+        kokoro_speed_max: 1.1,
         augmentations_per_clip: 6,
         use_tablet_far_field_augmentation: true,
         tablet_far_field_probability: 0.75,
         rir_probability: 0.9,
         background_noise_probability: 0.75,
-        max_steps: 50000,
+        use_mit_rirs: true,
+        use_but_reverbdb: true,
+        use_musan_noise: true,
+        use_musan_music: true,
+        use_fsd50k: true,
+        use_common_voice_negatives: true,
+        use_openwakeword_negative_features: true,
+        use_openwakeword_validation_features: true,
+        common_voice_subset: 100000,
+        model_type: "dnn",
+        max_steps: 115000,
         early_stop_min_steps: 30000,
+        early_stop_patience: 40,
+        val_every_n_steps: 500,
+        learning_rate: 0.0001,
+        weight_decay: 0.01,
+        use_focal_loss: true,
+        focal_gamma: 2,
+        label_smoothing: 0.05,
+        mixup_alpha: 0.2,
+        batch_size: 2048,
+        positive_sample_fraction: 0.08,
+        negative_loss_weight: 1,
         max_negative_loss_weight: 1000,
+        hard_negative_loss_weight: 1,
+        hard_negative_threshold: 0.9,
+        hard_negative_mining_top_k: 50000,
+        hard_negative_finetune_steps: 0,
+        hard_negative_finetune_positive_fraction: 0.5,
+        lr_warmup_fraction: 0.2,
+        lr_hold_fraction: 0.33,
+        lr_reduce_on_plateau: false,
         layer_dim: 64,
         n_blocks: 3,
-        min_curve_recall_for_export: 0.6,
-        min_curve_confirmation_rate_for_export: 0.25,
+        target_false_positives_per_hour: 0.5,
+        min_recall_at_target_fp_for_export: 0.7,
+        max_calibration_threshold_for_export: 0.8,
+        min_recall_at_0_5_for_export: 0.8,
+        max_fp_per_hour_at_0_5_for_export: 10,
+        min_positive_median_score_for_export: 0.75,
+        min_positive_p10_score_for_export: 0.35,
+        use_positive_curve_validation: true,
+        curve_validation_max_positive_clips: 400,
+        min_curve_recall_for_export: 0.65,
+        min_curve_median_peak_for_export: 0.78,
+        min_curve_p10_peak_for_export: 0.02,
+        min_curve_median_frames_for_export: 2,
+        min_curve_median_span_ms_for_export: 160,
+        min_curve_confirmation_rate_for_export: 0.3,
+        use_tablet_curve_validation: true,
+        tablet_curve_validation_variants_per_clip: 1,
+        min_tablet_curve_recall_for_export: 0.24,
         min_tablet_curve_median_peak_for_export: 0,
         min_tablet_curve_p10_peak_for_export: 0,
+        min_tablet_curve_median_frames_for_export: 0,
+        min_tablet_curve_median_span_ms_for_export: 0,
+        min_tablet_curve_confirmation_rate_for_export: 0.08,
+        curve_confirmation_min_gap_ms: 320,
+        seed: 4044,
       },
     },
   };
@@ -239,7 +297,7 @@
     const positiveBudget = Number($("#std-positive-budget")?.value || 200000);
     const negativeBudget = Number($("#std-negative-budget")?.value || 240000);
     const augmentationRounds = Number($("#std-augmentation-rounds")?.value || 6);
-    const trainingSteps = Number($("#std-training-steps")?.value || 50000);
+    const trainingSteps = Number($("#std-training-steps")?.value || 115000);
     const fpPenalty = Number($("#std-fp-penalty")?.value || 1000);
     const layerSize = getStandardLayer();
     const nnDepth = Number($("#std-nn-depth")?.value || 3);
@@ -267,7 +325,7 @@
     $("#std-positive-budget") && ($("#std-positive-budget").value = positiveBudget || TRAINING_PROFILES[profile].positiveBudget);
     $("#std-negative-budget") && ($("#std-negative-budget").value = adv * selectedPiperVoiceCount(form));
     $("#std-augmentation-rounds") && ($("#std-augmentation-rounds").value = form.querySelector('[name="augmentations_per_clip"]')?.value || 6);
-    $("#std-training-steps") && ($("#std-training-steps").value = form.querySelector('[name="max_steps"]')?.value || 50000);
+    $("#std-training-steps") && ($("#std-training-steps").value = form.querySelector('[name="max_steps"]')?.value || 115000);
     $("#std-fp-penalty") && ($("#std-fp-penalty").value = form.querySelector('[name="max_negative_loss_weight"]')?.value || 1000);
     $("#std-nn-depth") && ($("#std-nn-depth").value = form.querySelector('[name="n_blocks"]')?.value || 3);
     setStandardLayer(form.querySelector('[name="layer_dim"]')?.value || 64);
@@ -723,7 +781,7 @@
           .split("\n")
           .map((s) => s.trim())
           .filter(Boolean),
-        positive_sample_budget: vNum("positive_sample_budget", 0),
+        positive_sample_budget: vNum("positive_sample_budget", 200000),
         n_positive_per_phrase_per_voice: vNum("n_positive_per_phrase_per_voice", 10),
         negative_phrases: String(v("negative_phrases"))
           .split("\n")
@@ -781,7 +839,7 @@
         hard_negative_mining_top_k: vNum("hard_negative_mining_top_k", 50000),
         hard_negative_finetune_steps: vNum("hard_negative_finetune_steps", 0),
         hard_negative_finetune_positive_fraction: vNum("hard_negative_finetune_positive_fraction", 0.5),
-        max_steps: vNum("max_steps", 50000),
+        max_steps: vNum("max_steps", 115000),
         val_every_n_steps: vNum("val_every_n_steps", 500),
         early_stop_patience: vNum("early_stop_patience", 40),
         early_stop_min_steps: vNum("early_stop_min_steps", 30000),
@@ -794,12 +852,12 @@
         min_positive_p10_score_for_export: vNum("min_positive_p10_score_for_export", 0.35),
         use_positive_curve_validation: vBool("use_positive_curve_validation"),
         curve_validation_max_positive_clips: vNum("curve_validation_max_positive_clips", 400),
-        min_curve_recall_for_export: vNum("min_curve_recall_for_export", 0.6),
+        min_curve_recall_for_export: vNum("min_curve_recall_for_export", 0.65),
         min_curve_median_peak_for_export: vNum("min_curve_median_peak_for_export", 0.78),
         min_curve_p10_peak_for_export: vNum("min_curve_p10_peak_for_export", 0.02),
         min_curve_median_frames_for_export: vNum("min_curve_median_frames_for_export", 2),
         min_curve_median_span_ms_for_export: vNum("min_curve_median_span_ms_for_export", 160),
-        min_curve_confirmation_rate_for_export: vNum("min_curve_confirmation_rate_for_export", 0.25),
+        min_curve_confirmation_rate_for_export: vNum("min_curve_confirmation_rate_for_export", 0.3),
         use_tablet_curve_validation: vBool("use_tablet_curve_validation"),
         tablet_curve_validation_variants_per_clip: vNum("tablet_curve_validation_variants_per_clip", 1),
         min_tablet_curve_recall_for_export: vNum("min_tablet_curve_recall_for_export", 0.24),
@@ -1510,8 +1568,9 @@
     const sessionBytes = $("#system-session-bytes");
     const cacheBytes = $("#system-cache-bytes");
     if (count) count.textContent = String((disk.sessions || []).length);
-    if (sessionBytes) sessionBytes.textContent = fmtBytes(disk.session_bytes || 0);
-    if (cacheBytes) cacheBytes.textContent = fmtBytes(disk.cache_bytes || 0);
+    const hasSizes = disk.sizes_included !== false;
+    if (sessionBytes) sessionBytes.textContent = hasSizes ? fmtBytes(disk.session_bytes || 0) : "calculating...";
+    if (cacheBytes) cacheBytes.textContent = hasSizes ? fmtBytes(disk.cache_bytes || 0) : "calculating...";
     if (!disk.sessions?.length) {
       systemRows.innerHTML = `<tr><td colspan="5" class="empty-row">No sessions yet.</td></tr>`;
       return;
@@ -1522,7 +1581,7 @@
           <tr data-session-id="${escapeHtml(s.id)}">
             <td>${escapeHtml(s.wake_word || s.id)}</td>
             <td><code>${escapeHtml(s.id)}</code></td>
-            <td>${fmtBytes(s.size_bytes || 0)}</td>
+            <td>${s.size_bytes == null ? "calculating..." : fmtBytes(s.size_bytes || 0)}</td>
             <td>${s.has_model ? "ready" : "-"}</td>
             <td class="row-actions">
               <button type="button" class="danger delete-session-cache-btn" data-session-id="${escapeHtml(s.id)}">Delete cache</button>
@@ -1536,7 +1595,7 @@
 
   async function refreshSystemDisk() {
     if (!systemRows) return;
-    const res = await fetch("/api/system/disk");
+    const res = await fetch("/api/system/disk?sizes=false");
     if (!res.ok) return;
     renderSystemDisk(await res.json());
   }

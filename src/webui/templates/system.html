@@ -10,11 +10,11 @@
     </div>
     <div class="metric-tile">
       <div class="name">Session data</div>
-      <div class="value" id="system-session-bytes">{{ "%.1f"|format(disk.session_bytes / 1073741824) }} GB</div>
+      <div class="value" id="system-session-bytes">{% if disk.sizes_included %}{{ "%.1f"|format(disk.session_bytes / 1073741824) }} GB{% else %}calculating...{% endif %}</div>
     </div>
     <div class="metric-tile">
       <div class="name">Shared cache + models</div>
-      <div class="value" id="system-cache-bytes">{{ "%.1f"|format(disk.cache_bytes / 1073741824) }} GB</div>
+      <div class="value" id="system-cache-bytes">{% if disk.sizes_included %}{{ "%.1f"|format(disk.cache_bytes / 1073741824) }} GB{% else %}calculating...{% endif %}</div>
     </div>
   </div>
 
@@ -44,7 +44,7 @@
           <tr data-session-id="{{ s.id }}">
             <td>{{ s.wake_word }}</td>
             <td><code>{{ s.id }}</code></td>
-            <td data-size="{{ s.size_bytes }}">{{ "%.1f"|format((s.size_bytes or 0) / 1048576) }} MB</td>
+            <td data-size="{{ s.size_bytes or '' }}">{% if s.size_bytes is not none %}{{ "%.1f"|format((s.size_bytes or 0) / 1048576) }} MB{% else %}calculating...{% endif %}</td>
             <td>{% if s.has_model %}ready{% else %}-{% endif %}</td>
             <td class="row-actions">
               <button type="button" class="danger delete-session-cache-btn" data-session-id="{{ s.id }}" {% if state.status == 'running' %}disabled{% endif %}>Delete cache</button>

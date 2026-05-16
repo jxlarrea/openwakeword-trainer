@@ -297,10 +297,12 @@ def _generate_samples(
         i = 0
         loop_start_t = time.monotonic()
         last_log_t = loop_start_t
-        for sample in piper.iter_parallel(piper_tasks, workers=workers):
-            wav_path = out_dir / f"piper_{label}_{i:07d}.wav"
-            write_wav(wav_path, sample.audio, sample.sample_rate)
-            write_sample_metadata(wav_path, sample, "piper")
+        for wav_path in piper.iter_parallel_to_wavs(
+            piper_tasks,
+            workers=workers,
+            out_dir=out_dir,
+            label=label,
+        ):
             written.append(wav_path)
             i += 1
             if i % 25 == 0:
@@ -465,29 +467,15 @@ def _generate_kokoro_samples(
     import hashlib
 
     seed = int(hashlib.sha1(f"{cfg.wake_word}|{label}|kokoro".encode()).hexdigest()[:8], 16)
-    for sample in kokoro.iter_samples(
+    for wav_path in kokoro.iter_samples_to_wavs(
         phrases=phrases,
         voice_keys=cfg.generation.kokoro_voices,
         n_per_phrase_per_voice=n_per_phrase_per_voice,
         cfg=cfg.generation,
+        out_dir=out_dir,
+        label=label,
         seed=seed,
     ):
-        wav_path = out_dir / f"kokoro_{label}_{i:07d}.wav"
-        write_wav(wav_path, sample.audio, sample.sample_rate)
-        wav_path.with_suffix(".json").write_text(
-            json.dumps(
-                {
-                    "engine": "kokoro",
-                    "label": label,
-                    "text": sample.text,
-                    "voice": sample.voice,
-                    "sample_rate": sample.sample_rate,
-                    "metadata": sample.metadata,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
         written.append(wav_path)
         i += 1
         if i % 10 == 0:

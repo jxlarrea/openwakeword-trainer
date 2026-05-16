@@ -118,7 +118,10 @@ class Settings(BaseSettings):
         return self.feature_workers or min(14, max(1, (os.cpu_count() or 2)))
 
     def resolved_dataloader_workers(self) -> int:
-        return self.dataloader_workers or min(8, max(1, (os.cpu_count() or 2)))
+        # Feature batches come from mmap-backed arrays and are cheap to read;
+        # on GB10, 4 workers benchmarks faster than 8 and is less fragile for
+        # long CUDA training runs.
+        return self.dataloader_workers or min(4, max(1, (os.cpu_count() or 2)))
 
 
 @lru_cache(maxsize=1)

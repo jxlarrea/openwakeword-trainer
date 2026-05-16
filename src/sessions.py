@@ -17,6 +17,10 @@ from src.settings import get_settings
 from src.tts.kokoro_generator import default_kokoro_voice_keys
 from src.tts.voices import list_english_voices
 
+_DISK_SUMMARY_CACHE: dict[str, Any] | None = None
+_DISK_SUMMARY_CACHE_T = 0.0
+_DISK_SUMMARY_TTL_SECONDS = 30.0
+
 
 def slugify(value: str) -> str:
     slug = "".join(c if c.isalnum() else "_" for c in value.lower()).strip("_")
@@ -98,7 +102,7 @@ def create_session(wake_word: str, session_id: str | None = None) -> dict[str, A
         "config": existing.get("config") or _config_for_session(wake_word, sid),
     }
     (path / "session.json").write_text(json.dumps(data, indent=2))
-    return session_summary(sid)
+    return session_summary(sid, include_size=False)
 
 
 def save_session_config(session_id: str, cfg: TrainRunConfig) -> dict[str, Any]:
@@ -116,7 +120,7 @@ def save_session_config(session_id: str, cfg: TrainRunConfig) -> dict[str, Any]:
         "config": cfg.model_dump(mode="json"),
     }
     (path / "session.json").write_text(json.dumps(data, indent=2))
-    return session_summary(sid)
+    return session_summary(sid, include_size=False)
 
 
 def session_summary(session_id: str, include_size: bool = True) -> dict[str, Any]:
@@ -167,8 +171,8 @@ def list_sessions_with_size() -> list[dict[str, Any]]:
     return out
 
 
-def get_session(session_id: str) -> dict[str, Any]:
-    return session_summary(session_id, include_size=True)
+def get_session(session_id: str, include_size: bool = False) -> dict[str, Any]:
+    return session_summary(session_id, include_size=include_size)
 
 
 def delete_session(session_id: str) -> None:
@@ -248,7 +252,17 @@ def delete_all_sessions() -> int:
     return total
 
 
-def disk_cache_summary() -> dict[str, Any]:
+def disk_cache_summary(*, include_sizes: bool = True, use_cache: bool = True) -> dict[str, Any]:
+    global _DISK_SUMMARY_CACHE, _DISK_SUMMARY_CACHE_T
+    now = time.time()
+    if (
+        include_sizes
+        and use_cache
+        and _DISK_SUMMARY_CACHE is not None
+        and now - _DISK_SUMMARY_CACHE_T < _DISK_SUMMARY_TTL_SECONDS
+    ):
+        return _DISK_SUMMARY_CACHE
+
     settings = get_settings()
     cache_dirs = [
         settings.voices_dir,
@@ -258,19 +272,30 @@ def disk_cache_summary() -> dict[str, Any]:
     ]
     dirs = []
     for path in cache_dirs:
-        dirs.append({"path": str(path), "size_bytes": _dir_size(path)})
-    sessions = list_sessions_with_size()
-    model_bytes = _dir_size(settings.models_dir)
-    return {
+        dirs.append(
+            {
+                "path": str(path),
+                "size_bytes": _dir_size(path) if include_sizes else None,
+            }
+        )
+    sessions = list_sessions_with_size() if include_sizes else list_sessions()
+    model_bytes = _dir_size(settings.models_dir) if include_sizes else None
+    summary = {
         "sessions": sessions,
         "session_bytes": sum(int(s.get("size_bytes") or 0) for s in sessions),
-        "model_bytes": model_bytes,
+        "model_bytes": model_bytes or 0,
         "cache_dirs": dirs,
-        "cache_bytes": sum(int(d["size_bytes"]) for d in dirs) + model_bytes,
+        "cache_bytes": sum(int(d.get("size_bytes") or 0) for d in dirs) + (model_bytes or 0),
         "total_bytes": sum(int(s.get("size_bytes") or 0) for s in sessions)
-        + sum(int(d["size_bytes"]) for d in dirs)
-        + model_bytes,
+        + sum(int(d.get("size_bytes") or 0) for d in dirs)
+        + (model_bytes or 0),
+        "sizes_included": include_sizes,
+        "generated_at": now,
     }
+    if include_sizes:
+        _DISK_SUMMARY_CACHE = summary
+        _DISK_SUMMARY_CACHE_T = now
+    return summary
 
 
 def delete_global_disk_cache() -> int:

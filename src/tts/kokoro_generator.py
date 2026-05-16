@@ -7,10 +7,13 @@ and optional hard negatives.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import random
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -92,6 +95,38 @@ def _resample_float(audio: np.ndarray, src_sr: int, dst_sr: int = TARGET_SAMPLE_
     return resample_poly(audio, dst_sr // g, src_sr // g).astype(np.float32)
 
 
+def _write_kokoro_outputs(
+    wav_path: Path,
+    sample: GeneratedSample,
+    label: str,
+) -> Path:
+    import soundfile as sf
+
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_wav = wav_path.with_suffix(wav_path.suffix + ".tmp")
+    sf.write(tmp_wav, sample.audio, sample.sample_rate, subtype="PCM_16", format="WAV")
+    tmp_wav.replace(wav_path)
+
+    metadata_path = wav_path.with_suffix(".json")
+    tmp_metadata = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    tmp_metadata.write_text(
+        json.dumps(
+            {
+                "engine": "kokoro",
+                "label": label,
+                "text": sample.text,
+                "voice": sample.voice,
+                "sample_rate": sample.sample_rate,
+                "metadata": sample.metadata,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    tmp_metadata.replace(metadata_path)
+    return wav_path
+
+
 class KokoroGenerator:
     """Lazy-loads Kokoro pipelines and yields synthesized samples."""
 
@@ -171,3 +206,52 @@ class KokoroGenerator:
                             phrase,
                             exc,
                         )
+
+    def iter_samples_to_wavs(
+        self,
+        phrases: list[str],
+        voice_keys: list[str],
+        n_per_phrase_per_voice: int,
+        cfg: GenerationConfig,
+        out_dir: Path,
+        label: str,
+        seed: int = 0,
+        start_index: int = 0,
+    ) -> Iterator[Path]:
+        """Synthesize Kokoro samples while writing WAV/metadata asynchronously."""
+        write_workers = max(1, int(os.environ.get("OWW_TTS_WRITE_WORKERS", "4")))
+        max_pending = max(write_workers, int(os.environ.get("OWW_TTS_WRITE_QUEUE", "32")))
+        pending: set[Future[Path]] = set()
+        i = start_index
+
+        def drain(block: bool = False) -> Iterator[Path]:
+            nonlocal pending
+            if not pending:
+                return
+            done: set[Future[Path]]
+            if block:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            else:
+                done = {fut for fut in pending if fut.done()}
+                pending -= done
+            for fut in done:
+                yield fut.result()
+
+        with ThreadPoolExecutor(max_workers=write_workers) as executor:
+            for sample in self.iter_samples(
+                phrases=phrases,
+                voice_keys=voice_keys,
+                n_per_phrase_per_voice=n_per_phrase_per_voice,
+                cfg=cfg,
+                seed=seed,
+            ):
+                wav_path = out_dir / f"kokoro_{label}_{i:07d}.wav"
+                pending.add(executor.submit(_write_kokoro_outputs, wav_path, sample, label))
+                i += 1
+                if len(pending) >= max_pending:
+                    yield from drain(block=True)
+                else:
+                    yield from drain(block=False)
+
+            while pending:
+                yield from drain(block=True)

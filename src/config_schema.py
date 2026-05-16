@@ -26,7 +26,7 @@ class GenerationConfig(BaseModel):
     # reach approximately this many clean positive TTS samples. This is used by
     # the simplified Web UI profiles. A value of 0 preserves the exact advanced
     # per-phrase/per-voice knobs below.
-    positive_sample_budget: int = 0
+    positive_sample_budget: int = 200_000
     n_positive_per_phrase_per_voice: int = 10
 
     # User-supplied hard negatives - phrases the model must NOT trigger on.
@@ -145,7 +145,7 @@ class TrainingConfig(BaseModel):
     hard_negative_refresh_steps: int = 300
     hard_negative_refresh_positive_fraction: float = 0.50
     max_hard_negative_refreshes: int = 3
-    max_steps: int = 50_000
+    max_steps: int = 115_000
     val_every_n_steps: int = 500
     target_false_positives_per_hour: float = 0.5
     min_recall_at_p95_for_export: float = 0.80
@@ -164,12 +164,12 @@ class TrainingConfig(BaseModel):
     # v13-style gates (loosened from v15/v16 which were unachievable for a
     # sharp model). A precise wake-word head naturally peaks across 3-5 hops
     # at the wake-word completion, not 5-7.
-    min_curve_recall_for_export: float = 0.60
+    min_curve_recall_for_export: float = 0.65
     min_curve_median_peak_for_export: float = 0.78
     min_curve_p10_peak_for_export: float = 0.02
     min_curve_median_frames_for_export: int = 2
     min_curve_median_span_ms_for_export: float = 160.0
-    min_curve_confirmation_rate_for_export: float = 0.25
+    min_curve_confirmation_rate_for_export: float = 0.30
     use_tablet_curve_validation: bool = True
     # Generate a few tablet variants per clip so the metric is stable when the
     # tablet aug is now using per-clip training probabilities (no longer the

@@ -89,7 +89,7 @@ class FeatureMemmapDataset(Dataset):
         return int(self.labels.shape[0])
 
     def __getitem__(self, idx: int):
-        x = np.asarray(self.features[idx], dtype=np.float32)
+        x = np.asarray(self.features[idx], dtype=np.float32).copy()
         y = float(self.labels[idx])
         return x, y
 
@@ -125,18 +125,18 @@ class ExternalNegativeFeatureDataset(Dataset):
 
     def __getitem__(self, idx: int):
         if self._mode == "windows":
-            x = np.asarray(self.features[idx], dtype=np.float32)
+            x = np.asarray(self.features[idx], dtype=np.float32).copy()
         else:
             x = np.asarray(
                 self.features[idx : idx + CLASSIFIER_WINDOW_EMBEDDINGS],
                 dtype=np.float32,
-            )
+            ).copy()
         return x, 0.0
 
     def get_features(self, indices: np.ndarray) -> np.ndarray:
         indices = np.asarray(indices, dtype=np.int64)
         if self._mode == "windows":
-            return np.asarray(self.features[indices], dtype=np.float32)
+            return np.asarray(self.features[indices], dtype=np.float32).copy()
         out = np.empty(
             (indices.size, CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM),
             dtype=np.float32,
