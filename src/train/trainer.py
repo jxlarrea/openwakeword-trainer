@@ -48,9 +48,35 @@ class TrainResult:
     best_val_fp_per_hour_at_0_5: float
     best_positive_median_score: float
     best_positive_p10_score: float
+    best_curve_recall: float
+    best_curve_median_peak: float
+    best_curve_p10_peak: float
+    best_curve_median_frames: float
+    best_curve_median_span_ms: float
+    best_curve_confirmation_rate: float
+    best_tablet_curve_recall: float
+    best_tablet_curve_median_peak: float
+    best_tablet_curve_p10_peak: float
+    best_tablet_curve_median_frames: float
+    best_tablet_curve_median_span_ms: float
+    best_tablet_curve_confirmation_rate: float
     best_threshold: float
     best_step: int
     history: list[dict]
+
+
+@dataclass
+class CurveValidationSet:
+    """Sliding full-audio positive validation windows grouped by source clip."""
+
+    features_path: Path
+    source_ids_path: Path
+    n_windows: int
+    n_clips: int
+    tablet_features_path: Path | None = None
+    tablet_source_ids_path: Path | None = None
+    tablet_n_windows: int = 0
+    tablet_n_clips: int = 0
 
 
 def _make_loader(
@@ -361,8 +387,176 @@ def _evaluate(
     }
 
 
+def _calibrate_scores(scores: np.ndarray, threshold: float) -> np.ndarray:
+    """Mirror the exported ONNX score calibration for checkpoint validation."""
+    scores = np.clip(scores.astype(np.float32, copy=False), 1e-6, 1.0 - 1e-6)
+    threshold = float(np.clip(threshold, 1e-6, 1.0 - 1e-6))
+    logits = np.log(scores / (1.0 - scores))
+    threshold_logit = math.log(threshold / (1.0 - threshold))
+    return (1.0 / (1.0 + np.exp(-(logits - threshold_logit)))).astype(np.float32)
+
+
+def _empty_curve_metrics(enabled: bool) -> dict[str, float]:
+    if not enabled:
+        return {
+            "curve_recall": 1.0,
+            "curve_median_peak": 1.0,
+            "curve_p10_peak": 1.0,
+            "curve_median_frames": 1_000_000.0,
+            "curve_median_span_ms": 1_000_000.0,
+            "curve_confirmation_rate": 1.0,
+        }
+    return {
+        "curve_recall": 0.0,
+        "curve_median_peak": 0.0,
+        "curve_p10_peak": 0.0,
+        "curve_median_frames": 0.0,
+        "curve_median_span_ms": 0.0,
+        "curve_confirmation_rate": 0.0,
+    }
+
+
+def _score_curve_features(
+    *,
+    model: nn.Module,
+    features_path: Path,
+    source_ids_path: Path,
+    n_windows: int,
+    n_clips: int,
+    device: torch.device,
+    cfg: TrainingConfig,
+    threshold: float,
+) -> dict[str, float]:
+    if n_windows <= 0 or n_clips <= 0:
+        return _empty_curve_metrics(enabled=True)
+
+    features = np.memmap(
+        features_path,
+        dtype=np.float32,
+        mode="r",
+        shape=(n_windows, CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM),
+    )
+    source_ids = np.load(source_ids_path, mmap_mode="r")
+    if int(source_ids.shape[0]) != int(n_windows):
+        return _empty_curve_metrics(enabled=True)
+
+    scores: list[np.ndarray] = []
+    batch_size = max(4096, int(cfg.batch_size) * 2)
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, n_windows, batch_size):
+            end = min(n_windows, start + batch_size)
+            x = torch.from_numpy(np.array(features[start:end], dtype=np.float32, copy=True)).to(device)
+            p = model(x).squeeze(-1).detach().cpu().numpy().astype(np.float32)
+            scores.append(p)
+    raw_scores = np.concatenate(scores) if scores else np.empty(0, dtype=np.float32)
+    if raw_scores.size == 0:
+        return _empty_curve_metrics(enabled=True)
+
+    runtime_scores = _calibrate_scores(raw_scores, threshold)
+    order = np.argsort(source_ids)
+    sorted_sources = np.asarray(source_ids[order], dtype=np.int64)
+    sorted_scores = runtime_scores[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_sources)) + 1]
+
+    peaks: list[float] = []
+    frames: list[int] = []
+    spans_ms: list[float] = []
+    confirmations: list[float] = []
+    min_gap_frames = max(1, int(math.ceil(float(cfg.curve_confirmation_min_gap_ms) / 80.0)))
+    for start_idx, end_idx in zip(starts, np.r_[starts[1:], sorted_scores.size]):
+        clip_scores = sorted_scores[start_idx:end_idx]
+        if clip_scores.size == 0:
+            continue
+        peaks.append(float(np.max(clip_scores)))
+        above = np.flatnonzero(clip_scores >= 0.5)
+        frames.append(int(above.size))
+        if above.size:
+            spans_ms.append(float((above[-1] - above[0] + 1) * 80.0))
+        else:
+            spans_ms.append(0.0)
+        confirmed = False
+        if above.size >= 2:
+            for i in range(above.size - 1):
+                if int(above[-1] - above[i]) >= min_gap_frames:
+                    confirmed = True
+                    break
+        confirmations.append(1.0 if confirmed else 0.0)
+
+    if not peaks:
+        return _empty_curve_metrics(enabled=True)
+
+    peaks_arr = np.asarray(peaks, dtype=np.float32)
+    frames_arr = np.asarray(frames, dtype=np.float32)
+    spans_arr = np.asarray(spans_ms, dtype=np.float32)
+    confirmations_arr = np.asarray(confirmations, dtype=np.float32)
+    return {
+        "curve_recall": float((peaks_arr >= 0.5).sum() / peaks_arr.size),
+        "curve_median_peak": float(np.median(peaks_arr)),
+        "curve_p10_peak": float(np.quantile(peaks_arr, 0.10)),
+        "curve_median_frames": float(np.median(frames_arr)),
+        "curve_median_span_ms": float(np.median(spans_arr)),
+        "curve_confirmation_rate": float(confirmations_arr.mean()),
+    }
+
+
+def _evaluate_positive_curves(
+    model: nn.Module,
+    curve_val: CurveValidationSet | None,
+    device: torch.device,
+    cfg: TrainingConfig,
+    threshold: float,
+) -> dict[str, float]:
+    """Score held-out positive WAVs as full sliding curves.
+
+    Window-level validation can pass a model that produces a single narrow
+    spike. This evaluates the runtime-shaped curve after applying the same
+    threshold calibration that will be baked into the exported ONNX.
+    """
+    if not cfg.use_positive_curve_validation:
+        metrics = _empty_curve_metrics(enabled=False)
+        metrics.update({f"tablet_{k}": v for k, v in _empty_curve_metrics(enabled=False).items()})
+        return metrics
+    if curve_val is None or curve_val.n_windows <= 0 or curve_val.n_clips <= 0:
+        metrics = _empty_curve_metrics(enabled=True)
+        metrics.update({f"tablet_{k}": v for k, v in _empty_curve_metrics(enabled=True).items()})
+        return metrics
+
+    metrics = _score_curve_features(
+        model=model,
+        features_path=curve_val.features_path,
+        source_ids_path=curve_val.source_ids_path,
+        n_windows=curve_val.n_windows,
+        n_clips=curve_val.n_clips,
+        device=device,
+        cfg=cfg,
+        threshold=threshold,
+    )
+    if (
+        cfg.use_tablet_curve_validation
+        and curve_val.tablet_features_path is not None
+        and curve_val.tablet_source_ids_path is not None
+        and curve_val.tablet_n_windows > 0
+        and curve_val.tablet_n_clips > 0
+    ):
+        tablet_metrics = _score_curve_features(
+            model=model,
+            features_path=curve_val.tablet_features_path,
+            source_ids_path=curve_val.tablet_source_ids_path,
+            n_windows=curve_val.tablet_n_windows,
+            n_clips=curve_val.tablet_n_clips,
+            device=device,
+            cfg=cfg,
+            threshold=threshold,
+        )
+    else:
+        tablet_metrics = _empty_curve_metrics(enabled=cfg.use_tablet_curve_validation)
+    metrics.update({f"tablet_{k}": v for k, v in tablet_metrics.items()})
+    return metrics
+
+
 def _is_exportable(metrics: dict[str, float], cfg: TrainingConfig) -> bool:
-    return (
+    base_ok = (
         metrics.get("recall_at_target_fp", 0.0) >= cfg.min_recall_at_target_fp_for_export
         and metrics["fp_per_hour"] <= cfg.target_false_positives_per_hour
         and metrics.get("threshold", 1.0) <= cfg.max_calibration_threshold_for_export
@@ -371,6 +565,29 @@ def _is_exportable(metrics: dict[str, float], cfg: TrainingConfig) -> bool:
         and metrics.get("positive_median_score", 0.0) >= cfg.min_positive_median_score_for_export
         and metrics.get("positive_p10_score", 0.0) >= cfg.min_positive_p10_score_for_export
         and not math.isnan(metrics["loss"])
+    )
+    if not base_ok:
+        return False
+    if not cfg.use_positive_curve_validation:
+        return True
+    return (
+        metrics.get("curve_recall", 0.0) >= cfg.min_curve_recall_for_export
+        and metrics.get("curve_median_peak", 0.0) >= cfg.min_curve_median_peak_for_export
+        and metrics.get("curve_p10_peak", 0.0) >= cfg.min_curve_p10_peak_for_export
+        and metrics.get("curve_median_frames", 0.0) >= cfg.min_curve_median_frames_for_export
+        and metrics.get("curve_median_span_ms", 0.0) >= cfg.min_curve_median_span_ms_for_export
+        and metrics.get("curve_confirmation_rate", 0.0) >= cfg.min_curve_confirmation_rate_for_export
+        and (
+            not cfg.use_tablet_curve_validation
+            or (
+                metrics.get("tablet_curve_recall", 0.0) >= cfg.min_tablet_curve_recall_for_export
+                and metrics.get("tablet_curve_median_peak", 0.0) >= cfg.min_tablet_curve_median_peak_for_export
+                and metrics.get("tablet_curve_p10_peak", 0.0) >= cfg.min_tablet_curve_p10_peak_for_export
+                and metrics.get("tablet_curve_median_frames", 0.0) >= cfg.min_tablet_curve_median_frames_for_export
+                and metrics.get("tablet_curve_median_span_ms", 0.0) >= cfg.min_tablet_curve_median_span_ms_for_export
+                and metrics.get("tablet_curve_confirmation_rate", 0.0) >= cfg.min_tablet_curve_confirmation_rate_for_export
+            )
+        )
     )
 
 
@@ -412,6 +629,68 @@ def _export_gate_failures(metrics: dict[str, float], cfg: TrainingConfig) -> lis
             f"pos_p10={metrics.get('positive_p10_score', 0.0):.3f} "
             f"< {cfg.min_positive_p10_score_for_export:.3f}"
         )
+    if cfg.use_positive_curve_validation:
+        if metrics.get("curve_recall", 0.0) < cfg.min_curve_recall_for_export:
+            failures.append(
+                f"curve_recall={metrics.get('curve_recall', 0.0):.3f} "
+                f"< {cfg.min_curve_recall_for_export:.3f}"
+            )
+        if metrics.get("curve_median_peak", 0.0) < cfg.min_curve_median_peak_for_export:
+            failures.append(
+                f"curve_med_peak={metrics.get('curve_median_peak', 0.0):.3f} "
+                f"< {cfg.min_curve_median_peak_for_export:.3f}"
+            )
+        if metrics.get("curve_p10_peak", 0.0) < cfg.min_curve_p10_peak_for_export:
+            failures.append(
+                f"curve_p10_peak={metrics.get('curve_p10_peak', 0.0):.3f} "
+                f"< {cfg.min_curve_p10_peak_for_export:.3f}"
+            )
+        if metrics.get("curve_median_frames", 0.0) < cfg.min_curve_median_frames_for_export:
+            failures.append(
+                f"curve_med_frames={metrics.get('curve_median_frames', 0.0):.1f} "
+                f"< {cfg.min_curve_median_frames_for_export:.1f}"
+            )
+        if metrics.get("curve_median_span_ms", 0.0) < cfg.min_curve_median_span_ms_for_export:
+            failures.append(
+                f"curve_med_span={metrics.get('curve_median_span_ms', 0.0):.0f}ms "
+                f"< {cfg.min_curve_median_span_ms_for_export:.0f}ms"
+            )
+        if metrics.get("curve_confirmation_rate", 0.0) < cfg.min_curve_confirmation_rate_for_export:
+            failures.append(
+                f"curve_confirm={metrics.get('curve_confirmation_rate', 0.0):.3f} "
+                f"< {cfg.min_curve_confirmation_rate_for_export:.3f}"
+            )
+        if cfg.use_tablet_curve_validation:
+            if metrics.get("tablet_curve_recall", 0.0) < cfg.min_tablet_curve_recall_for_export:
+                failures.append(
+                    f"tablet_curve_recall={metrics.get('tablet_curve_recall', 0.0):.3f} "
+                    f"< {cfg.min_tablet_curve_recall_for_export:.3f}"
+                )
+            if metrics.get("tablet_curve_median_peak", 0.0) < cfg.min_tablet_curve_median_peak_for_export:
+                failures.append(
+                    f"tablet_curve_med_peak={metrics.get('tablet_curve_median_peak', 0.0):.3f} "
+                    f"< {cfg.min_tablet_curve_median_peak_for_export:.3f}"
+                )
+            if metrics.get("tablet_curve_p10_peak", 0.0) < cfg.min_tablet_curve_p10_peak_for_export:
+                failures.append(
+                    f"tablet_curve_p10_peak={metrics.get('tablet_curve_p10_peak', 0.0):.3f} "
+                    f"< {cfg.min_tablet_curve_p10_peak_for_export:.3f}"
+                )
+            if metrics.get("tablet_curve_median_frames", 0.0) < cfg.min_tablet_curve_median_frames_for_export:
+                failures.append(
+                    f"tablet_curve_med_frames={metrics.get('tablet_curve_median_frames', 0.0):.1f} "
+                    f"< {cfg.min_tablet_curve_median_frames_for_export:.1f}"
+                )
+            if metrics.get("tablet_curve_median_span_ms", 0.0) < cfg.min_tablet_curve_median_span_ms_for_export:
+                failures.append(
+                    f"tablet_curve_med_span={metrics.get('tablet_curve_median_span_ms', 0.0):.0f}ms "
+                    f"< {cfg.min_tablet_curve_median_span_ms_for_export:.0f}ms"
+                )
+            if metrics.get("tablet_curve_confirmation_rate", 0.0) < cfg.min_tablet_curve_confirmation_rate_for_export:
+                failures.append(
+                    f"tablet_curve_confirm={metrics.get('tablet_curve_confirmation_rate', 0.0):.3f} "
+                    f"< {cfg.min_tablet_curve_confirmation_rate_for_export:.3f}"
+                )
     if math.isnan(metrics.get("loss", math.nan)):
         failures.append("val_loss is NaN")
     return failures
@@ -435,6 +714,12 @@ def _checkpoint_score(metrics: dict[str, float], cfg: TrainingConfig) -> tuple:
             -float(metrics["fp_per_hour"]),
             -float(metrics.get("fp_per_hour_at_0_5", math.inf)),
             float(metrics.get("positive_median_score", 0.0)),
+            float(metrics.get("tablet_curve_confirmation_rate", 0.0)),
+            float(metrics.get("tablet_curve_median_frames", 0.0)),
+            float(metrics.get("tablet_curve_median_peak", 0.0)),
+            float(metrics.get("curve_confirmation_rate", 0.0)),
+            float(metrics.get("curve_median_frames", 0.0)),
+            float(metrics.get("curve_median_peak", 0.0)),
             float(metrics.get("recall_at_p95", 0.0)),
             loss_score,
         )
@@ -446,6 +731,12 @@ def _checkpoint_score(metrics: dict[str, float], cfg: TrainingConfig) -> tuple:
         -float(metrics.get("threshold", 1.0)),
         -float(metrics.get("fp_per_hour_at_0_5", math.inf)),
         float(metrics.get("positive_median_score", 0.0)),
+        float(metrics.get("tablet_curve_confirmation_rate", 0.0)),
+        float(metrics.get("tablet_curve_median_frames", 0.0)),
+        float(metrics.get("tablet_curve_median_peak", 0.0)),
+        float(metrics.get("curve_confirmation_rate", 0.0)),
+        float(metrics.get("curve_median_frames", 0.0)),
+        float(metrics.get("curve_median_peak", 0.0)),
         float(metrics.get("recall_at_p95", 0.0)),
         -float(metrics["fp_per_hour"]),
         loss_score,
@@ -527,6 +818,7 @@ def _fine_tune_hard_negatives(
     cfg: TrainingConfig,
     train_ds: FeatureMemmapDataset,
     val_loader: DataLoader,
+    curve_val: CurveValidationSet | None,
     device: torch.device,
     out_dir: Path,
     history: list[dict],
@@ -608,6 +900,7 @@ def _fine_tune_hard_negatives(
 
         if ft_step % cfg.val_every_n_steps == 0 or ft_step == cfg.hard_negative_finetune_steps:
             metrics = _evaluate(model, val_loader, device, cfg)
+            metrics.update(_evaluate_positive_curves(model, curve_val, device, cfg, metrics["threshold"]))
             global_step = base_step + ft_step
             metrics["step"] = global_step
             metrics["phase"] = "hard_negative_finetune"
@@ -623,6 +916,10 @@ def _fine_tune_hard_negatives(
                 val_fp_per_hour_at_0_5=metrics["fp_per_hour_at_0_5"],
                 positive_median_score=metrics["positive_median_score"],
                 positive_p10_score=metrics["positive_p10_score"],
+                curve_recall=metrics.get("curve_recall", 0.0),
+                curve_median_peak=metrics.get("curve_median_peak", 0.0),
+                curve_median_frames=metrics.get("curve_median_frames", 0.0),
+                curve_confirmation_rate=metrics.get("curve_confirmation_rate", 0.0),
                 threshold=metrics["threshold"],
             )
             bus.log(
@@ -634,6 +931,10 @@ def _fine_tune_hard_negatives(
                 f"rawFP/hr@0.5={metrics['fp_per_hour_at_0_5']:.2f} "
                 f"pos_med={metrics['positive_median_score']:.3f} "
                 f"pos_p10={metrics['positive_p10_score']:.3f} "
+                f"curve={metrics.get('curve_recall', 0.0):.3f}/"
+                f"{metrics.get('curve_median_peak', 0.0):.3f}/"
+                f"{metrics.get('curve_median_frames', 0.0):.1f}f/"
+                f"{metrics.get('curve_confirmation_rate', 0.0):.3f} "
                 f"threshold={metrics['threshold']:.6f}"
             )
             score = _checkpoint_score(metrics, cfg)
@@ -662,6 +963,7 @@ def _refresh_hard_negatives(
     cfg: TrainingConfig,
     train_ds: FeatureMemmapDataset,
     val_loader: DataLoader,
+    curve_val: CurveValidationSet | None,
     device: torch.device,
     refresh_index: int,
     global_step: int,
@@ -763,6 +1065,7 @@ def _refresh_hard_negatives(
         return 0, None
 
     metrics = _evaluate(model, val_loader, device, cfg)
+    metrics.update(_evaluate_positive_curves(model, curve_val, device, cfg, metrics["threshold"]))
     metrics["step"] = global_step + steps_done
     metrics["phase"] = "hard_negative_refresh"
     bus.metric(
@@ -776,6 +1079,10 @@ def _refresh_hard_negatives(
         val_fp_per_hour_at_0_5=metrics["fp_per_hour_at_0_5"],
         positive_median_score=metrics["positive_median_score"],
         positive_p10_score=metrics["positive_p10_score"],
+        curve_recall=metrics.get("curve_recall", 0.0),
+        curve_median_peak=metrics.get("curve_median_peak", 0.0),
+        curve_median_frames=metrics.get("curve_median_frames", 0.0),
+        curve_confirmation_rate=metrics.get("curve_confirmation_rate", 0.0),
         threshold=metrics["threshold"],
     )
     bus.log(
@@ -787,6 +1094,10 @@ def _refresh_hard_negatives(
         f"rawFP/hr@0.5={metrics['fp_per_hour_at_0_5']:.2f} "
         f"pos_med={metrics['positive_median_score']:.3f} "
         f"pos_p10={metrics['positive_p10_score']:.3f} "
+        f"curve={metrics.get('curve_recall', 0.0):.3f}/"
+        f"{metrics.get('curve_median_peak', 0.0):.3f}/"
+        f"{metrics.get('curve_median_frames', 0.0):.1f}f/"
+        f"{metrics.get('curve_confirmation_rate', 0.0):.3f} "
         f"threshold={metrics['threshold']:.5f}"
     )
     return steps_done, metrics
@@ -798,6 +1109,7 @@ def train(
     val_ds: FeatureMemmapDataset,
     out_dir: Path,
     workers: int = 4,
+    curve_val: CurveValidationSet | None = None,
     cancel_flag=None,
 ) -> TrainResult:
     """Run the training loop. `cancel_flag.is_set()` aborts gracefully."""
@@ -848,6 +1160,23 @@ def train(
         f"rawFP/hr@0.5<={cfg.max_fp_per_hour_at_0_5_for_export:.2f}, "
         f"pos_median>={cfg.min_positive_median_score_for_export:.2f}, "
         f"pos_p10>={cfg.min_positive_p10_score_for_export:.2f}, "
+        f"curve_validation={cfg.use_positive_curve_validation}, "
+        f"curve_recall>={cfg.min_curve_recall_for_export:.2f}, "
+        f"curve_med_peak>={cfg.min_curve_median_peak_for_export:.2f}, "
+        f"curve_p10_peak>={cfg.min_curve_p10_peak_for_export:.2f}, "
+        f"curve_med_frames>={cfg.min_curve_median_frames_for_export}, "
+        f"curve_med_span>={cfg.min_curve_median_span_ms_for_export:.0f}ms, "
+        f"curve_confirm>={cfg.min_curve_confirmation_rate_for_export:.2f}, "
+        f"tablet_curve_validation={cfg.use_tablet_curve_validation}, "
+        f"tablet_curve_recall>={cfg.min_tablet_curve_recall_for_export:.2f}, "
+        f"tablet_curve_med_peak>={cfg.min_tablet_curve_median_peak_for_export:.2f}, "
+        f"tablet_curve_med_frames>={cfg.min_tablet_curve_median_frames_for_export}, "
+        f"tablet_curve_med_span>={cfg.min_tablet_curve_median_span_ms_for_export:.0f}ms, "
+        f"tablet_curve_confirm>={cfg.min_tablet_curve_confirmation_rate_for_export:.2f}, "
+        f"positive_temporal_windows={cfg.positive_temporal_windows}x"
+        f"{cfg.positive_temporal_stride_embeddings}, "
+        f"positive_context={cfg.positive_context_seconds:.1f}s, "
+        f"quality_extension_steps={cfg.exportable_quality_extension_steps}, "
         f"weight_decay={cfg.weight_decay:.2e}, "
         f"lr={current_lr:.2e}, "
         "lr_schedule=warmup_hold_cosine, "
@@ -860,6 +1189,7 @@ def train(
     best_step = 0
     best_exportable = False
     no_improve = 0
+    exportable_quality_until_step = int(cfg.early_stop_min_steps)
 
     step = 0
     t0 = time.monotonic()
@@ -921,6 +1251,7 @@ def train(
 
         if step % cfg.val_every_n_steps == 0 or step == cfg.max_steps:
             metrics = _evaluate(model, val_loader, device, cfg)
+            metrics.update(_evaluate_positive_curves(model, curve_val, device, cfg, metrics["threshold"]))
             metrics["step"] = step
             history.append(metrics)
             bus.metric(
@@ -934,6 +1265,18 @@ def train(
                 val_fp_per_hour_at_0_5=metrics["fp_per_hour_at_0_5"],
                 positive_median_score=metrics["positive_median_score"],
                 positive_p10_score=metrics["positive_p10_score"],
+                curve_recall=metrics.get("curve_recall", 0.0),
+                curve_median_peak=metrics.get("curve_median_peak", 0.0),
+                curve_p10_peak=metrics.get("curve_p10_peak", 0.0),
+                curve_median_frames=metrics.get("curve_median_frames", 0.0),
+                curve_median_span_ms=metrics.get("curve_median_span_ms", 0.0),
+                curve_confirmation_rate=metrics.get("curve_confirmation_rate", 0.0),
+                tablet_curve_recall=metrics.get("tablet_curve_recall", 0.0),
+                tablet_curve_median_peak=metrics.get("tablet_curve_median_peak", 0.0),
+                tablet_curve_p10_peak=metrics.get("tablet_curve_p10_peak", 0.0),
+                tablet_curve_median_frames=metrics.get("tablet_curve_median_frames", 0.0),
+                tablet_curve_median_span_ms=metrics.get("tablet_curve_median_span_ms", 0.0),
+                tablet_curve_confirmation_rate=metrics.get("tablet_curve_confirmation_rate", 0.0),
                 threshold=metrics["threshold"],
             )
             bus.log(
@@ -945,6 +1288,16 @@ def train(
                 f"rawFP/hr@0.5={metrics['fp_per_hour_at_0_5']:.2f} "
                 f"pos_med={metrics['positive_median_score']:.3f} "
                 f"pos_p10={metrics['positive_p10_score']:.3f} "
+                f"curve={metrics.get('curve_recall', 0.0):.3f}/"
+                f"{metrics.get('curve_median_peak', 0.0):.3f}/"
+                f"{metrics.get('curve_median_frames', 0.0):.1f}f/"
+                f"{metrics.get('curve_median_span_ms', 0.0):.0f}ms/"
+                f"{metrics.get('curve_confirmation_rate', 0.0):.3f} "
+                f"tablet_curve={metrics.get('tablet_curve_recall', 0.0):.3f}/"
+                f"{metrics.get('tablet_curve_median_peak', 0.0):.3f}/"
+                f"{metrics.get('tablet_curve_median_frames', 0.0):.1f}f/"
+                f"{metrics.get('tablet_curve_median_span_ms', 0.0):.0f}ms/"
+                f"{metrics.get('tablet_curve_confirmation_rate', 0.0):.3f} "
                 f"threshold={metrics['threshold']:.5f}"
             )
             score = _checkpoint_score(metrics, cfg)
@@ -958,6 +1311,18 @@ def train(
                 torch.save(model.state_dict(), out_dir / "best_candidate.pt")
                 if best_exportable:
                     torch.save(model.state_dict(), out_dir / "best.pt")
+                    if int(cfg.exportable_quality_extension_steps) > 0:
+                        next_quality_until = min(
+                            int(cfg.max_steps),
+                            step + int(cfg.exportable_quality_extension_steps),
+                        )
+                        if next_quality_until > exportable_quality_until_step:
+                            exportable_quality_until_step = next_quality_until
+                            bus.log(
+                                "Extended exportable quality window: "
+                                f"continue until step={exportable_quality_until_step} "
+                                f"(best exportable at step={step})."
+                            )
                     bus.log(
                         "New exportable checkpoint: "
                         f"step={step} recall@targetFP={metrics['recall_at_target_fp']:.3f} "
@@ -1022,6 +1387,7 @@ def train(
                                 cfg,
                                 train_ds,
                                 val_loader,
+                                curve_val,
                                 device,
                                 hard_negative_refreshes,
                                 step,
@@ -1039,6 +1405,18 @@ def train(
                                     torch.save(model.state_dict(), out_dir / "best_candidate.pt")
                                     if best_exportable:
                                         torch.save(model.state_dict(), out_dir / "best.pt")
+                                        if int(cfg.exportable_quality_extension_steps) > 0:
+                                            next_quality_until = min(
+                                                int(cfg.max_steps),
+                                                best_step + int(cfg.exportable_quality_extension_steps),
+                                            )
+                                            if next_quality_until > exportable_quality_until_step:
+                                                exportable_quality_until_step = next_quality_until
+                                                bus.log(
+                                                    "Extended exportable quality window: "
+                                                    f"continue until step={exportable_quality_until_step} "
+                                                    f"(best exportable at step={best_step})."
+                                                )
                                         bus.log(
                                             "New exportable hard-refresh checkpoint: "
                                             f"step={best_step} "
@@ -1047,21 +1425,26 @@ def train(
                                             f"FP/hr={refresh_metrics['fp_per_hour']:.2f}"
                                         )
                         continue
-                if no_improve >= cfg.early_stop_patience and step >= cfg.early_stop_min_steps:
+                min_stop_step = (
+                    exportable_quality_until_step
+                    if best_exportable
+                    else int(cfg.early_stop_min_steps)
+                )
+                if no_improve >= cfg.early_stop_patience and step >= min_stop_step:
                     bus.log(
                         f"Early stop after {no_improve} evals without improvement "
-                        f"(min_steps={cfg.early_stop_min_steps})",
+                        f"(min_steps={min_stop_step})",
                         level="warning",
                     )
                     break
 
-            if _is_exportable(metrics, cfg) and step >= cfg.early_stop_min_steps:
+            if _is_exportable(metrics, cfg) and step >= exportable_quality_until_step:
                 bus.log("Hit target FP/hour with strong recall. Stopping.", level="info")
                 break
-            if _is_exportable(metrics, cfg) and step < cfg.early_stop_min_steps:
+            if _is_exportable(metrics, cfg) and step < exportable_quality_until_step:
                 bus.log(
                     "Checkpoint is exportable; continuing until "
-                    f"early_stop_min_steps={cfg.early_stop_min_steps} "
+                    f"quality_window_step={exportable_quality_until_step} "
                     "to improve quality.",
                     level="info",
                 )
@@ -1086,6 +1469,7 @@ def train(
             cfg,
             train_ds,
             val_loader,
+            curve_val,
             device,
             out_dir,
             history,
@@ -1121,7 +1505,29 @@ def train(
             f"pos_median={candidate.get('positive_median_score', 0.0):.3f} "
             f"(required >= {cfg.min_positive_median_score_for_export:.3f}), "
             f"pos_p10={candidate.get('positive_p10_score', 0.0):.3f} "
-            f"(required >= {cfg.min_positive_p10_score_for_export:.3f}). "
+            f"(required >= {cfg.min_positive_p10_score_for_export:.3f}), "
+            f"curve_recall={candidate.get('curve_recall', 0.0):.3f} "
+            f"(required >= {cfg.min_curve_recall_for_export:.3f}), "
+            f"curve_med_peak={candidate.get('curve_median_peak', 0.0):.3f} "
+            f"(required >= {cfg.min_curve_median_peak_for_export:.3f}), "
+            f"curve_p10_peak={candidate.get('curve_p10_peak', 0.0):.3f} "
+            f"(required >= {cfg.min_curve_p10_peak_for_export:.3f}), "
+            f"curve_med_frames={candidate.get('curve_median_frames', 0.0):.1f} "
+            f"(required >= {cfg.min_curve_median_frames_for_export:.1f}), "
+            f"curve_med_span={candidate.get('curve_median_span_ms', 0.0):.0f}ms "
+            f"(required >= {cfg.min_curve_median_span_ms_for_export:.0f}ms), "
+            f"curve_confirm={candidate.get('curve_confirmation_rate', 0.0):.3f} "
+            f"(required >= {cfg.min_curve_confirmation_rate_for_export:.3f}), "
+            f"tablet_curve_recall={candidate.get('tablet_curve_recall', 0.0):.3f} "
+            f"(required >= {cfg.min_tablet_curve_recall_for_export:.3f}), "
+            f"tablet_curve_med_peak={candidate.get('tablet_curve_median_peak', 0.0):.3f} "
+            f"(required >= {cfg.min_tablet_curve_median_peak_for_export:.3f}), "
+            f"tablet_curve_med_frames={candidate.get('tablet_curve_median_frames', 0.0):.1f} "
+            f"(required >= {cfg.min_tablet_curve_median_frames_for_export:.1f}), "
+            f"tablet_curve_med_span={candidate.get('tablet_curve_median_span_ms', 0.0):.0f}ms "
+            f"(required >= {cfg.min_tablet_curve_median_span_ms_for_export:.0f}ms), "
+            f"tablet_curve_confirm={candidate.get('tablet_curve_confirmation_rate', 0.0):.3f} "
+            f"(required >= {cfg.min_tablet_curve_confirmation_rate_for_export:.3f}). "
             f"Failed gates: {failure_detail}. "
             "Refusing to export/publish an unusable wake-word model."
         )
@@ -1147,6 +1553,16 @@ def train(
         f"rawFP/hr@0.5={best_metrics['fp_per_hour_at_0_5']:.2f}, "
         f"pos_med={best_metrics['positive_median_score']:.3f}, "
         f"pos_p10={best_metrics['positive_p10_score']:.3f}, "
+        f"curve={best_metrics.get('curve_recall', 0.0):.3f}/"
+        f"{best_metrics.get('curve_median_peak', 0.0):.3f}/"
+        f"{best_metrics.get('curve_median_frames', 0.0):.1f}f/"
+        f"{best_metrics.get('curve_median_span_ms', 0.0):.0f}ms/"
+        f"{best_metrics.get('curve_confirmation_rate', 0.0):.3f}, "
+        f"tablet_curve={best_metrics.get('tablet_curve_recall', 0.0):.3f}/"
+        f"{best_metrics.get('tablet_curve_median_peak', 0.0):.3f}/"
+        f"{best_metrics.get('tablet_curve_median_frames', 0.0):.1f}f/"
+        f"{best_metrics.get('tablet_curve_median_span_ms', 0.0):.0f}ms/"
+        f"{best_metrics.get('tablet_curve_confirmation_rate', 0.0):.3f}, "
         f"onnx_max_abs_diff={parity_diff:.2e})"
     )
 
@@ -1160,6 +1576,18 @@ def train(
         best_val_fp_per_hour_at_0_5=best_metrics["fp_per_hour_at_0_5"],
         best_positive_median_score=best_metrics["positive_median_score"],
         best_positive_p10_score=best_metrics["positive_p10_score"],
+        best_curve_recall=best_metrics.get("curve_recall", 0.0),
+        best_curve_median_peak=best_metrics.get("curve_median_peak", 0.0),
+        best_curve_p10_peak=best_metrics.get("curve_p10_peak", 0.0),
+        best_curve_median_frames=best_metrics.get("curve_median_frames", 0.0),
+        best_curve_median_span_ms=best_metrics.get("curve_median_span_ms", 0.0),
+        best_curve_confirmation_rate=best_metrics.get("curve_confirmation_rate", 0.0),
+        best_tablet_curve_recall=best_metrics.get("tablet_curve_recall", 0.0),
+        best_tablet_curve_median_peak=best_metrics.get("tablet_curve_median_peak", 0.0),
+        best_tablet_curve_p10_peak=best_metrics.get("tablet_curve_p10_peak", 0.0),
+        best_tablet_curve_median_frames=best_metrics.get("tablet_curve_median_frames", 0.0),
+        best_tablet_curve_median_span_ms=best_metrics.get("tablet_curve_median_span_ms", 0.0),
+        best_tablet_curve_confirmation_rate=best_metrics.get("tablet_curve_confirmation_rate", 0.0),
         best_threshold=best_metrics["threshold"],
         best_step=best_step,
         history=history,

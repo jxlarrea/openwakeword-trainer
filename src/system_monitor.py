@@ -132,6 +132,8 @@ def _gpu() -> dict[str, float | str] | None:
                 "gpu_mem_percent": 100.0 * used_mem / total_mem if total_mem else 0.0,
             }
         )
+    else:
+        result["gpu_mem_note"] = "unified memory"
     return result
 
 

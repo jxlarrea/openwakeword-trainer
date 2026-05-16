@@ -42,10 +42,12 @@ from src.sessions import (
 from src.settings import get_settings
 from src.system_monitor import sample_system
 from src.train.progress import bus
+from src.train.stress_test import run as run_stress_test
 from src.tts.elevenlabs_generator import ElevenLabsGenerator
 from src.tts.kokoro_generator import default_kokoro_voice_keys, list_kokoro_voices
 from src.tts.piper_generator import PiperGenerator
 from src.tts.voices import list_english_voices
+from src.augment.downloader import OPENWAKEWORD_ACAV100M_FILE, OPENWAKEWORD_VALIDATION_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -428,6 +430,75 @@ def register_routes(api: APIRouter) -> None:
             "score_curve": [{"t": t, "s": s} for t, s in result.score_curve],
         }
 
+    @api.post("/api/test/stress")
+    async def stress_test(payload: dict):
+        payload = payload or {}
+        model_name = str(payload.get("model_name") or "").strip()
+        if not model_name:
+            raise HTTPException(status_code=400, detail="model_name is required")
+        threshold = _bounded_float(payload.get("threshold"), 0.5, 0.0, 1.0)
+        batch_size = _bounded_int(payload.get("batch_size"), 8192, 1, 65536)
+        max_windows_raw = _bounded_int(payload.get("max_windows"), 1_000_000, 0, 50_000_000)
+        max_windows = max_windows_raw or None
+        include_session = bool(payload.get("include_session", True))
+        include_validation = bool(payload.get("include_validation", True))
+        include_acav100m = bool(payload.get("include_acav100m", False))
+        use_cuda = bool(payload.get("use_cuda", False))
+
+        models_dir = get_settings().models_dir.resolve()
+        model_path = (models_dir / model_name).resolve()
+        if (
+            not str(model_path).startswith(str(models_dir))
+            or not model_path.exists()
+            or model_path.suffix != ".onnx"
+        ):
+            raise HTTPException(status_code=404, detail="model not found")
+
+        settings = get_settings()
+        run_dir = None
+        if include_session:
+            candidate = (settings.runs_dir / model_path.stem).resolve()
+            runs_dir = settings.runs_dir.resolve()
+            if str(candidate).startswith(str(runs_dir)) and candidate.exists():
+                run_dir = candidate
+
+        external_features: list[Path] = []
+        skipped_sources: list[dict[str, str]] = []
+        if include_validation:
+            validation_path = settings.openwakeword_features_dir / OPENWAKEWORD_VALIDATION_FILE
+            if validation_path.exists():
+                external_features.append(validation_path)
+            else:
+                skipped_sources.append({"name": "openWakeWord validation", "reason": "not downloaded"})
+        if include_acav100m:
+            acav_path = settings.openwakeword_features_dir / OPENWAKEWORD_ACAV100M_FILE
+            if acav_path.exists():
+                external_features.append(acav_path)
+            else:
+                skipped_sources.append({"name": "ACAV100M", "reason": "not downloaded"})
+        if include_session and run_dir is None:
+            skipped_sources.append({"name": "session shards", "reason": f"no run cache for {model_path.stem}"})
+        if run_dir is None and not external_features:
+            raise HTTPException(status_code=400, detail="No stress-test sources are available for this request.")
+
+        try:
+            report = await asyncio.to_thread(
+                run_stress_test,
+                model_path=model_path,
+                threshold=threshold,
+                run_dir=run_dir,
+                external_features=external_features,
+                batch_size=batch_size,
+                max_windows=max_windows,
+                use_cuda=use_cuda,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Stress test failed: {exc}") from exc
+
+        report["skipped_sources"] = skipped_sources
+        report["max_windows"] = max_windows
+        return report
+
 
 # ----------------------------------------------------------------------------- #
 # Helpers
@@ -471,6 +542,22 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, audio, sample_rate, subtype="PCM_16", format="WAV")
     return buf.getvalue()
+
+
+def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = default
+    return max(minimum, min(maximum, out))
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        out = default
+    return max(minimum, min(maximum, out))
 
 
 def _form_to_config_payload(form) -> dict:
@@ -536,7 +623,7 @@ def _form_to_config_payload(form) -> dict:
             "rir_probability": _float("rir_probability", 0.9),
             "background_noise_probability": _float("background_noise_probability", 0.75),
             "use_tablet_far_field_augmentation": _bool("use_tablet_far_field_augmentation"),
-            "tablet_far_field_probability": _float("tablet_far_field_probability", 0.6),
+            "tablet_far_field_probability": _float("tablet_far_field_probability", 0.75),
             "augmentations_per_clip": _int("augmentations_per_clip", 6),
         },
         "datasets": {
@@ -583,7 +670,24 @@ def _form_to_config_payload(form) -> dict:
             "max_fp_per_hour_at_0_5_for_export": _float("max_fp_per_hour_at_0_5_for_export", 10.0),
             "min_positive_median_score_for_export": _float("min_positive_median_score_for_export", 0.75),
             "min_positive_p10_score_for_export": _float("min_positive_p10_score_for_export", 0.35),
-            "seed": _int("seed", 4041),
+            "use_positive_curve_validation": _bool("use_positive_curve_validation"),
+            "curve_validation_max_positive_clips": _int("curve_validation_max_positive_clips", 400),
+            "min_curve_recall_for_export": _float("min_curve_recall_for_export", 0.65),
+            "min_curve_median_peak_for_export": _float("min_curve_median_peak_for_export", 0.78),
+            "min_curve_p10_peak_for_export": _float("min_curve_p10_peak_for_export", 0.02),
+            "min_curve_median_frames_for_export": _int("min_curve_median_frames_for_export", 2),
+            "min_curve_median_span_ms_for_export": _float("min_curve_median_span_ms_for_export", 160.0),
+            "min_curve_confirmation_rate_for_export": _float("min_curve_confirmation_rate_for_export", 0.30),
+            "use_tablet_curve_validation": _bool("use_tablet_curve_validation"),
+            "tablet_curve_validation_variants_per_clip": _int("tablet_curve_validation_variants_per_clip", 1),
+            "min_tablet_curve_recall_for_export": _float("min_tablet_curve_recall_for_export", 0.24),
+            "min_tablet_curve_median_peak_for_export": _float("min_tablet_curve_median_peak_for_export", 0.27),
+            "min_tablet_curve_p10_peak_for_export": _float("min_tablet_curve_p10_peak_for_export", 0.04),
+            "min_tablet_curve_median_frames_for_export": _int("min_tablet_curve_median_frames_for_export", 0),
+            "min_tablet_curve_median_span_ms_for_export": _float("min_tablet_curve_median_span_ms_for_export", 0.0),
+            "min_tablet_curve_confirmation_rate_for_export": _float("min_tablet_curve_confirmation_rate_for_export", 0.08),
+            "curve_confirmation_min_gap_ms": _float("curve_confirmation_min_gap_ms", 320.0),
+            "seed": _int("seed", 4044),
         },
     }
     return payload

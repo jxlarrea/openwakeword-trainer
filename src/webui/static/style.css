@@ -464,6 +464,21 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 8px;
 }
+#stress-result {
+  margin-top: 14px;
+}
+.stress-summary {
+  margin-bottom: 12px;
+}
+.stress-table td,
+.stress-table th {
+  white-space: nowrap;
+}
+.stress-table td:first-child,
+.stress-table th:first-child {
+  white-space: normal;
+  min-width: 220px;
+}
 .score-bar {
   height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden;
 }

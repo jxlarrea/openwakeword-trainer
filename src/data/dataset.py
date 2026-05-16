@@ -32,10 +32,13 @@ from src.data.features import (
 
 logger = logging.getLogger(__name__)
 
-# Reference openWakeWord-style training uses one fixed clip per example.
-# 2 seconds at 16 kHz produces exactly one 16-timestep classifier input.
+# Reference openWakeWord-style training uses fixed clips. Positives can fan
+# out to adjacent trailing windows so the model learns a wider activation
+# region; negatives stay single-window to avoid making random audio easier to
+# trigger.
 TRAINING_CLIP_SAMPLES = 16_000 * 2
 _POSITIVE_END_JITTER_SAMPLES = int(0.2 * 16_000)
+DEFAULT_POSITIVE_CONTEXT_SAMPLES = 16_000 * 3
 
 
 @dataclass
@@ -245,6 +248,7 @@ def _align_training_clip(
     rng: np.random.Generator,
     active_start: int | None = None,
     active_end: int | None = None,
+    positive_context_samples: int = DEFAULT_POSITIVE_CONTEXT_SAMPLES,
 ) -> tuple[np.ndarray, int, int]:
     """Return one fixed-size training clip and speech bounds inside it.
 
@@ -291,7 +295,74 @@ def _align_training_clip(
     return out, offset + active_start, offset + active_end
 
 
-FEATURE_LABELING_VERSION = "fixed_end_aligned_examples_v1"
+def _place_positive_streaming_clip_with_bounds(
+    audio: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, int, int]:
+    """Place a positive phrase into a streaming-style 3 s buffer.
+
+    The fixed trailing windows teach the ideal "wake word just finished"
+    alignment. These streaming placements teach the model to stay active as a
+    rolling inference buffer advances across a spoken phrase.
+    """
+    active_start, active_end = _active_audio_bounds(audio)
+    speech = audio[active_start:active_end].astype(np.float32, copy=False)
+    if speech.size == 0:
+        speech = audio.astype(np.float32, copy=False)
+    lead_samples = int(rng.integers(int(0.4 * 16_000), int(1.2 * 16_000) + 1))
+    tail_samples = int(1.2 * 16_000)
+    total_samples = max(DEFAULT_POSITIVE_CONTEXT_SAMPLES, lead_samples + int(speech.size) + tail_samples)
+    out = np.zeros(total_samples, dtype=np.float32)
+    end = min(total_samples, lead_samples + int(speech.size))
+    out[lead_samples:end] = speech[: max(0, end - lead_samples)]
+    return out, lead_samples, end
+
+
+def _place_positive_streaming_clip(audio: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    out, _, _ = _place_positive_streaming_clip_with_bounds(audio, rng)
+    return out
+
+
+def _select_positive_streaming_windows(
+    windows: np.ndarray,
+    speech_end_sample: int,
+    n_windows: int,
+    stride_embeddings: int,
+) -> np.ndarray:
+    """Select streaming positive windows starting at wake-word completion.
+
+    classifier_inputs() returns every rolling 1.28 s window from the streaming
+    clip indexed by win_start. The window whose TRAILING EDGE lands AT
+    speech_end has win_start = speech_end_embedding (because the trailing
+    1.28 s ends exactly at speech_end). The model needs to recognize "wake
+    word just ended" for several adjacent rolling positions: walk FORWARD
+    from this anchor into the post-speech tail, where the wake word sits
+    increasingly toward the lead of the rolling 1.28 s buffer until it slides
+    out. Walking backward (the previous behaviour) trained the classifier on
+    windows whose trailing edge had not yet reached the wake word, i.e.
+    silence-as-positive.
+    """
+    n_windows = max(1, int(n_windows))
+    stride_embeddings = max(1, int(stride_embeddings))
+    if windows.shape[0] == 0:
+        return windows
+
+    hop_samples = int(0.08 * 16_000)
+    anchor_index = int(round(speech_end_sample / hop_samples)) - CLASSIFIER_WINDOW_EMBEDDINGS
+    anchor_index = max(0, min(windows.shape[0] - 1, anchor_index))
+    indices: list[int] = []
+    for k in range(n_windows):
+        idx = anchor_index + k * stride_embeddings
+        if idx >= windows.shape[0]:
+            break
+        if not indices or idx != indices[-1]:
+            indices.append(idx)
+    if not indices:
+        return windows[:1]
+    return windows[np.asarray(indices, dtype=np.int64)]
+
+
+FEATURE_LABELING_VERSION = "fixed_end_aligned_examples_v2"
 
 
 # ============================================================================
@@ -306,6 +377,9 @@ FEATURE_LABELING_VERSION = "fixed_end_aligned_examples_v1"
 _WORKER_AUGMENTER = None     # populated by _augment_worker_init
 _WORKER_EXTRACTOR = None     # populated by _augment_worker_init
 _WORKER_AUG_CFG = None       # populated by _augment_worker_init
+_WORKER_POSITIVE_TEMPORAL_WINDOWS = 1
+_WORKER_POSITIVE_TEMPORAL_STRIDE = 1
+_WORKER_POSITIVE_CONTEXT_SAMPLES = DEFAULT_POSITIVE_CONTEXT_SAMPLES
 
 
 def _augment_worker_init(
@@ -313,6 +387,9 @@ def _augment_worker_init(
     rir_dir_strs: list[str],
     bg_dir_strs: list[str],
     use_gpu: bool,
+    positive_temporal_windows: int = 1,
+    positive_temporal_stride_embeddings: int = 1,
+    positive_context_seconds: float = 3.0,
 ) -> None:
     """Pool initializer. Builds the augmenter and a FeatureExtractor per worker.
 
@@ -322,6 +399,8 @@ def _augment_worker_init(
     GPU utilization at ~18% in main-process-only mode.
     """
     global _WORKER_AUGMENTER, _WORKER_EXTRACTOR, _WORKER_AUG_CFG
+    global _WORKER_POSITIVE_TEMPORAL_WINDOWS, _WORKER_POSITIVE_TEMPORAL_STRIDE
+    global _WORKER_POSITIVE_CONTEXT_SAMPLES
     import warnings as _warnings
 
     from src.augment.augmenter import build_augmenter
@@ -346,6 +425,12 @@ def _augment_worker_init(
     if not use_gpu:
         providers = ["CPUExecutionProvider"]
     _WORKER_EXTRACTOR = FeatureExtractor(providers=providers)
+    _WORKER_POSITIVE_TEMPORAL_WINDOWS = max(1, int(positive_temporal_windows))
+    _WORKER_POSITIVE_TEMPORAL_STRIDE = max(1, int(positive_temporal_stride_embeddings))
+    _WORKER_POSITIVE_CONTEXT_SAMPLES = max(
+        TRAINING_CLIP_SAMPLES,
+        int(float(positive_context_seconds) * 16_000),
+    )
 
 
 def _augment_one_clip(task: dict) -> dict | None:
@@ -376,7 +461,14 @@ def _augment_one_clip(task: dict) -> dict | None:
             audio = _resample_poly(audio, 16_000 // g, sr // g).astype(_np.float32)
 
         rng = _np.random.default_rng(seed)
-        audio, _, _ = _align_training_clip(audio, label, rng)
+        speech_start = 0
+        speech_end = 0
+        audio, speech_start, speech_end = _align_training_clip(
+            audio,
+            label,
+            rng,
+            positive_context_samples=_WORKER_POSITIVE_CONTEXT_SAMPLES,
+        )
 
         all_windows: list[_np.ndarray] = []
         for _ in range(n_augs):
@@ -389,8 +481,8 @@ def _augment_one_clip(task: dict) -> dict | None:
             except Exception:
                 aug = audio
             int16 = float32_to_int16(aug)
-            feature = _WORKER_EXTRACTOR.fixed_classifier_input(int16)
-            all_windows.append(feature[None, ...])
+            feature = _WORKER_EXTRACTOR.fixed_classifier_input(int16)[None, ...]
+            all_windows.append(feature)
 
         if not all_windows:
             return {"n_windows": 0, "windows_bytes": b"", "task_index": task_index}
@@ -438,6 +530,9 @@ def build_features_from_wavs_parallel(
     completed_clip_indices: set[int] | None = None,
     checkpoint_callback=None,
     checkpoint_every: int = 500,
+    positive_temporal_windows: int = 1,
+    positive_temporal_stride_embeddings: int = 1,
+    positive_context_seconds: float = 3.0,
 ) -> int:
     """Full end-to-end pipeline in workers (align + augment + mel + embedding).
 
@@ -447,6 +542,7 @@ def build_features_from_wavs_parallel(
     a single drainer thread.
     """
     import time as _time
+    from multiprocessing import TimeoutError as PoolTimeoutError
     from multiprocessing import get_context
 
     from src.train.progress import bus
@@ -490,12 +586,28 @@ def build_features_from_wavs_parallel(
     with ctx.Pool(
         processes=workers,
         initializer=_augment_worker_init,
-        initargs=(aug_cfg_dump, rir_dir_strs, bg_dir_strs, use_gpu_in_workers),
+        initargs=(
+            aug_cfg_dump,
+            rir_dir_strs,
+            bg_dir_strs,
+            use_gpu_in_workers,
+            positive_temporal_windows,
+            positive_temporal_stride_embeddings,
+            positive_context_seconds,
+        ),
     ) as pool:
-        for result in pool.imap_unordered(_augment_one_clip, tasks, chunksize=2):
+        iterator = pool.imap_unordered(_augment_one_clip, tasks, chunksize=1)
+        while True:
             if cancel_flag is not None and cancel_flag.is_set():
                 pool.terminate()
                 break
+
+            try:
+                result = iterator.next(timeout=1.0)
+            except StopIteration:
+                break
+            except PoolTimeoutError:
+                continue
 
             task_index = int(result.get("task_index", -1)) if result is not None else -1
             n_new = int(result.get("n_windows", 0)) if result is not None else 0
@@ -564,6 +676,9 @@ def build_features_from_wavs(
     progress_fraction_base: float = 0.0,
     progress_fraction_span: float = 1.0,
     source_id_base: int = 0,
+    positive_temporal_windows: int = 1,
+    positive_temporal_stride_embeddings: int = 1,
+    positive_context_seconds: float = 3.0,
 ) -> int:
     """Read each wav, augment + extract features, write to the memmap.
 
@@ -614,10 +729,15 @@ def build_features_from_wavs(
             g = gcd(sr, 16_000)
             audio = resample_poly(audio, 16_000 // g, sr // g).astype(np.float32)
 
-        # Match the reference training shape: one fixed 2 s example per
-        # augmented clip. Positives are end-aligned, negatives are centered or
-        # cropped to a single fixed window.
-        audio, _, _ = _align_training_clip(audio, label, rng)
+        # Place positives with leading silence + speech + trailing tail so the
+        # fan-out can walk forward from speech_end into the tail. Negatives
+        # are centered or randomly cropped to a single fixed window.
+        audio, speech_start, speech_end = _align_training_clip(
+            audio,
+            label,
+            rng,
+            positive_context_samples=max(TRAINING_CLIP_SAMPLES, int(float(positive_context_seconds) * 16_000)),
+        )
 
         for variant in augment_clip(
             audio,
@@ -628,7 +748,7 @@ def build_features_from_wavs(
         ):
             int16 = float32_to_int16(variant)
             windows = extractor.fixed_classifier_input(int16)[None, ...]
-            n_new = 1
+            n_new = int(windows.shape[0])
             if cursor + n_new > out_features.shape[0]:
                 # Truncate to fit the pre-allocated memmap.
                 n_new = out_features.shape[0] - cursor

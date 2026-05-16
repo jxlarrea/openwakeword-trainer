@@ -19,6 +19,7 @@
   const sessionSummary = $("#session-summary");
   const configCard = $("#config");
   const testForm = $("#test-form");
+  const stressForm = $("#stress-form");
   const progressCancelBtn = $("#progress-cancel-btn");
   const progressStatusPill = $("#progress-status-pill");
   const progressCard = $("#progress");
@@ -76,21 +77,23 @@
   }
 
   function setTestFormEnabled(enabled) {
-    if (!testForm) return;
-    testForm.querySelectorAll("input, select, textarea, button").forEach((el) => {
-      if (!enabled) {
-        el.disabled = true;
-        return;
-      }
-      if (el.id === "stop-record-btn") {
-        el.disabled = true;
-        return;
-      }
-      if (el.id === "record-btn" && !(window.isSecureContext || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
-        el.disabled = true;
-        return;
-      }
-      el.disabled = false;
+    [testForm, stressForm].forEach((form) => {
+      if (!form) return;
+      form.querySelectorAll("input, select, textarea, button").forEach((el) => {
+        if (!enabled) {
+          el.disabled = true;
+          return;
+        }
+        if (el.id === "stop-record-btn") {
+          el.disabled = true;
+          return;
+        }
+        if (el.id === "record-btn" && !(window.isSecureContext || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
+          el.disabled = true;
+          return;
+        }
+        el.disabled = false;
+      });
     });
   }
 
@@ -204,6 +207,23 @@
     setValue(form, "max_fp_per_hour_at_0_5_for_export", tr.max_fp_per_hour_at_0_5_for_export);
     setValue(form, "min_positive_median_score_for_export", tr.min_positive_median_score_for_export);
     setValue(form, "min_positive_p10_score_for_export", tr.min_positive_p10_score_for_export);
+    setChecked(form, "use_positive_curve_validation", tr.use_positive_curve_validation !== false);
+    setValue(form, "curve_validation_max_positive_clips", tr.curve_validation_max_positive_clips);
+    setValue(form, "min_curve_recall_for_export", tr.min_curve_recall_for_export);
+    setValue(form, "min_curve_median_peak_for_export", tr.min_curve_median_peak_for_export);
+    setValue(form, "min_curve_p10_peak_for_export", tr.min_curve_p10_peak_for_export);
+    setValue(form, "min_curve_median_frames_for_export", tr.min_curve_median_frames_for_export);
+    setValue(form, "min_curve_median_span_ms_for_export", tr.min_curve_median_span_ms_for_export);
+    setValue(form, "min_curve_confirmation_rate_for_export", tr.min_curve_confirmation_rate_for_export);
+    setChecked(form, "use_tablet_curve_validation", tr.use_tablet_curve_validation !== false);
+    setValue(form, "tablet_curve_validation_variants_per_clip", tr.tablet_curve_validation_variants_per_clip);
+    setValue(form, "min_tablet_curve_recall_for_export", tr.min_tablet_curve_recall_for_export);
+    setValue(form, "min_tablet_curve_median_peak_for_export", tr.min_tablet_curve_median_peak_for_export);
+    setValue(form, "min_tablet_curve_p10_peak_for_export", tr.min_tablet_curve_p10_peak_for_export);
+    setValue(form, "min_tablet_curve_median_frames_for_export", tr.min_tablet_curve_median_frames_for_export);
+    setValue(form, "min_tablet_curve_median_span_ms_for_export", tr.min_tablet_curve_median_span_ms_for_export);
+    setValue(form, "min_tablet_curve_confirmation_rate_for_export", tr.min_tablet_curve_confirmation_rate_for_export);
+    setValue(form, "curve_confirmation_min_gap_ms", tr.curve_confirmation_min_gap_ms);
     setValue(form, "seed", tr.seed);
 
     if (deleteSessionBtn) deleteSessionBtn.disabled = runStatus === "running";
@@ -541,7 +561,7 @@
         rir_probability: vNum("rir_probability", 0.9),
         background_noise_probability: vNum("background_noise_probability", 0.75),
         use_tablet_far_field_augmentation: vBool("use_tablet_far_field_augmentation"),
-        tablet_far_field_probability: vNum("tablet_far_field_probability", 0.6),
+        tablet_far_field_probability: vNum("tablet_far_field_probability", 0.75),
         augmentations_per_clip: vNum("augmentations_per_clip", 6),
       },
       datasets: {
@@ -588,7 +608,24 @@
         max_fp_per_hour_at_0_5_for_export: vNum("max_fp_per_hour_at_0_5_for_export", 10),
         min_positive_median_score_for_export: vNum("min_positive_median_score_for_export", 0.75),
         min_positive_p10_score_for_export: vNum("min_positive_p10_score_for_export", 0.35),
-        seed: vNum("seed", 4041),
+        use_positive_curve_validation: vBool("use_positive_curve_validation"),
+        curve_validation_max_positive_clips: vNum("curve_validation_max_positive_clips", 400),
+        min_curve_recall_for_export: vNum("min_curve_recall_for_export", 0.65),
+        min_curve_median_peak_for_export: vNum("min_curve_median_peak_for_export", 0.78),
+        min_curve_p10_peak_for_export: vNum("min_curve_p10_peak_for_export", 0.02),
+        min_curve_median_frames_for_export: vNum("min_curve_median_frames_for_export", 2),
+        min_curve_median_span_ms_for_export: vNum("min_curve_median_span_ms_for_export", 160),
+        min_curve_confirmation_rate_for_export: vNum("min_curve_confirmation_rate_for_export", 0.3),
+        use_tablet_curve_validation: vBool("use_tablet_curve_validation"),
+        tablet_curve_validation_variants_per_clip: vNum("tablet_curve_validation_variants_per_clip", 1),
+        min_tablet_curve_recall_for_export: vNum("min_tablet_curve_recall_for_export", 0.24),
+        min_tablet_curve_median_peak_for_export: vNum("min_tablet_curve_median_peak_for_export", 0.27),
+        min_tablet_curve_p10_peak_for_export: vNum("min_tablet_curve_p10_peak_for_export", 0.04),
+        min_tablet_curve_median_frames_for_export: vNum("min_tablet_curve_median_frames_for_export", 0),
+        min_tablet_curve_median_span_ms_for_export: vNum("min_tablet_curve_median_span_ms_for_export", 0),
+        min_tablet_curve_confirmation_rate_for_export: vNum("min_tablet_curve_confirmation_rate_for_export", 0.08),
+        curve_confirmation_min_gap_ms: vNum("curve_confirmation_min_gap_ms", 320),
+        seed: vNum("seed", 4044),
       },
     };
   }
@@ -677,6 +714,7 @@
   }
 
   function setMetric(name, value) {
+    if (!metricsBox) return;
     let tile = metricMap.get(name);
     if (!tile) {
       tile = document.createElement("div");
@@ -748,6 +786,7 @@
   }
 
   function updateSystemMetrics(d) {
+    if ("gpu_name" in d) setMetric("Accelerator", d.gpu_name);
     if ("cpu_percent" in d) setMetric("CPU", fmtPct(d.cpu_percent));
     if ("ram_percent" in d) {
       setMetric(
@@ -761,6 +800,8 @@
         "GPU VRAM",
         `${fmtPct(d.gpu_mem_percent)} (${fmtGb(d.gpu_mem_used_gb)} / ${fmtGb(d.gpu_mem_total_gb)})`
       );
+    } else if ("gpu_mem_note" in d) {
+      setMetric("GPU Memory", `${d.gpu_mem_note} (see RAM)`);
     }
     if ("gpu_temp_c" in d) setMetric("GPU Temp", Math.round(d.gpu_temp_c) + " C");
   }
@@ -908,6 +949,154 @@
     refreshModels();
   });
   updateModelInfo();
+
+  $("#stress-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const modelName = $("#test-model")?.value;
+    if (!modelName) {
+      alert("No model selected.");
+      return;
+    }
+    const form = e.target;
+    const fd = new FormData(form);
+    const payload = {
+      model_name: modelName,
+      threshold: Number(fd.get("threshold") || 0.5),
+      max_windows: Number(fd.get("max_windows") || 0),
+      batch_size: Number(fd.get("batch_size") || 8192),
+      include_session: fd.has("include_session"),
+      include_validation: fd.has("include_validation"),
+      include_acav100m: fd.has("include_acav100m"),
+      use_cuda: fd.has("use_cuda"),
+    };
+    const status = $("#stress-status");
+    const btn = $("#stress-run-btn");
+    if (status) {
+      status.textContent = "running...";
+      status.className = "pill running";
+    }
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch("/api/test/stress", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
+      const result = await res.json();
+      renderStressResult(result);
+      if (status) {
+        status.textContent = "complete";
+        status.className = "pill succeeded";
+      }
+    } catch (err) {
+      if (status) {
+        status.textContent = "failed";
+        status.className = "pill failed";
+      }
+      alert("Stress test failed: " + (err?.message || err));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  function fmtScore(v) {
+    return typeof v === "number" && Number.isFinite(v) ? v.toFixed(4) : "-";
+  }
+
+  function fmtRate(v) {
+    return typeof v === "number" && Number.isFinite(v) ? v.toFixed(3) : "-";
+  }
+
+  function renderStressResult(report) {
+    const out = $("#stress-result");
+    if (!out) return;
+    const reports = report.reports || [];
+    const negativeReports = reports.filter((r) => r.kind === "negative");
+    const totalHours = negativeReports.reduce((acc, r) => acc + (Number(r.hours) || 0), 0);
+    const totalEvents = negativeReports.reduce((acc, r) => acc + (Number(r.events) || 0), 0);
+    const aggregateFpHr = totalHours > 0 ? totalEvents / totalHours : 0;
+    const skipped = report.skipped_sources || [];
+
+    const rows = reports.map((r) => {
+      const s = r.score || {};
+      if (r.kind === "positive") {
+        const count = r.clips ?? r.windows ?? 0;
+        return `
+          <tr>
+            <td>${escapeHtml(r.name)}</td>
+            <td>positive</td>
+            <td>${Number(count).toLocaleString()}</td>
+            <td>-</td>
+            <td>-</td>
+            <td>${fmtRate(r.recall)}</td>
+            <td>${fmtScore(s.p10)}</td>
+            <td>${fmtScore(s.p50)}</td>
+            <td>${fmtScore(s.max)}</td>
+          </tr>
+        `;
+      }
+      return `
+        <tr>
+          <td>${escapeHtml(r.name)}</td>
+          <td>negative</td>
+          <td>${Number(r.windows || 0).toLocaleString()}</td>
+          <td>${fmtRate(r.hours)}</td>
+          <td>${Number(r.events || 0).toLocaleString()}</td>
+          <td>${fmtRate(r.fp_per_hour)}</td>
+          <td>${fmtScore(s.p99)}</td>
+          <td>${fmtScore(s.p99_9)}</td>
+          <td>${fmtScore(s.max)}</td>
+        </tr>
+      `;
+    }).join("");
+
+    const skippedHtml = skipped.length
+      ? `<p class="hint">Skipped: ${skipped.map((s) => `${escapeHtml(s.name)} (${escapeHtml(s.reason)})`).join(", ")}</p>`
+      : "";
+
+    out.innerHTML = `
+      <div class="metrics stress-summary">
+        <div class="metric-tile">
+          <div class="name">Aggregate FP/hr</div>
+          <div class="value">${fmtRate(aggregateFpHr)}</div>
+        </div>
+        <div class="metric-tile">
+          <div class="name">Negative hours</div>
+          <div class="value">${fmtRate(totalHours)}</div>
+        </div>
+        <div class="metric-tile">
+          <div class="name">Events</div>
+          <div class="value">${Number(totalEvents || 0).toLocaleString()}</div>
+        </div>
+        <div class="metric-tile">
+          <div class="name">Provider</div>
+          <div class="value">${escapeHtml((report.providers || []).join(", ") || "-")}</div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="session-table stress-table">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Kind</th>
+              <th>Windows / clips</th>
+              <th>Hours</th>
+              <th>Events</th>
+              <th>FP/hr or recall</th>
+              <th>p99 / p10</th>
+              <th>p99.9 / p50</th>
+              <th>Max</th>
+            </tr>
+          </thead>
+          <tbody>${rows || `<tr><td colspan="9" class="empty-row">No reports returned.</td></tr>`}</tbody>
+        </table>
+      </div>
+      ${skippedHtml}
+    `;
+  }
 
   // ---------- Mic recording with HTTPS gate ----------
 

@@ -146,6 +146,101 @@ _O_STARTING_PHRASES = [
 ]
 
 
+# Competing wake words and rhythm-similar two-syllable openers. These are
+# ALWAYS injected into the adversarial pool regardless of the trained wake
+# word's prefix family, because without them the classifier never learns to
+# reject the most common false-trigger class in real deployment: phrases
+# that share the wake word's rhythmic shape but no phonetic content (e.g.
+# "hey jarvis" for a model trained on "ok nabu"). Without these examples,
+# the model can score such phrases at ~0.3-0.4 raw - thin margin against the
+# 0.5 runtime trigger threshold.
+_COMPETING_WAKE_WORDS = [
+    # Major assistant wake words
+    "hey google", "ok google", "okay google",
+    "hey siri", "hi siri",
+    "hey alexa", "alexa", "echo",
+    "hey cortana",
+    "hey computer", "computer",
+    "hey portal", "hey facebook", "hey meta",
+    "hey jarvis", "jarvis",
+    "hey rhasspy", "rhasspy",
+    "hey mycroft", "mycroft",
+    "hey marvin", "marvin",
+    "hey snips",
+    "hey bixby", "bixby",
+    "hey nest", "ok nest",
+    "hey home",
+    "hey assistant", "ok assistant",
+    "hey buddy",
+    "hey friend",
+    "hey watson",
+    "hey echo",
+    # Common voice-command phrasing that ISN'T a wake word
+    "hey there", "hi there", "hello there",
+    "hey you", "hi you",
+    "hey now", "hi now",
+    "hey man",
+    "hey listen", "hi listen",
+    "hey wait",
+    "hey look",
+    "hey what",
+    "yo wassup", "yo dude", "yo what",
+    "what's up", "what is it", "what's that", "what's this", "what now",
+    "wake up", "wake me", "wake me up",
+    "shut up", "shut down",
+    "tell me", "show me", "play me", "find me", "give me",
+    "i think", "i mean", "i know", "i guess", "i wonder", "i need",
+    "you know", "you see", "you got it", "you can",
+    "let me", "let's go", "let's see", "let's try",
+    "do it", "say it", "go on", "go ahead",
+    "come on", "come here",
+    "hold on", "hang on",
+    "actually", "anyway", "alright", "honestly", "obviously",
+    "give me a minute", "wait a sec", "wait a minute", "hold on a sec",
+    "tell me about", "show me how", "find me a",
+    "make me a", "play some music", "set a timer",
+    "turn on", "turn off", "turn it on", "turn it off",
+    "set the timer", "set the alarm",
+    "what time is it", "what's the weather",
+    "i love you", "i hate it",
+    # Names that sound vaguely wake-word-ish (rhythm + onset)
+    "hey peter", "hey patrick", "hey paul", "hey peggy",
+    "hey amy", "hey andy", "hey adam", "hey alex",
+    "hey betty", "hey bobby", "hey bruce", "hey ben",
+    "hey carol", "hey carl", "hey casey", "hey chris",
+    "hey david", "hey diana", "hey doug",
+    "hey eric", "hey emma", "hey ellen",
+    "hey frank", "hey fred",
+    "hey george", "hey gary",
+    "hey harry", "hey henry", "hey helen",
+    "hey ian", "hey iris",
+    "hey jack", "hey jane", "hey james", "hey jerry", "hey john",
+    "hey kate", "hey kevin", "hey karl",
+    "hey larry", "hey laura", "hey leo",
+    "hey mary", "hey mike", "hey mark",
+    "hey nick", "hey nancy", "hey nathan",
+    "hey oscar", "hey oliver",
+    "hey rachel", "hey ryan", "hey rob",
+    "hey sarah", "hey sam", "hey sandy", "hey steve",
+    "hey tom", "hey tim", "hey tony", "hey tina",
+    "hey vicky", "hey vince",
+    "hey walter", "hey wendy",
+]
+
+
+def _competing_wake_words_negatives(wake_word: str) -> list[str]:
+    """Return competing-wake-word and rhythm-rival phrases minus the trained one."""
+    wake_lower = wake_word.lower().strip()
+    out = []
+    for p in _COMPETING_WAKE_WORDS:
+        if p == wake_lower:
+            continue
+        if " " in wake_lower and wake_lower in p:
+            continue
+        out.append(p)
+    return out
+
+
 def _prefix_family(first_word: str) -> list[str]:
     """Return phonetic siblings of a wake-word first-word (lower-cased)."""
     first_word = first_word.lower().strip()
@@ -271,6 +366,11 @@ def build_adversarial_phrases(
 
     pool: list[str] = []
     pool.extend(_generate_prefix_negatives(wake_word))
+    # ALWAYS include competing wake-word + rhythm-rival negatives. Without
+    # this, the model only learns to reject phrases that share its prefix
+    # ("ok X") and scores rhythm-similar non-"ok" phrases ("hey jarvis")
+    # at ~0.3-0.4 raw - thin margin to the 0.5 runtime trigger.
+    pool.extend(_competing_wake_words_negatives(wake_word))
     pool.extend(GENERIC_NEGATIVE_PHRASES)
     pool.extend(_phonetic_neighbors(wake_word))
     if extra_phrases:

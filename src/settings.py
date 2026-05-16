@@ -30,6 +30,7 @@ class Settings(BaseSettings):
 
     # Workers
     generation_workers: int = 0  # 0 -> min(10, cpu_count)
+    feature_workers: int = 0  # 0 -> min(14, cpu_count)
     dataloader_workers: int = 0  # 0 -> min(8, cpu_count)
     # Threads per Piper worker's onnxruntime session. workers * this should be
     # near the physical core count. DGX Spark (20 cores) likes 10 * 2 = 20.
@@ -110,6 +111,12 @@ class Settings(BaseSettings):
         # DGX Spark's 20 physical cores exactly (10 workers x 2 ort threads).
         # Override OWW_GENERATION_WORKERS to scale on smaller / larger hosts.
         return self.generation_workers or min(10, max(1, (os.cpu_count() or 2)))
+
+    def resolved_feature_workers(self) -> int:
+        # Feature extraction mixes CPU-heavy augmentation with GPU-backed ONNX
+        # feature models. It can usually use a few more workers than Piper,
+        # but each worker still owns a CUDA session, so keep the default bounded.
+        return self.feature_workers or min(14, max(1, (os.cpu_count() or 2)))
 
     def resolved_dataloader_workers(self) -> int:
         return self.dataloader_workers or min(8, max(1, (os.cpu_count() or 2)))

@@ -27,6 +27,7 @@ from typing import Optional
 import numpy as np
 
 from src.augment.augmenter import (
+    apply_tablet_far_field_effect,
     build_augmenter,
     collect_background_noise_dirs,
     collect_rir_dirs,
@@ -52,10 +53,11 @@ from src.data.features import (
     CLASSIFIER_WINDOW_EMBEDDINGS,
     EMBEDDING_DIM,
     FeatureExtractor,
+    float32_to_int16,
 )
 from src.settings import get_settings
 from src.train.progress import bus
-from src.train.trainer import train as run_training
+from src.train.trainer import CurveValidationSet, train as run_training
 from src.tts.elevenlabs_generator import ElevenLabsGenerator
 from src.tts.kokoro_generator import KokoroGenerator
 from src.tts.piper_generator import PiperGenerator
@@ -65,6 +67,8 @@ logger = logging.getLogger(__name__)
 FEATURE_RESUME_FILENAME = "features_resume.json"
 FEATURE_RESUME_VERSION = 1
 FEATURE_CHECKPOINT_EVERY_CLIPS = 500
+CURVE_VALIDATION_FILENAME = "positive_curve_validation.json"
+CURVE_VALIDATION_VERSION = 5
 
 
 class RunState:
@@ -586,6 +590,7 @@ def _feature_input_signature(
     positive_wavs: list[Path],
     negative_wavs: list[Path],
     cv_clips: list[Path],
+    background_negative_clips: list[Path],
 ) -> str:
     """Hash the inputs that affect extracted features and train/val splits."""
     h = hashlib.sha256()
@@ -596,6 +601,9 @@ def _feature_input_signature(
         "generation": cfg.generation.model_dump(mode="json"),
         "augmentation": cfg.augmentation.model_dump(mode="json"),
         "datasets": cfg.datasets.model_dump(mode="json"),
+        "positive_temporal_windows": cfg.training.positive_temporal_windows,
+        "positive_temporal_stride_embeddings": cfg.training.positive_temporal_stride_embeddings,
+        "positive_context_seconds": cfg.training.positive_context_seconds,
         "split_seed": cfg.training.seed,
     }
     h.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -603,6 +611,7 @@ def _feature_input_signature(
         ("positive", positive_wavs),
         ("negative", negative_wavs),
         ("common_voice", cv_clips),
+        ("background_negatives", background_negative_clips),
     ):
         h.update(group_name.encode("utf-8"))
         h.update(str(len(paths)).encode("ascii"))
@@ -615,6 +624,269 @@ def _feature_input_signature(
                 continue
             h.update(f":{st.st_size}:{st.st_mtime_ns}".encode("ascii"))
     return h.hexdigest()
+
+
+def _collect_background_negative_clips(bg_dirs: list[Path], limit: int, seed: int) -> list[Path]:
+    """Use environmental corpora as standalone no-wake-word negative clips.
+
+    MUSAN/FSD50K are already used as background overlays. Adding a bounded,
+    deterministic subset as direct negatives gives the classifier explicit
+    examples of household/media/noise audio where no wake word is present.
+    """
+    if limit <= 0:
+        return []
+    suffixes = {".wav", ".flac", ".ogg"}
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in bg_dirs:
+        if not root or not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in suffixes and path not in seen:
+                seen.add(path)
+                candidates.append(path)
+    if len(candidates) <= limit:
+        return sorted(candidates)
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(candidates), size=limit, replace=False)
+    return sorted(candidates[int(i)] for i in indices)
+
+
+def _curve_validation_signature(cfg: TrainRunConfig, val_pos: list[Path]) -> str:
+    h = hashlib.sha256()
+    payload = {
+        "version": CURVE_VALIDATION_VERSION,
+        "wake_word": cfg.wake_word,
+        "seed": cfg.training.seed,
+        "max_positive_clips": cfg.training.curve_validation_max_positive_clips,
+        "tablet_curve_validation": cfg.training.use_tablet_curve_validation,
+        "tablet_variants_per_clip": cfg.training.tablet_curve_validation_variants_per_clip,
+        "tablet_far_field_probability": cfg.augmentation.tablet_far_field_probability,
+        "rir_probability": cfg.augmentation.rir_probability,
+        "background_noise_probability": cfg.augmentation.background_noise_probability,
+    }
+    h.update(json.dumps(payload, sort_keys=True).encode("utf-8"))
+    for path in val_pos:
+        h.update(str(path).encode("utf-8"))
+        try:
+            st = path.stat()
+        except OSError:
+            h.update(b":missing")
+            continue
+        h.update(f":{st.st_size}:{st.st_mtime_ns}".encode("ascii"))
+    return h.hexdigest()
+
+
+def _load_audio_16k(path: Path) -> np.ndarray:
+    import soundfile as sf
+    from math import gcd
+    from scipy.signal import resample_poly
+
+    audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if sr != 16_000:
+        g = gcd(sr, 16_000)
+        audio = resample_poly(audio, 16_000 // g, sr // g).astype(np.float32)
+    else:
+        audio = audio.astype(np.float32, copy=False)
+    return audio
+
+
+def _place_positive_for_curve_validation(audio: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Place a phrase-only synthetic WAV into a streaming-style test clip."""
+    lead_samples = int(rng.integers(int(0.4 * 16_000), int(1.2 * 16_000) + 1))
+    tail_samples = int(1.2 * 16_000)
+    total_samples = max(16_000 * 3, lead_samples + int(audio.size) + tail_samples)
+    out = np.zeros(total_samples, dtype=np.float32)
+    end = min(total_samples, lead_samples + int(audio.size))
+    out[lead_samples:end] = audio[: max(0, end - lead_samples)]
+    return out
+
+
+def _build_curve_validation_features(
+    *,
+    run_dir: Path,
+    val_pos: list[Path],
+    cfg: TrainRunConfig,
+    extractor: FeatureExtractor,
+    rir_dirs: list[Path],
+    bg_dirs: list[Path],
+) -> CurveValidationSet | None:
+    """Precompute full-audio sliding positive curves for export validation."""
+    if not cfg.training.use_positive_curve_validation or not val_pos:
+        return None
+
+    limit = max(1, int(cfg.training.curve_validation_max_positive_clips))
+    selected = list(val_pos)
+    if len(selected) > limit:
+        rng = np.random.default_rng(cfg.training.seed + 313)
+        indices = sorted(int(i) for i in rng.choice(len(selected), size=limit, replace=False))
+        selected = [selected[i] for i in indices]
+
+    meta_path = run_dir / CURVE_VALIDATION_FILENAME
+    features_path = run_dir / "positive_curve_features.bin"
+    source_ids_path = run_dir / "positive_curve_source_ids.npy"
+    tablet_features_path = run_dir / "tablet_positive_curve_features.bin"
+    tablet_source_ids_path = run_dir / "tablet_positive_curve_source_ids.npy"
+    signature = _curve_validation_signature(cfg, selected)
+    if meta_path.exists() and features_path.exists() and source_ids_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            tablet_ready = (
+                not cfg.training.use_tablet_curve_validation
+                or (
+                    tablet_features_path.exists()
+                    and tablet_source_ids_path.exists()
+                    and int(meta.get("tablet_n_windows", 0)) > 0
+                    and int(meta.get("tablet_n_clips", 0)) > 0
+                )
+            )
+            if (
+                meta.get("version") == CURVE_VALIDATION_VERSION
+                and meta.get("signature") == signature
+                and int(meta.get("n_windows", 0)) > 0
+                and int(meta.get("n_clips", 0)) > 0
+                and tablet_ready
+            ):
+                bus.log(
+                    "Reusing full-audio positive curve validation cache: "
+                    f"{int(meta['n_clips']):,} clean clips, {int(meta['n_windows']):,} windows; "
+                    f"{int(meta.get('tablet_n_clips', 0)):,} tablet clips, "
+                    f"{int(meta.get('tablet_n_windows', 0)):,} windows"
+                )
+                return CurveValidationSet(
+                    features_path=features_path,
+                    source_ids_path=source_ids_path,
+                    n_windows=int(meta["n_windows"]),
+                    n_clips=int(meta["n_clips"]),
+                    tablet_features_path=tablet_features_path if cfg.training.use_tablet_curve_validation else None,
+                    tablet_source_ids_path=tablet_source_ids_path if cfg.training.use_tablet_curve_validation else None,
+                    tablet_n_windows=int(meta.get("tablet_n_windows", 0)),
+                    tablet_n_clips=int(meta.get("tablet_n_clips", 0)),
+                )
+        except Exception:
+            bus.log("Ignoring unreadable positive curve validation cache", level="warning")
+
+    windows: list[np.ndarray] = []
+    source_ids: list[np.ndarray] = []
+    tablet_windows: list[np.ndarray] = []
+    tablet_source_ids: list[np.ndarray] = []
+    rng = np.random.default_rng(cfg.training.seed + 719)
+    # Use the per-clip training probabilities directly instead of stacking
+    # 100% tablet + 90% RIR + 50% bg on every clip. Worst-case stacking made
+    # the tablet curve gate effectively unreachable: most clips dropped to
+    # ~0.3 calibrated peaks because every variant got all three degradations
+    # at once. Real deployment is one channel at a time at the configured
+    # rate; generate a few variants per clip so the metric is stable.
+    tablet_aug_cfg = cfg.augmentation.model_copy(
+        update={
+            "use_tablet_far_field_augmentation": True,
+        }
+    )
+    tablet_augmenter = (
+        build_augmenter(tablet_aug_cfg, rir_dirs=rir_dirs, background_noise_dirs=bg_dirs)
+        if cfg.training.use_tablet_curve_validation
+        else None
+    )
+    tablet_variants_per_clip = max(1, int(cfg.training.tablet_curve_validation_variants_per_clip))
+    for clip_id, path in enumerate(selected):
+        try:
+            audio = _load_audio_16k(path)
+            audio = _place_positive_for_curve_validation(audio, rng)
+            clip_windows = extractor.classifier_inputs(float32_to_int16(audio))
+        except Exception as exc:
+            bus.log(f"Skipping curve validation clip {path.name}: {exc}", level="warning")
+            continue
+        if clip_windows.shape[0] == 0:
+            continue
+        windows.append(clip_windows.astype(np.float32, copy=False))
+        source_ids.append(np.full(clip_windows.shape[0], clip_id, dtype=np.int32))
+        if tablet_augmenter is not None:
+            for variant_idx in range(tablet_variants_per_clip):
+                try:
+                    tablet_audio = tablet_augmenter(samples=audio.astype(np.float32), sample_rate=16_000)
+                    tablet_audio = apply_tablet_far_field_effect(tablet_audio, 16_000, tablet_aug_cfg)
+                    np.clip(tablet_audio, -1.0, 1.0, out=tablet_audio)
+                    tw = extractor.classifier_inputs(float32_to_int16(tablet_audio))
+                except Exception as exc:
+                    bus.log(
+                        f"Skipping tablet curve validation variant {path.name}: {exc}",
+                        level="warning",
+                    )
+                    continue
+                if tw.shape[0] == 0:
+                    continue
+                tablet_windows.append(tw.astype(np.float32, copy=False))
+                tablet_source_ids.append(
+                    np.full(
+                        tw.shape[0],
+                        clip_id * tablet_variants_per_clip + variant_idx,
+                        dtype=np.int32,
+                    )
+                )
+
+    if not windows:
+        bus.log("No positive curve validation windows were produced", level="warning")
+        return None
+
+    all_windows = np.concatenate(windows, axis=0)
+    all_sources = np.concatenate(source_ids, axis=0)
+    features_path.parent.mkdir(parents=True, exist_ok=True)
+    mm = np.memmap(
+        features_path,
+        dtype=np.float32,
+        mode="w+",
+        shape=all_windows.shape,
+    )
+    mm[:] = all_windows
+    mm.flush()
+    del mm
+    np.save(source_ids_path, all_sources)
+    tablet_n_windows = 0
+    tablet_n_clips = 0
+    if cfg.training.use_tablet_curve_validation and tablet_windows:
+        all_tablet_windows = np.concatenate(tablet_windows, axis=0)
+        all_tablet_sources = np.concatenate(tablet_source_ids, axis=0)
+        tmm = np.memmap(
+            tablet_features_path,
+            dtype=np.float32,
+            mode="w+",
+            shape=all_tablet_windows.shape,
+        )
+        tmm[:] = all_tablet_windows
+        tmm.flush()
+        del tmm
+        np.save(tablet_source_ids_path, all_tablet_sources)
+        tablet_n_windows = int(all_tablet_windows.shape[0])
+        tablet_n_clips = int(np.unique(all_tablet_sources).size)
+    elif cfg.training.use_tablet_curve_validation:
+        bus.log("No tablet/off-axis positive curve validation windows were produced", level="warning")
+    meta = {
+        "version": CURVE_VALIDATION_VERSION,
+        "signature": signature,
+        "n_windows": int(all_windows.shape[0]),
+        "n_clips": int(len(windows)),
+        "tablet_n_windows": tablet_n_windows,
+        "tablet_n_clips": tablet_n_clips,
+        "clips": [str(p) for p in selected],
+    }
+    _atomic_write_json(meta_path, meta)
+    bus.log(
+        "Built full-audio positive curve validation set: "
+        f"{len(windows):,} clean clips, {all_windows.shape[0]:,} windows; "
+        f"{tablet_n_clips:,} tablet clips, {tablet_n_windows:,} windows"
+    )
+    return CurveValidationSet(
+        features_path=features_path,
+        source_ids_path=source_ids_path,
+        n_windows=int(all_windows.shape[0]),
+        n_clips=int(len(windows)),
+        tablet_features_path=tablet_features_path if tablet_n_windows else None,
+        tablet_source_ids_path=tablet_source_ids_path if tablet_n_windows else None,
+        tablet_n_windows=tablet_n_windows,
+        tablet_n_clips=tablet_n_clips,
+    )
 
 
 def _load_completed_feature_cache(
@@ -760,7 +1032,7 @@ def _build_features(
     common_voice_dir: Path | None,
     cfg: TrainRunConfig,
     run_dir: Path,
-) -> tuple[FeatureMemmapDataset, FeatureMemmapDataset, dict[str, ShardManifest]]:
+) -> tuple[FeatureMemmapDataset, FeatureMemmapDataset, dict[str, ShardManifest], CurveValidationSet | None]:
     """Augment + extract features into train/val memmaps."""
     extractor = FeatureExtractor()
 
@@ -784,7 +1056,20 @@ def _build_features(
     if common_voice_dir and cfg.datasets.use_common_voice_negatives:
         cv_clips = sorted(common_voice_dir.rglob("*.wav"))[: cfg.datasets.common_voice_subset]
 
-    all_negatives = negative_wavs + cv_clips
+    background_negative_clips: list[Path] = []
+    if cfg.datasets.use_background_corpus_negatives:
+        background_negative_clips = _collect_background_negative_clips(
+            bg_dirs,
+            int(cfg.datasets.background_corpus_negative_subset),
+            seed=cfg.training.seed,
+        )
+        if background_negative_clips:
+            bus.log(
+                f"Added background-corpus standalone negatives: "
+                f"{len(background_negative_clips):,} clips"
+            )
+
+    all_negatives = negative_wavs + cv_clips + background_negative_clips
 
     # 90/10 split; track at the source-clip level so windows from the same clip
     # don't leak across train/val.
@@ -799,19 +1084,35 @@ def _build_features(
     val_pos = [positive_wavs[i] for i in pos_idx[pos_split:]]
     train_neg = [all_negatives[i] for i in neg_idx[:neg_split]]
     val_neg = [all_negatives[i] for i in neg_idx[neg_split:]]
+    curve_val = _build_curve_validation_features(
+        run_dir=run_dir,
+        val_pos=val_pos,
+        cfg=cfg,
+        extractor=extractor,
+        rir_dirs=rir_dirs,
+        bg_dirs=bg_dirs,
+    )
 
     aug_per = cfg.augmentation.augmentations_per_clip
-    feature_signature = _feature_input_signature(cfg, positive_wavs, negative_wavs, cv_clips)
+    feature_signature = _feature_input_signature(
+        cfg,
+        positive_wavs,
+        negative_wavs,
+        cv_clips,
+        background_negative_clips,
+    )
     cached = _load_completed_feature_cache(run_dir, feature_signature)
     if cached is not None:
-        return cached
+        train_ds, val_ds, manifests = cached
+        return train_ds, val_ds, manifests, curve_val
 
+    pos_windows_per_aug = max(1, int(cfg.training.positive_temporal_windows)) * 2
     train_capacity = (
-        estimate_window_count(len(train_pos), aug_per)
+        estimate_window_count(len(train_pos), aug_per, pos_windows_per_aug)
         + estimate_window_count(len(train_neg), aug_per)
     ) or 1024
     val_capacity = (
-        estimate_window_count(len(val_pos), aug_per)
+        estimate_window_count(len(val_pos), aug_per, pos_windows_per_aug)
         + estimate_window_count(len(val_neg), aug_per)
     ) or 256
 
@@ -878,7 +1179,7 @@ def _build_features(
 
     # Feature extraction uses a process pool. Each worker does augmentation
     # + mel + embedding + window filter end-to-end; main writes the memmap.
-    workers = get_settings().resolved_generation_workers()
+    workers = get_settings().resolved_feature_workers()
     bus.log(
         f"features:extract using {workers} worker processes "
         f"(each with its own CUDA session)"
@@ -991,6 +1292,9 @@ def _build_features(
             completed_clip_indices=completed_indices,
             checkpoint_callback=checkpoint,
             checkpoint_every=FEATURE_CHECKPOINT_EVERY_CLIPS,
+            positive_temporal_windows=cfg.training.positive_temporal_windows,
+            positive_temporal_stride_embeddings=cfg.training.positive_temporal_stride_embeddings,
+            positive_context_seconds=cfg.training.positive_context_seconds,
         )
         split_cursors[split] = new_cursor
         save_feature_checkpoint(
@@ -1134,7 +1438,7 @@ def _build_features(
     resume_state["updated_at"] = time.time()
     resume_state["split_cursors"] = {"train": int(train_cursor), "val": int(val_cursor)}
     _atomic_write_json(resume_path, resume_state)
-    return train_ds, val_ds, manifests
+    return train_ds, val_ds, manifests, curve_val
 
 
 def _run(cfg: TrainRunConfig) -> None:
@@ -1142,6 +1446,8 @@ def _run(cfg: TrainRunConfig) -> None:
     state.config = cfg
     state.status = "running"
     state.started_at = time.time()
+    state.finished_at = None
+    state.onnx_path = None
     state.error = None
     state.cancel_flag.clear()
 
@@ -1294,7 +1600,7 @@ def _run(cfg: TrainRunConfig) -> None:
 
         # 4 + 5. Features
         bus.phase("features:build")
-        train_ds, val_ds, _manifests = _build_features(
+        train_ds, val_ds, _manifests, curve_val = _build_features(
             positive_wavs=positive_wavs,
             negative_wavs=negative_wavs,
             common_voice_dir=corpora.get("common_voice"),
@@ -1327,6 +1633,7 @@ def _run(cfg: TrainRunConfig) -> None:
             val_ds=val_ds,
             out_dir=run_dir,
             workers=settings.resolved_dataloader_workers(),
+            curve_val=curve_val,
             cancel_flag=state.cancel_flag,
         )
 
@@ -1353,6 +1660,18 @@ def _run(cfg: TrainRunConfig) -> None:
                     "best_val_fp_per_hour_at_0_5": result.best_val_fp_per_hour_at_0_5,
                     "best_positive_median_score": result.best_positive_median_score,
                     "best_positive_p10_score": result.best_positive_p10_score,
+                    "best_curve_recall": result.best_curve_recall,
+                    "best_curve_median_peak": result.best_curve_median_peak,
+                    "best_curve_p10_peak": result.best_curve_p10_peak,
+                    "best_curve_median_frames": result.best_curve_median_frames,
+                    "best_curve_median_span_ms": result.best_curve_median_span_ms,
+                    "best_curve_confirmation_rate": result.best_curve_confirmation_rate,
+                    "best_tablet_curve_recall": result.best_tablet_curve_recall,
+                    "best_tablet_curve_median_peak": result.best_tablet_curve_median_peak,
+                    "best_tablet_curve_p10_peak": result.best_tablet_curve_p10_peak,
+                    "best_tablet_curve_median_frames": result.best_tablet_curve_median_frames,
+                    "best_tablet_curve_median_span_ms": result.best_tablet_curve_median_span_ms,
+                    "best_tablet_curve_confirmation_rate": result.best_tablet_curve_confirmation_rate,
                     "calibration_threshold_raw": result.best_threshold,
                     "recommended_runtime_threshold": 0.5,
                     "recommended_threshold": 0.5,

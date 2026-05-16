@@ -129,13 +129,14 @@ def apply_tablet_far_field_effect(
 
     y = audio.astype(np.float32, copy=True)
     try:
-        from scipy.signal import butter, sosfilt
+        from scipy.signal import butter, iirnotch, sosfilt, tf2sos
 
         # Cheap tablet mics and off-axis pickup tend to lose lows/highs and
-        # emphasize a narrow speech band. Randomize the band so the model does
-        # not overfit one device response.
-        highpass_hz = float(rng.uniform(90.0, 220.0))
-        lowpass_hz = float(rng.uniform(2800.0, 5200.0))
+        # emphasize a narrow speech band. Ranges widened so the model sees
+        # both gentle (mid-quality) and harsh (cheap-mic) channel responses,
+        # mimicking the spread of real wall-mounted tablets.
+        highpass_hz = float(rng.uniform(70.0, 320.0))
+        lowpass_hz = float(rng.uniform(2200.0, 7000.0))
         sos = butter(
             2,
             [highpass_hz, min(lowpass_hz, sample_rate / 2 - 100.0)],
@@ -144,37 +145,48 @@ def apply_tablet_far_field_effect(
             output="sos",
         )
         y = sosfilt(sos, y).astype(np.float32, copy=False)
+        # Occasional notch at a random mid-frequency to simulate small-room
+        # standing waves or cabinet resonances.
+        if rng.random() < 0.35:
+            notch_hz = float(rng.uniform(300.0, 2200.0))
+            q = float(rng.uniform(2.0, 8.0))
+            try:
+                b, a = iirnotch(notch_hz / (sample_rate / 2.0), q)
+                y = sosfilt(tf2sos(b, a), y).astype(np.float32, copy=False)
+            except Exception:
+                pass
     except Exception:
         pass
 
-    # Add a few very early reflections, which mimic the tablet sitting near a
-    # tabletop/wall and the user speaking from an awkward angle.
+    # Early reflections: more variation in count, delay, and gain so the
+    # model sees both tight near-field reflections (tabletop) and longer
+    # ones (wall-mount with room behind it).
     reflected = y.copy()
-    for _ in range(int(rng.integers(1, 4))):
-        delay = int(sample_rate * rng.uniform(0.004, 0.035))
-        gain = float(rng.uniform(0.04, 0.22))
+    for _ in range(int(rng.integers(1, 5))):
+        delay = int(sample_rate * rng.uniform(0.003, 0.050))
+        gain = float(rng.uniform(0.02, 0.32))
         if delay <= 0 or delay >= y.size:
             continue
         reflected[delay:] += y[:-delay] * gain
     y = reflected
 
-    # Distance/off-axis attenuation. Background SNR augmentation can still
-    # raise or lower the final mix, but this gives the model genuinely quiet
-    # wake-word examples.
-    gain_db = float(rng.uniform(-24.0, -6.0))
+    # Distance/off-axis attenuation. Range widened from [-24, -6] to
+    # [-30, -4] so some variants are very near-field and some are nearly
+    # inaudible to model attenuation across the room.
+    gain_db = float(rng.uniform(-30.0, -4.0))
     y *= 10.0 ** (gain_db / 20.0)
 
-    # After the speech has been attenuated, add a small device/room noise floor
-    # so some variants are genuinely low-SNR instead of just quiet.
+    # Device/room noise floor. SNR range widened from [8, 28] to [4, 32] so
+    # we cover both noisy households and quiet rooms.
     rms = float(np.sqrt(np.mean(np.square(y), dtype=np.float64))) if y.size else 0.0
     if rms > 1e-7:
-        snr_db = float(rng.uniform(8.0, 28.0))
+        snr_db = float(rng.uniform(4.0, 32.0))
         noise_rms = rms / (10.0 ** (snr_db / 20.0))
         y += rng.normal(0.0, noise_rms, size=y.shape).astype(np.float32)
 
-    # Light compression / limiter-style saturation, similar to mobile capture
-    # paths under noise suppression or AGC. Keep it subtle.
-    drive = float(rng.uniform(1.0, 2.2))
+    # Compression / saturation - widened drive range to span subtle to
+    # moderate AGC behaviour.
+    drive = float(rng.uniform(1.0, 2.8))
     y = np.tanh(y * drive) / drive
     np.clip(y, -1.0, 1.0, out=y)
     return y.astype(np.float32, copy=False)

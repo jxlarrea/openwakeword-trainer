@@ -230,7 +230,7 @@
           <small class="hint">Probability of mixing in noise/music/speech background per clip.</small>
         </label>
         <label>Tablet far-field p
-          <input type="number" name="tablet_far_field_probability" value="0.6" min="0" max="1" step="0.05" required>
+          <input type="number" name="tablet_far_field_probability" value="0.75" min="0" max="1" step="0.05" required>
           <small class="hint">Probability of applying tablet/off-axis coloration when the far-field mode is enabled.</small>
         </label>
       </div>
@@ -366,12 +366,75 @@
           <input type="number" name="min_positive_p10_score_for_export" value="0.35" min="0" max="1" step="0.01" required>
           <small class="hint">Guards against too many weak positives in the lower tail.</small>
         </label>
+        <div class="check-row">
+          <label class="inline"><input type="checkbox" name="use_positive_curve_validation" checked> Use full-audio curve validation</label>
+          <small class="hint">Rejects models that only produce a narrow one-frame spike on held-out positive WAVs.</small>
+        </div>
+        <label>Curve validation positive clips
+          <input type="number" name="curve_validation_max_positive_clips" value="400" min="1" max="5000" step="1" required>
+          <small class="hint">Number of held-out generated positive WAVs scored as full sliding curves.</small>
+        </label>
+        <label>Minimum curve recall
+          <input type="number" name="min_curve_recall_for_export" value="0.65" min="0" max="1" step="0.01" required>
+          <small class="hint">Fraction of held-out positive WAVs that must cross the runtime 0.5 threshold.</small>
+        </label>
+        <label>Minimum curve median peak
+          <input type="number" name="min_curve_median_peak_for_export" value="0.78" min="0" max="1" step="0.01" required>
+          <small class="hint">Median peak score required across full positive WAV curves.</small>
+        </label>
+        <label>Minimum curve p10 peak
+          <input type="number" name="min_curve_p10_peak_for_export" value="0.02" min="0" max="1" step="0.01" required>
+          <small class="hint">Lower-tail peak score required across full positive WAV curves.</small>
+        </label>
+        <label>Minimum curve median frames
+          <input type="number" name="min_curve_median_frames_for_export" value="2" min="0" max="50" step="1" required>
+          <small class="hint">Median number of 80 ms frames above threshold required per positive WAV.</small>
+        </label>
+        <label>Minimum curve median span (ms)
+          <input type="number" name="min_curve_median_span_ms_for_export" value="160" min="0" max="3000" step="80" required>
+          <small class="hint">Median activation span required across held-out positive WAVs.</small>
+        </label>
+        <label>Minimum curve confirmation rate
+          <input type="number" name="min_curve_confirmation_rate_for_export" value="0.3" min="0" max="1" step="0.01" required>
+          <small class="hint">Fraction of positives with a second above-threshold hit after the configured gap.</small>
+        </label>
+        <div class="check-row">
+          <label class="inline"><input type="checkbox" name="use_tablet_curve_validation" checked> Use tablet/off-axis curve validation</label>
+          <small class="hint">Requires a separate held-out far-field tablet curve to pass, not just clean synthetic speech.</small>
+        </div>
+        <label>Tablet curve variants per clip
+          <input type="number" name="tablet_curve_validation_variants_per_clip" value="1" min="1" max="8" step="1" required>
+          <small class="hint">Additional held-out tablet/off-axis variants per positive validation clip.</small>
+        </label>
+        <label>Minimum tablet curve recall
+          <input type="number" name="min_tablet_curve_recall_for_export" value="0.24" min="0" max="1" step="0.01" required>
+          <small class="hint">Fraction of tablet/off-axis positive curves that must cross threshold.</small>
+        </label>
+        <label>Minimum tablet curve median peak
+          <input type="number" name="min_tablet_curve_median_peak_for_export" value="0.27" min="0" max="1" step="0.01" required>
+        </label>
+        <label>Minimum tablet curve p10 peak
+          <input type="number" name="min_tablet_curve_p10_peak_for_export" value="0.04" min="0" max="1" step="0.01" required>
+        </label>
+        <label>Minimum tablet curve median frames
+          <input type="number" name="min_tablet_curve_median_frames_for_export" value="0" min="0" max="50" step="1" required>
+        </label>
+        <label>Minimum tablet curve median span (ms)
+          <input type="number" name="min_tablet_curve_median_span_ms_for_export" value="0" min="0" max="3000" step="80" required>
+        </label>
+        <label>Minimum tablet curve confirmation rate
+          <input type="number" name="min_tablet_curve_confirmation_rate_for_export" value="0.08" min="0" max="1" step="0.01" required>
+        </label>
+        <label>Curve confirmation gap (ms)
+          <input type="number" name="curve_confirmation_min_gap_ms" value="320" min="80" max="2000" step="80" required>
+          <small class="hint">Minimum gap between above-threshold frames for curve confirmation.</small>
+        </label>
         <label>Early stop minimum steps
           <input type="number" name="early_stop_min_steps" value="30000" min="500" max="200000" step="500" required>
           <small class="hint">Training will not early-stop before this step count.</small>
         </label>
         <label>Seed
-          <input type="number" name="seed" value="4041" required>
+          <input type="number" name="seed" value="4044" required>
           <small class="hint">Random seed for reproducibility.</small>
         </label>
       </div>

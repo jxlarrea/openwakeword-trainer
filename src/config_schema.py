@@ -79,7 +79,7 @@ class AugmentationConfig(BaseModel):
     gain_max_db: float = 3.0
     mp3_compression_probability: float = 0.2
     use_tablet_far_field_augmentation: bool = True
-    tablet_far_field_probability: float = 0.6
+    tablet_far_field_probability: float = 0.75
     augmentations_per_clip: int = 6  # multiplies dataset size (DGX Spark default)
 
 
@@ -93,6 +93,8 @@ class DatasetConfig(BaseModel):
     use_fsd50k: bool = True
     use_common_voice_negatives: bool = True
     common_voice_subset: int = 100000  # DGX Spark default
+    use_background_corpus_negatives: bool = True
+    background_corpus_negative_subset: int = 20000
     use_openwakeword_negative_features: bool = True
     use_openwakeword_validation_features: bool = True
 
@@ -117,6 +119,9 @@ class TrainingConfig(BaseModel):
     separation_margin: float = 0.50
     separation_loss_weight: float = 0.0
     separation_top_k: int = 128
+    # Negative pressure schedule ramps from 1 -> this value. Keep this high
+    # enough that broad negative speech banks still shape the operating point;
+    # export gates below decide whether the resulting model is deployable.
     max_negative_loss_weight: float = 1000.0
     lr_warmup_fraction: float = 0.20
     lr_hold_fraction: float = 0.33
@@ -143,14 +148,48 @@ class TrainingConfig(BaseModel):
     target_false_positives_per_hour: float = 0.5
     min_recall_at_p95_for_export: float = 0.80
     min_recall_at_target_fp_for_export: float = 0.70
+    # Keep the raw operating point sane even though export calibration maps the
+    # selected threshold to runtime 0.5. High raw thresholds and high raw FP/hr
+    # are strong signs that sensitivity offsets or alternate runners will be
+    # noisy in the real world.
     max_calibration_threshold_for_export: float = 0.80
     min_recall_at_0_5_for_export: float = 0.80
     max_fp_per_hour_at_0_5_for_export: float = 10.0
     min_positive_median_score_for_export: float = 0.75
     min_positive_p10_score_for_export: float = 0.35
+    use_positive_curve_validation: bool = True
+    curve_validation_max_positive_clips: int = 400
+    # v13-style gates (loosened from v15/v16 which were unachievable for a
+    # sharp model). A precise wake-word head naturally peaks across 3-5 hops
+    # at the wake-word completion, not 5-7.
+    min_curve_recall_for_export: float = 0.65
+    min_curve_median_peak_for_export: float = 0.78
+    min_curve_p10_peak_for_export: float = 0.02
+    min_curve_median_frames_for_export: int = 2
+    min_curve_median_span_ms_for_export: float = 160.0
+    min_curve_confirmation_rate_for_export: float = 0.30
+    use_tablet_curve_validation: bool = True
+    # Generate a few tablet variants per clip so the metric is stable when the
+    # tablet aug is now using per-clip training probabilities (no longer the
+    # adversarial "100% tablet + 90% RIR + 50% bg" stacking).
+    tablet_curve_validation_variants_per_clip: int = 1
+    # Tablet validation is intentionally stricter than the generic curve check:
+    # a model that only works on clean, front-facing TTS is not good enough for
+    # wall-mounted tablets. Failed tablet gates must block export.
+    min_tablet_curve_recall_for_export: float = 0.24
+    min_tablet_curve_median_peak_for_export: float = 0.27
+    min_tablet_curve_p10_peak_for_export: float = 0.04
+    min_tablet_curve_median_frames_for_export: int = 0
+    min_tablet_curve_median_span_ms_for_export: float = 0.0
+    min_tablet_curve_confirmation_rate_for_export: float = 0.08
+    curve_confirmation_min_gap_ms: float = 320.0
+    positive_temporal_windows: int = 1
+    positive_temporal_stride_embeddings: int = 1
+    positive_context_seconds: float = 2.0
     early_stop_min_steps: int = 30_000
+    exportable_quality_extension_steps: int = 30_000
     early_stop_patience: int = 40
-    seed: int = 4041
+    seed: int = 4044
 
 
 class TrainRunConfig(BaseModel):
@@ -200,6 +239,7 @@ class TrainRunConfig(BaseModel):
             or self.datasets.use_musan_music
             or self.datasets.use_fsd50k
             or self.datasets.use_common_voice_negatives
+            or self.datasets.use_background_corpus_negatives
             or self.datasets.use_openwakeword_negative_features
             or self.datasets.use_openwakeword_validation_features
         )

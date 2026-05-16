@@ -48,4 +48,50 @@
   <div id="test-result"></div>
 </section>
 
+<section id="stress-test" class="card">
+  <h2>False-positive stress test</h2>
+  <form id="stress-form">
+    <div class="grid">
+      <label>Threshold
+        <input type="number" id="stress-threshold" name="threshold" value="0.5" min="0" max="1" step="0.01">
+        <small class="hint">Uses the model selected above. For exported trainer models, 0.5 is the calibrated runtime threshold.</small>
+      </label>
+      <label>Max windows per source
+        <input type="number" id="stress-max-windows" name="max_windows" value="1000000" min="0" step="100000">
+        <small class="hint">0 means full source. One million windows is about 22.2 hours of negatives.</small>
+      </label>
+      <label>Batch size
+        <input type="number" id="stress-batch-size" name="batch_size" value="8192" min="1" max="65536" step="1024">
+        <small class="hint">Larger is faster when memory allows.</small>
+      </label>
+    </div>
+
+    <fieldset>
+      <legend>Sources</legend>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="include_session" checked> Session train/val feature shards</label>
+        <small class="hint">Uses <code>/data/runs/&lt;model name&gt;</code> when available.</small>
+      </div>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="include_validation" checked> openWakeWord validation negatives</label>
+        <small class="hint">Official validation negative bank used for FP/hr calibration.</small>
+      </div>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="include_acav100m"> ACAV100M negatives</label>
+        <small class="hint">Large generic negative bank. Full sweep is slower; keep the window limit for quick checks.</small>
+      </div>
+      <div class="check-row">
+        <label class="inline"><input type="checkbox" name="use_cuda"> Use CUDA provider</label>
+        <small class="hint">Usually leave off while training or serving another GPU workload.</small>
+      </div>
+    </fieldset>
+
+    <div class="actions test-actions">
+      <button type="submit" id="stress-run-btn" class="primary">Run stress test</button>
+      <span id="stress-status" class="pill"></span>
+    </div>
+  </form>
+  <div id="stress-result"></div>
+</section>
+
 {% endblock %}

@@ -158,6 +158,101 @@ class FeatureExtractor:
             out[-emb.shape[0] :] = emb
         return out
 
+    def fixed_classifier_inputs(
+        self,
+        audio_int16: np.ndarray,
+        n_windows: int = 1,
+        stride_embeddings: int = 1,
+        speech_end_sample: int | None = None,
+        speech_start_sample: int | None = None,
+    ) -> np.ndarray:
+        """Return classifier-input windows where the FULL wake-word sits
+        inside the rolling 1.28 s buffer at every trained position.
+
+        v22 design: strict forward fan-out from speech_end.
+          - earliest window has its trailing edge AT speech_end (full
+            wake-word ends exactly at the trailing edge)
+          - subsequent windows step `stride_embeddings * 80 ms` forward into
+            the post-speech tail
+          - walk EARLY-STOPS when the wake-word's leading edge would slide
+            out of the rolling buffer (trailing_edge > speech_start + 1.28 s)
+
+        Why no backward walk: v21 used backward fan-out into the wake-word
+        audio, which trained windows whose trailing edge sat on only the
+        FIRST part of the wake-word ("ok n..."). The model learned that ANY
+        "ok"-like onset at the trailing edge of a quiet buffer is positive,
+        and fired on real "OK" alone at 0.76. v22 trains only on windows
+        where the entire wake-word is present in the buffer, so partial
+        matches no longer pattern-match training positions.
+        """
+        n_windows = max(1, int(n_windows))
+        stride_embeddings = max(1, int(stride_embeddings))
+        if n_windows == 1:
+            return self.fixed_classifier_input(audio_int16)[None, ...]
+
+        emb = self.embeddings(audio_int16)
+        if emb.shape[0] == 0:
+            return np.zeros(
+                (1, CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM),
+                dtype=np.float32,
+            )
+
+        out: list[np.ndarray] = []
+        used: set[tuple[int, int]] = set()
+        end = emb.shape[0]
+        hop_samples = 1280  # 0.08 s @ 16 kHz
+
+        if speech_end_sample is not None and speech_end_sample > 0:
+            # Anchor: window whose trailing edge sits at speech_end (full
+            # wake-word ends exactly at the trailing edge of the buffer).
+            anchor_win_end = int(round(speech_end_sample / hop_samples))
+            anchor_win_end = max(CLASSIFIER_WINDOW_EMBEDDINGS, anchor_win_end)
+            anchor_win_end = min(anchor_win_end, end)
+
+            # Maximum win_end so the wake-word's leading edge stays inside
+            # the 16-embedding (1.28 s) rolling buffer.
+            #   buffer covers embeddings [win_end - 16, win_end)
+            #   for speech_start to be in buffer: win_end - 16 <= speech_start_emb
+            #   -> win_end <= speech_start_emb + 16
+            if speech_start_sample is not None and speech_start_sample >= 0:
+                speech_start_emb = int(round(speech_start_sample / hop_samples))
+                max_win_end = speech_start_emb + CLASSIFIER_WINDOW_EMBEDDINGS
+            else:
+                max_win_end = end
+
+            candidates: list[int] = []
+            for k in range(n_windows):
+                we = anchor_win_end + k * stride_embeddings
+                if we > end:
+                    break  # ran out of audio
+                if we > max_win_end:
+                    break  # wake-word leading edge would slide out of the buffer
+                candidates.append(we)
+        else:
+            # No speech bounds known: fall back to backward walk from end
+            # of audio. Used only for the inference path that wasn't given
+            # speech bounds; training always passes them.
+            candidates = []
+            for offset in range((n_windows - 1) * stride_embeddings, -1, -stride_embeddings):
+                we = end - offset
+                if we <= 0:
+                    continue
+                candidates.append(we)
+
+        for win_end in candidates:
+            win_start = max(0, win_end - CLASSIFIER_WINDOW_EMBEDDINGS)
+            key = (win_start, win_end)
+            if key in used:
+                continue
+            used.add(key)
+            window = np.zeros((CLASSIFIER_WINDOW_EMBEDDINGS, EMBEDDING_DIM), dtype=np.float32)
+            chunk = emb[win_start:win_end]
+            window[-chunk.shape[0] :] = chunk
+            out.append(window)
+        if not out:
+            return self.fixed_classifier_input(audio_int16)[None, ...]
+        return np.stack(out).astype(np.float32)
+
     def classifier_inputs(self, audio_int16: np.ndarray) -> np.ndarray:
         """Slide a 16-embedding window over a clip; return (M, 16, 96).
 
