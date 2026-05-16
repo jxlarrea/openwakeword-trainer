@@ -7,7 +7,9 @@ are reused whenever the user comes back to that wake word.
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -19,7 +21,7 @@ from src.tts.voices import list_english_voices
 
 _DISK_SUMMARY_CACHE: dict[str, Any] | None = None
 _DISK_SUMMARY_CACHE_T = 0.0
-_DISK_SUMMARY_TTL_SECONDS = 30.0
+_DISK_SUMMARY_TTL_SECONDS = 120.0
 
 
 def slugify(value: str) -> str:
@@ -333,11 +335,45 @@ def delete_everything() -> int:
 
 
 def _dir_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    du_size = _dir_size_with_du(path)
+    if du_size is not None:
+        return du_size
+    return _dir_size_with_scandir(path)
+
+
+def _dir_size_with_du(path: Path) -> int | None:
+    if os.name == "nt":
+        return None
+    try:
+        result = subprocess.run(
+            ["du", "-sb", "--", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return int(result.stdout.split(maxsplit=1)[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def _dir_size_with_scandir(path: Path) -> int:
     total = 0
-    for p in path.rglob("*"):
+    stack = [str(path)]
+    while stack:
+        current = stack.pop()
         try:
-            if p.is_file():
-                total += p.stat().st_size
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
         except OSError:
             continue
     return total

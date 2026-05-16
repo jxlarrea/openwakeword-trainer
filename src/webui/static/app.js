@@ -1554,6 +1554,7 @@
 
   const systemRows = $("#system-session-rows");
   const systemStatus = $("#system-action-status");
+  let systemDiskRequestSeq = 0;
 
   function setSystemStatus(text, kind) {
     if (!systemStatus) return;
@@ -1593,11 +1594,21 @@
       .join("");
   }
 
-  async function refreshSystemDisk() {
+  async function refreshSystemDisk(force = false) {
     if (!systemRows) return;
-    const res = await fetch("/api/system/disk?sizes=false");
-    if (!res.ok) return;
-    renderSystemDisk(await res.json());
+    const seq = ++systemDiskRequestSeq;
+    const quickRes = await fetch("/api/system/disk?sizes=false", { cache: "no-store" });
+    if (seq !== systemDiskRequestSeq) return;
+    if (quickRes.ok) renderSystemDisk(await quickRes.json());
+
+    const fullUrl = force ? "/api/system/disk?refresh=true&sizes=true" : "/api/system/disk?sizes=true";
+    const fullRes = await fetch(fullUrl, { cache: "no-store" });
+    if (seq !== systemDiskRequestSeq) return;
+    if (fullRes.ok) {
+      renderSystemDisk(await fullRes.json());
+    } else {
+      setSystemStatus("disk metrics unavailable", "failed");
+    }
   }
 
   async function systemDelete(url, confirmText) {
@@ -1642,9 +1653,11 @@
       systemDelete(
         `/api/sessions/${encodeURIComponent(id)}`,
         `Delete session "${id}" and all of its cached data?`
-      ).then(refreshSystemDisk);
+      ).then(() => refreshSystemDisk(true));
     }
   });
+
+  if (systemRows) refreshSystemDisk();
 
   // ---------- Initial state sync ----------
 

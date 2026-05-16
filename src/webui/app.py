@@ -276,14 +276,14 @@ def register_routes(api: APIRouter) -> None:
             raise HTTPException(status_code=409, detail="Cannot delete cache while training is running.")
         sid = slugify(session_id)
         reclaimed = delete_session_cache(sid)
-        return {"deleted": True, "id": sid, "reclaimed_bytes": reclaimed, "disk": disk_cache_summary()}
+        return {"deleted": True, "id": sid, "reclaimed_bytes": reclaimed, "disk": disk_cache_summary(use_cache=False)}
 
     @api.delete("/api/system/cache")
     def system_cache_delete():
         if orchestrator.state.status == "running":
             raise HTTPException(status_code=409, detail="Cannot delete cache while training is running.")
         reclaimed = delete_all_disk_cache_preserving_sessions()
-        return {"deleted": True, "reclaimed_bytes": reclaimed, "disk": disk_cache_summary()}
+        return {"deleted": True, "reclaimed_bytes": reclaimed, "disk": disk_cache_summary(use_cache=False)}
 
     @api.delete("/api/system/all")
     def system_all_delete():
@@ -291,7 +291,7 @@ def register_routes(api: APIRouter) -> None:
             raise HTTPException(status_code=409, detail="Cannot delete data while training is running.")
         reclaimed = delete_everything()
         bus.reset()
-        return {"deleted": True, "reclaimed_bytes": reclaimed, "disk": disk_cache_summary()}
+        return {"deleted": True, "reclaimed_bytes": reclaimed, "disk": disk_cache_summary(use_cache=False)}
 
     @api.post("/api/sessions")
     async def sessions_create(request: Request):
