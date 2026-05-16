@@ -43,7 +43,6 @@ from src.settings import get_settings
 from src.system_monitor import sample_system
 from src.train.progress import bus
 from src.train.stress_test import run as run_stress_test
-from src.tts.elevenlabs_generator import ElevenLabsGenerator
 from src.tts.kokoro_generator import default_kokoro_voice_keys, list_kokoro_voices
 from src.tts.piper_generator import PiperGenerator
 from src.tts.voices import list_english_voices
@@ -329,20 +328,6 @@ def register_routes(api: APIRouter) -> None:
         sample = gen.synthesize_one(text=text, voice_key=voice_key, speaker_id=speaker_id)
         return Response(content=_audio_to_wav_bytes(sample.audio, sample.sample_rate), media_type="audio/wav")
 
-    @api.post("/api/audition/elevenlabs")
-    async def audition_elevenlabs(payload: dict):
-        api_key = get_settings().elevenlabs_api_key
-        if not api_key:
-            raise HTTPException(status_code=400, detail="ELEVENLABS_API_KEY not configured")
-        text = (payload or {}).get("text", "").strip()
-        voice_id = (payload or {}).get("voice_id", "").strip()
-        model_id = (payload or {}).get("model_id", "eleven_multilingual_v2").strip()
-        if not text or not voice_id:
-            raise HTTPException(status_code=400, detail="text and voice_id required")
-        gen = ElevenLabsGenerator(api_key=api_key, model_id=model_id)
-        sample = gen.synthesize_one(text=text, voice_id=voice_id)
-        return Response(content=_audio_to_wav_bytes(sample.audio, sample.sample_rate), media_type="audio/wav")
-
     @api.get("/api/voices/piper")
     def list_voices_piper():
         try:
@@ -360,14 +345,6 @@ def register_routes(api: APIRouter) -> None:
             }
             for v in voices
         ]
-
-    @api.get("/api/voices/elevenlabs")
-    def list_voices_elevenlabs():
-        api_key = get_settings().elevenlabs_api_key
-        if not api_key:
-            return []
-        gen = ElevenLabsGenerator(api_key=api_key)
-        return gen.list_voices()
 
     # ----- Models -----
 
@@ -524,7 +501,6 @@ def _common_template_context(include_voices: bool = True) -> dict[str, Any]:
         "state": orchestrator.state.to_dict(),
         "models": model_items,
         "sessions": list_sessions(),
-        "elevenlabs_enabled": bool(settings.elevenlabs_api_key),
     }
     if include_voices:
         try:
@@ -592,10 +568,6 @@ def _form_to_config_payload(form) -> dict:
     voice_keys = form.getlist("piper_voice") if hasattr(form, "getlist") else form.get("piper_voice", [])
     if isinstance(voice_keys, str):
         voice_keys = [voice_keys]
-    el_voices = form.getlist("elevenlabs_voice_id") if hasattr(form, "getlist") else []
-    if isinstance(el_voices, str):
-        el_voices = [el_voices]
-
     payload = {
         "wake_word": form.get("wake_word", "").strip(),
         "session_id": form.get("session_id", "").strip(),
@@ -615,9 +587,6 @@ def _form_to_config_payload(form) -> dict:
             "n_kokoro_negative_per_phrase_per_voice": _int("n_kokoro_negative_per_phrase_per_voice", 1),
             "kokoro_speed_min": _float("kokoro_speed_min", 0.9),
             "kokoro_speed_max": _float("kokoro_speed_max", 1.1),
-            "use_elevenlabs": _bool("use_elevenlabs"),
-            "elevenlabs_voice_ids": el_voices,
-            "elevenlabs_model": form.get("elevenlabs_model", "eleven_multilingual_v2"),
         },
         "augmentation": {
             "rir_probability": _float("rir_probability", 0.9),

@@ -46,9 +46,6 @@ class GenerationConfig(BaseModel):
     n_kokoro_negative_per_phrase_per_voice: int = 1
     kokoro_speed_min: float = 0.9
     kokoro_speed_max: float = 1.1
-    use_elevenlabs: bool = False
-    elevenlabs_voice_ids: list[str] = Field(default_factory=list)
-    elevenlabs_model: str = "eleven_multilingual_v2"
 
     # Synthesis variability (Piper SynthesisConfig).
     length_scale_min: float = 0.85
@@ -221,14 +218,9 @@ class TrainRunConfig(BaseModel):
             if self.generation.use_kokoro
             else 0
         )
-        n_eleven = (
-            len(self.generation.elevenlabs_voice_ids)
-            if self.generation.use_elevenlabs
-            else 0
-        )
-        if n_piper == 0 and n_kokoro == 0 and n_eleven == 0:
+        if n_piper == 0 and n_kokoro == 0:
             raise ValueError(
-                "Select at least one Piper, Kokoro, or ElevenLabs voice."
+                "Select at least one Piper or Kokoro voice."
             )
 
         # At least one augmentation corpus.

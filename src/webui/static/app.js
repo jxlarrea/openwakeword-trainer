@@ -134,17 +134,12 @@
     setValue(form, "n_negative_per_phrase_per_voice", gen.n_negative_per_phrase_per_voice);
     setValue(form, "n_adversarial_phrases", gen.n_adversarial_phrases);
     setValue(form, "n_adversarial_per_phrase_per_voice", gen.n_adversarial_per_phrase_per_voice);
-    setValue(form, "elevenlabs_model", gen.elevenlabs_model);
-    setChecked(form, "use_elevenlabs", gen.use_elevenlabs);
 
     const savedPiperVoices = gen.piper_voices || [];
     $$("#config input[name='piper_voice']").forEach((cb) => {
       cb.checked =
         savedPiperVoices.length === 0 ||
         savedPiperVoices.some((v) => (v.voice_key || v) === cb.value);
-    });
-    $$("#config input[name='elevenlabs_voice_id']").forEach((cb) => {
-      cb.checked = (gen.elevenlabs_voice_ids || []).includes(cb.value);
     });
     setChecked(form, "use_kokoro", gen.use_kokoro !== false);
     const savedKokoroVoices = gen.kokoro_voices || [];
@@ -347,29 +342,6 @@
     });
   });
 
-  // ---------- ElevenLabs voices ----------
-
-  $("#load-elevenlabs-voices")?.addEventListener("click", async () => {
-    const container = $("#elevenlabs-voices");
-    container.innerHTML = "<p class='hint'>loading...</p>";
-    const res = await fetch("/api/voices/elevenlabs");
-    const voices = await res.json();
-    if (!voices.length) {
-      container.innerHTML = "<p class='hint'>No voices returned. Check API key.</p>";
-      return;
-    }
-    container.innerHTML = voices
-      .map(
-        (v) => `
-        <label class="voice-row" data-key="${v.voice_id}">
-          <input type="checkbox" name="elevenlabs_voice_id" value="${v.voice_id}">
-          <span class="voice-name">${v.name}</span>
-          <span class="voice-meta">${v.category || ""}</span>
-        </label>`
-      )
-      .join("");
-  });
-
   // ---------- Submit training run ----------
 
   function clearValidationState(form) {
@@ -412,11 +384,9 @@
     const piperCount = form.querySelectorAll('input[name="piper_voice"]:checked').length;
     const kokoroUsed = form.querySelector('input[name="use_kokoro"]')?.checked;
     const kokoroCount = form.querySelectorAll('input[name="kokoro_voice"]:checked').length;
-    const elUsed = form.querySelector('input[name="use_elevenlabs"]')?.checked;
-    const elCount = form.querySelectorAll('input[name="elevenlabs_voice_id"]:checked').length;
 
-    if (piperCount === 0 && !(kokoroUsed && kokoroCount > 0) && !(elUsed && elCount > 0)) {
-      errors.push("Select at least one Piper, Kokoro, or ElevenLabs voice.");
+    if (piperCount === 0 && !(kokoroUsed && kokoroCount > 0)) {
+      errors.push("Select at least one Piper or Kokoro voice.");
       const voicesFieldset = form.querySelector(".voice-list")?.closest("fieldset");
       voicesFieldset?.classList.add("invalid");
       if (!firstInvalid) firstInvalid = voicesFieldset;
@@ -526,7 +496,6 @@
     };
     const vBool = (k) => fd.get(k) !== null;
     const piperVoices = fd.getAll("piper_voice").map((k) => ({ voice_key: k }));
-    const elVoices = fd.getAll("elevenlabs_voice_id");
     const kokoroVoices = fd.getAll("kokoro_voice");
     return {
       wake_word: String(v("wake_word")).trim(),
@@ -553,9 +522,6 @@
         n_kokoro_negative_per_phrase_per_voice: vNum("n_kokoro_negative_per_phrase_per_voice", 1),
         kokoro_speed_min: vNum("kokoro_speed_min", 0.9),
         kokoro_speed_max: vNum("kokoro_speed_max", 1.1),
-        use_elevenlabs: vBool("use_elevenlabs"),
-        elevenlabs_voice_ids: elVoices,
-        elevenlabs_model: String(v("elevenlabs_model")) || "eleven_multilingual_v2",
       },
       augmentation: {
         rir_probability: vNum("rir_probability", 0.9),

@@ -124,31 +124,6 @@
     </fieldset>
 
     <fieldset>
-      <legend>ElevenLabs (optional)</legend>
-      {% if elevenlabs_enabled %}
-        <div class="check-row">
-          <label class="inline">
-            <input type="checkbox" name="use_elevenlabs"> Use ElevenLabs voices for extra accent diversity
-          </label>
-          <small class="hint">Costs per character. Recommended only for positive phrases.</small>
-        </div>
-        <button type="button" id="load-elevenlabs-voices">Load my voices</button>
-        <div id="elevenlabs-voices" class="voice-list"></div>
-        <label>Model
-          <select name="elevenlabs_model">
-            <option value="eleven_multilingual_v2" selected>eleven_multilingual_v2</option>
-            <option value="eleven_v3">eleven_v3</option>
-            <option value="eleven_turbo_v2_5">eleven_turbo_v2_5</option>
-            <option value="eleven_flash_v2_5">eleven_flash_v2_5</option>
-          </select>
-          <small class="hint">eleven_multilingual_v2 is the workhorse - broadest accent coverage.</small>
-        </label>
-      {% else %}
-        <p class="hint">Set <code>ELEVENLABS_API_KEY</code> in <code>.env</code> and recreate the container to enable.</p>
-      {% endif %}
-    </fieldset>
-
-    <fieldset>
       <legend>Sample volume</legend>
       <div class="grid">
         <label>Positives per phrase per voice

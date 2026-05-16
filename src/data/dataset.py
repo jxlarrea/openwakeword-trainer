@@ -1,7 +1,7 @@
 """Pre-computed feature dataset for training.
 
 Workflow per training run:
-  1. Generate positive WAVs (Piper + optional ElevenLabs)
+  1. Generate positive WAVs (Piper + Kokoro)
   2. Generate adversarial WAVs (same TTS path)
   3. Build the augmenter (RIRs + background-noise pools)
   4. For each clip, augment N times, align to one fixed ~2 s training window,

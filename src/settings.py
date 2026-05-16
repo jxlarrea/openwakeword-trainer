@@ -41,7 +41,6 @@ class Settings(BaseSettings):
     piper_use_cuda: bool = True
 
     # Optional API keys (also accepted via the unprefixed env vars).
-    elevenlabs_api_key: str | None = Field(default=None, alias="ELEVENLABS_API_KEY")
     hf_token: str | None = Field(default=None, alias="HF_TOKEN")
 
     # ----- derived paths -----

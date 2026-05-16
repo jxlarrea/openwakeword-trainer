@@ -8,7 +8,7 @@
 <a href="https://buymeacoffee.com/jxlarrea"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 </p>
 
-A Dockerized, GPU-accelerated trainer for [openWakeWord](https://github.com/dscripka/openWakeWord) custom models with a Web UI. It is built especially for people using [Voice Satellite for Home Assistant](https://github.com/jxlarrea/voice-satellite-card-integration), where wake words usually need to work from wall-mounted tablets instead of dedicated microphone arrays. The default recipe trains for that reality: off-axis speech, room echo, background noise, quieter voices, and the slightly muffled capture you get when someone talks to a tablet from across the room. Generates synthetic positives and hard negatives with [Piper](https://github.com/OHF-Voice/piper1-gpl), high-quality local positives with [Kokoro](https://github.com/hexgrad/kokoro), and optional ElevenLabs voices, pulls real-world augmentation corpora (MIT IR Survey, BUT ReverbDB, MUSAN, FSD50K, Common Voice), uses the official openWakeWord ACAV100M/validation negative feature banks, trains a small classifier head on top of Google's frozen speech-embedding model, and exports an ONNX model that drops into the openWakeWord runtime.
+A Dockerized, GPU-accelerated trainer for [openWakeWord](https://github.com/dscripka/openWakeWord) custom models with a Web UI. It is built especially for people using [Voice Satellite for Home Assistant](https://github.com/jxlarrea/voice-satellite-card-integration), where wake words usually need to work from wall-mounted tablets instead of dedicated microphone arrays. The default recipe trains for that reality: off-axis speech, room echo, background noise, quieter voices, and the slightly muffled capture you get when someone talks to a tablet from across the room. Generates synthetic positives and hard negatives with [Piper](https://github.com/OHF-Voice/piper1-gpl), high-quality local positives with [Kokoro](https://github.com/hexgrad/kokoro), pulls real-world augmentation corpora (MIT IR Survey, BUT ReverbDB, MUSAN, FSD50K, Common Voice), uses the official openWakeWord ACAV100M/validation negative feature banks, trains a small classifier head on top of Google's frozen speech-embedding model, and exports an ONNX model that drops into the openWakeWord runtime.
 
 Built and tuned on **NVIDIA DGX Spark** (Grace + Blackwell GB10, aarch64) but the same image runs on any NVIDIA host with CUDA 12.8 drivers.
 
@@ -85,7 +85,6 @@ cd openwakeword-trainer
 
 cp .env.example .env
 # Edit .env to add HF_TOKEN (needed for Common Voice).
-# Optional: paste an ELEVENLABS_API_KEY.
 
 docker compose up --build
 ```
@@ -251,7 +250,6 @@ The header includes three primary pages:
 - **Negative phrases (hard negatives)** (right column) are TTS'd as **negative** samples with the same emphasis as positives. Paste any false-trigger phrases you observed in production. This is the most important knob for v2+ models.
 - **Piper voices**: high/medium voices are selected by default; select all, none, or high-quality-only as needed. Use the search box to narrow. Multi-speaker voices like `en_US-libritts-high` cover hundreds of speakers per voice.
 - **Kokoro voices**: enabled by default for positive phrases. Use **Best quality** to keep only the strongest Kokoro voices if you want less synthesis volume.
-- **ElevenLabs** (only if `ELEVENLABS_API_KEY` is set in `.env`): adds external voice diversity. Note: costs per character; recommended only for positive phrases.
 - **Sample volume**: per-phrase reps, adversarial-pool size, augmentations-per-clip. Defaults are tuned for DGX Spark.
 - **Augmentation corpora**: each toggle has a hint. At least one corpus must be enabled. BUT ReverbDB adds measured far-field room impulse responses. ACAV100M adds generic negative training windows; the openWakeWord validation bank is used for low-FP threshold calibration.
 - **Tablet far-field augmentation**: default-on channel simulation for off-axis tablet microphones. It applies mic band-limiting, distance attenuation, a device/room noise floor, early reflections, and light capture compression.
@@ -348,9 +346,7 @@ The trainer optimizes for low false positives, not just low validation loss:
 | GET | `/api/train/status` | Current run state plus current system telemetry |
 | GET | `/api/events` | SSE stream (phase, progress, metric, system, log, run_started, complete, run_error, cancelled) |
 | POST | `/api/audition/piper` | One-shot Piper synth (JSON: text, voice_key, speaker_id) |
-| POST | `/api/audition/elevenlabs` | One-shot ElevenLabs synth |
 | GET | `/api/voices/piper` | List English Piper voices from HF manifest |
-| GET | `/api/voices/elevenlabs` | List your ElevenLabs voices |
 | GET | `/api/models` | List trained ONNX models with ONNX/package sizes |
 | GET | `/api/models/{name}` | Download a trained ONNX |
 | GET | `/api/model-packages/{name}` | Download a trained model zip package |
@@ -376,7 +372,6 @@ All settable via `.env` in the repo root. Defaults are in `src/settings.py` and 
 | `OWW_KOKORO_DEVICE` | cuda | Torch device for Kokoro TTS; CUDA uses Kokoro's custom STFT path to avoid complex-kernel JIT issues on newer GPUs |
 | `OWW_DATALOADER_WORKERS` | 0 (auto: `min(8, cpu_count)`) | PyTorch DataLoader workers |
 | `HF_TOKEN` | (none) | Hugging Face token; required for Common Voice |
-| `ELEVENLABS_API_KEY` | (none) | Optional, unlocks ElevenLabs voices |
 
 Defaults pair `workers * threads = 20` to match DGX Spark's 20 Grace cores exactly without thrashing.
 
@@ -384,7 +379,7 @@ Defaults pair `workers * threads = 20` to match DGX Spark's 20 Grace cores exact
 
 Defaults are tuned for high-quality, low-false-positive models on the DGX Spark, including noisy/far-field tablet use. Further knobs:
 
-- **More voices, more accents.** High/medium Piper voices are the default quality set. Toggle every English Piper voice only if you want more variety and are willing to test whether lower-quality voices help your phrase. Enable ElevenLabs (`ELEVENLABS_API_KEY`) for additional accent variations.
+- **More voices, more accents.** High/medium Piper voices are the default quality set. Toggle every English Piper voice only if you want more variety and are willing to test whether lower-quality voices help your phrase.
 - **Use Kokoro for natural positives and hard negatives.** Kokoro is on by default with 2 positive renders per phrase/voice and 1 hard-negative render per phrase/voice.
 - **More augmentations per clip.** Bump from 6 to 8. Each WAV becomes more variants, forcing the classifier to learn channel-invariant cues. Linearly grows feature-extraction time.
 - **Tablet / far-field deployments.** BUT ReverbDB, Tablet far-field augmentation, `RIR p = 0.9`, and 6 augmentations per clip are the defaults. Increase tablet far-field probability toward `0.8` for harsher off-axis environments.

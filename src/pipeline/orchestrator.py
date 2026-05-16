@@ -2,7 +2,7 @@
 
 Phases:
   0. Prepare run directory + persist config
-  1. Generate positive samples (Piper + optional ElevenLabs)
+  1. Generate positive samples (Piper + Kokoro)
   2. Generate negative / adversarial samples
   3. Ensure augmentation corpora are downloaded
   4. Build augmenter
@@ -58,7 +58,6 @@ from src.data.features import (
 from src.settings import get_settings
 from src.train.progress import bus
 from src.train.trainer import CurveValidationSet, train as run_training
-from src.tts.elevenlabs_generator import ElevenLabsGenerator
 from src.tts.kokoro_generator import KokoroGenerator
 from src.tts.piper_generator import PiperGenerator
 
@@ -152,8 +151,6 @@ def _phrases_signature(
     phrases: list[str],
     n_per_phrase_per_voice: int,
     piper_voices: list,
-    use_elevenlabs: bool,
-    elevenlabs_voice_ids: list,
 ) -> str:
     """Stable hash of everything that determines what WAVs get synthesized."""
     import hashlib
@@ -164,8 +161,6 @@ def _phrases_signature(
             "phrases": sorted(phrases),
             "n": n_per_phrase_per_voice,
             "piper": sorted(getattr(v, "voice_key", str(v)) for v in piper_voices),
-            "use_el": bool(use_elevenlabs),
-            "el": sorted(elevenlabs_voice_ids),
         },
         sort_keys=True,
     ).encode()
@@ -179,7 +174,7 @@ def _generate_samples(
     n_per_phrase_per_voice: int,
     label: str,
 ) -> list[Path]:
-    """Generate Piper + (optionally) ElevenLabs samples. Returns wav paths.
+    """Generate Piper samples. Returns wav paths.
 
     Skips generation entirely if a sentinel for this label exists AND its
     content matches a hash of the current phrases + voice selection. If the
@@ -188,7 +183,7 @@ def _generate_samples(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     sentinel = out_dir / f".generated_{label}"
-    existing_patterns = (f"piper_{label}_*.wav", f"el_{label}_*.wav")
+    existing_patterns = (f"piper_{label}_*.wav",)
 
     def existing_wavs() -> list[Path]:
         files: list[Path] = []
@@ -213,8 +208,6 @@ def _generate_samples(
         phrases,
         n_per_phrase_per_voice,
         cfg.generation.piper_voices,
-        cfg.generation.use_elevenlabs,
-        cfg.generation.elevenlabs_voice_ids,
     )
 
     settings = get_settings()
@@ -231,16 +224,6 @@ def _generate_samples(
         else []
     )
     expected_total = len(piper_tasks)
-    if (
-        cfg.generation.use_elevenlabs
-        and cfg.generation.elevenlabs_voice_ids
-        and settings.elevenlabs_api_key
-    ):
-        expected_total += (
-            len(cfg.generation.elevenlabs_voice_ids)
-            * len(phrases)
-            * n_per_phrase_per_voice
-        )
 
     if sentinel.exists():
         cached = sentinel.read_text().strip()
@@ -350,44 +333,6 @@ def _generate_samples(
             skipped = target_total - i
             detail = f"{i}/{target_total}" + (f" ({skipped} skipped)" if skipped else "")
             bus.progress(f"generate:piper:{label}", 1.0, detail=detail)
-
-    # ElevenLabs (optional)
-    if cfg.generation.use_elevenlabs and cfg.generation.elevenlabs_voice_ids:
-        api_key = settings.elevenlabs_api_key
-        if not api_key:
-            bus.log("ElevenLabs requested but ELEVENLABS_API_KEY not set; skipping", level="warning")
-        else:
-            bus.phase(f"generate:elevenlabs:{label}")
-            el = ElevenLabsGenerator(api_key=api_key, model_id=cfg.generation.elevenlabs_model)
-            target_total = (
-                len(cfg.generation.elevenlabs_voice_ids)
-                * len(phrases)
-                * n_per_phrase_per_voice
-            )
-            j = 0
-            for sample in el.iter_samples(
-                phrases=phrases,
-                voice_ids=cfg.generation.elevenlabs_voice_ids,
-                n_per_phrase_per_voice=n_per_phrase_per_voice,
-                cfg=cfg.generation,
-            ):
-                wav_path = out_dir / f"el_{label}_{j:07d}.wav"
-                write_wav(wav_path, sample.audio, sample.sample_rate)
-                write_sample_metadata(wav_path, sample, "elevenlabs")
-                written.append(wav_path)
-                j += 1
-                if j % 10 == 0:
-                    bus.progress(
-                        f"generate:elevenlabs:{label}",
-                        j / max(1, target_total),
-                        detail=f"{j}/{target_total}",
-                    )
-                if state.cancel_flag.is_set():
-                    break
-            if not state.cancel_flag.is_set():
-                skipped = target_total - j
-                detail = f"{j}/{target_total}" + (f" ({skipped} skipped)" if skipped else "")
-                bus.progress(f"generate:elevenlabs:{label}", 1.0, detail=detail)
 
     # Drop sentinel only if we successfully reached this point without cancel.
     # Content = phrase-list signature so a phrase change forces regeneration.
