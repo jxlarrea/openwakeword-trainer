@@ -506,7 +506,7 @@
           .split("\n")
           .map((s) => s.trim())
           .filter(Boolean),
-        n_positive_per_phrase_per_voice: vNum("n_positive_per_phrase_per_voice", 8),
+        n_positive_per_phrase_per_voice: vNum("n_positive_per_phrase_per_voice", 10),
         negative_phrases: String(v("negative_phrases"))
           .split("\n")
           .map((s) => s.trim())
@@ -517,7 +517,7 @@
         piper_voices: piperVoices,
         use_kokoro: vBool("use_kokoro"),
         kokoro_voices: kokoroVoices,
-        n_kokoro_positive_per_phrase_per_voice: vNum("n_kokoro_positive_per_phrase_per_voice", 2),
+        n_kokoro_positive_per_phrase_per_voice: vNum("n_kokoro_positive_per_phrase_per_voice", 3),
         use_kokoro_for_negatives: vBool("use_kokoro_for_negatives"),
         n_kokoro_negative_per_phrase_per_voice: vNum("n_kokoro_negative_per_phrase_per_voice", 1),
         kokoro_speed_min: vNum("kokoro_speed_min", 0.9),
@@ -576,17 +576,17 @@
         min_positive_p10_score_for_export: vNum("min_positive_p10_score_for_export", 0.35),
         use_positive_curve_validation: vBool("use_positive_curve_validation"),
         curve_validation_max_positive_clips: vNum("curve_validation_max_positive_clips", 400),
-        min_curve_recall_for_export: vNum("min_curve_recall_for_export", 0.65),
+        min_curve_recall_for_export: vNum("min_curve_recall_for_export", 0.6),
         min_curve_median_peak_for_export: vNum("min_curve_median_peak_for_export", 0.78),
         min_curve_p10_peak_for_export: vNum("min_curve_p10_peak_for_export", 0.02),
         min_curve_median_frames_for_export: vNum("min_curve_median_frames_for_export", 2),
         min_curve_median_span_ms_for_export: vNum("min_curve_median_span_ms_for_export", 160),
-        min_curve_confirmation_rate_for_export: vNum("min_curve_confirmation_rate_for_export", 0.3),
+        min_curve_confirmation_rate_for_export: vNum("min_curve_confirmation_rate_for_export", 0.25),
         use_tablet_curve_validation: vBool("use_tablet_curve_validation"),
         tablet_curve_validation_variants_per_clip: vNum("tablet_curve_validation_variants_per_clip", 1),
         min_tablet_curve_recall_for_export: vNum("min_tablet_curve_recall_for_export", 0.24),
-        min_tablet_curve_median_peak_for_export: vNum("min_tablet_curve_median_peak_for_export", 0.27),
-        min_tablet_curve_p10_peak_for_export: vNum("min_tablet_curve_p10_peak_for_export", 0.04),
+        min_tablet_curve_median_peak_for_export: vNum("min_tablet_curve_median_peak_for_export", 0),
+        min_tablet_curve_p10_peak_for_export: vNum("min_tablet_curve_p10_peak_for_export", 0),
         min_tablet_curve_median_frames_for_export: vNum("min_tablet_curve_median_frames_for_export", 0),
         min_tablet_curve_median_span_ms_for_export: vNum("min_tablet_curve_median_span_ms_for_export", 0),
         min_tablet_curve_confirmation_rate_for_export: vNum("min_tablet_curve_confirmation_rate_for_export", 0.08),

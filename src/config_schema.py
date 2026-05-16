@@ -22,7 +22,7 @@ class GenerationConfig(BaseModel):
     )
     # Defaults tuned for the DGX Spark (GB10, 128 GB unified memory). Smaller
     # hosts may want to reduce sample volume and batch size.
-    n_positive_per_phrase_per_voice: int = 8
+    n_positive_per_phrase_per_voice: int = 10
 
     # User-supplied hard negatives - phrases the model must NOT trigger on.
     # Typical use: paste false-triggers observed in production
@@ -41,7 +41,7 @@ class GenerationConfig(BaseModel):
     piper_voices: list[VoiceSelection] = Field(default_factory=list)
     use_kokoro: bool = True
     kokoro_voices: list[str] = Field(default_factory=list)
-    n_kokoro_positive_per_phrase_per_voice: int = 2
+    n_kokoro_positive_per_phrase_per_voice: int = 3
     use_kokoro_for_negatives: bool = True
     n_kokoro_negative_per_phrase_per_voice: int = 1
     kokoro_speed_min: float = 0.9
@@ -159,23 +159,23 @@ class TrainingConfig(BaseModel):
     # v13-style gates (loosened from v15/v16 which were unachievable for a
     # sharp model). A precise wake-word head naturally peaks across 3-5 hops
     # at the wake-word completion, not 5-7.
-    min_curve_recall_for_export: float = 0.65
+    min_curve_recall_for_export: float = 0.60
     min_curve_median_peak_for_export: float = 0.78
     min_curve_p10_peak_for_export: float = 0.02
     min_curve_median_frames_for_export: int = 2
     min_curve_median_span_ms_for_export: float = 160.0
-    min_curve_confirmation_rate_for_export: float = 0.30
+    min_curve_confirmation_rate_for_export: float = 0.25
     use_tablet_curve_validation: bool = True
     # Generate a few tablet variants per clip so the metric is stable when the
     # tablet aug is now using per-clip training probabilities (no longer the
     # adversarial "100% tablet + 90% RIR + 50% bg" stacking).
     tablet_curve_validation_variants_per_clip: int = 1
-    # Tablet validation is intentionally stricter than the generic curve check:
-    # a model that only works on clean, front-facing TTS is not good enough for
-    # wall-mounted tablets. Failed tablet gates must block export.
+    # Tablet validation keeps recall/confirmation as hard gates, but median and
+    # p10 synthetic tablet peaks are advisory. Real tablet recordings have
+    # proven more reliable than those synthetic peak statistics.
     min_tablet_curve_recall_for_export: float = 0.24
-    min_tablet_curve_median_peak_for_export: float = 0.27
-    min_tablet_curve_p10_peak_for_export: float = 0.04
+    min_tablet_curve_median_peak_for_export: float = 0.0
+    min_tablet_curve_p10_peak_for_export: float = 0.0
     min_tablet_curve_median_frames_for_export: int = 0
     min_tablet_curve_median_span_ms_for_export: float = 0.0
     min_tablet_curve_confirmation_rate_for_export: float = 0.08

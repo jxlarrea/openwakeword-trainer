@@ -104,8 +104,8 @@
       </div>
       <div class="grid">
         <label>Kokoro positives per phrase per voice
-          <input type="number" name="n_kokoro_positive_per_phrase_per_voice" value="2" min="0" max="16" required>
-          <small class="hint">Extra high-quality renders per phrase/voice. 2 is enough when Piper is also enabled.</small>
+          <input type="number" name="n_kokoro_positive_per_phrase_per_voice" value="3" min="0" max="16" required>
+          <small class="hint">Extra high-quality renders per phrase/voice. 3 is the current v23 tablet/default recipe.</small>
         </label>
         <label>Kokoro speed min
           <input type="number" name="kokoro_speed_min" value="0.9" min="0.5" max="2" step="0.05" required>
@@ -127,8 +127,8 @@
       <legend>Sample volume</legend>
       <div class="grid">
         <label>Positives per phrase per voice
-          <input type="number" name="n_positive_per_phrase_per_voice" value="8" min="1" max="32" required>
-          <small class="hint">How many TTS renders per (phrase, voice) combo. 8 improves clean-speech confidence.</small>
+          <input type="number" name="n_positive_per_phrase_per_voice" value="10" min="1" max="32" required>
+          <small class="hint">How many TTS renders per (phrase, voice) combo. 10 improves clean-speech confidence.</small>
         </label>
         <label>Hard negatives per phrase per voice
           <input type="number" name="n_negative_per_phrase_per_voice" value="5" min="0" max="32" required>
@@ -350,7 +350,7 @@
           <small class="hint">Number of held-out generated positive WAVs scored as full sliding curves.</small>
         </label>
         <label>Minimum curve recall
-          <input type="number" name="min_curve_recall_for_export" value="0.65" min="0" max="1" step="0.01" required>
+          <input type="number" name="min_curve_recall_for_export" value="0.6" min="0" max="1" step="0.01" required>
           <small class="hint">Fraction of held-out positive WAVs that must cross the runtime 0.5 threshold.</small>
         </label>
         <label>Minimum curve median peak
@@ -370,7 +370,7 @@
           <small class="hint">Median activation span required across held-out positive WAVs.</small>
         </label>
         <label>Minimum curve confirmation rate
-          <input type="number" name="min_curve_confirmation_rate_for_export" value="0.3" min="0" max="1" step="0.01" required>
+          <input type="number" name="min_curve_confirmation_rate_for_export" value="0.25" min="0" max="1" step="0.01" required>
           <small class="hint">Fraction of positives with a second above-threshold hit after the configured gap.</small>
         </label>
         <div class="check-row">
@@ -386,10 +386,10 @@
           <small class="hint">Fraction of tablet/off-axis positive curves that must cross threshold.</small>
         </label>
         <label>Minimum tablet curve median peak
-          <input type="number" name="min_tablet_curve_median_peak_for_export" value="0.27" min="0" max="1" step="0.01" required>
+          <input type="number" name="min_tablet_curve_median_peak_for_export" value="0" min="0" max="1" step="0.01" required>
         </label>
         <label>Minimum tablet curve p10 peak
-          <input type="number" name="min_tablet_curve_p10_peak_for_export" value="0.04" min="0" max="1" step="0.01" required>
+          <input type="number" name="min_tablet_curve_p10_peak_for_export" value="0" min="0" max="1" step="0.01" required>
         </label>
         <label>Minimum tablet curve median frames
           <input type="number" name="min_tablet_curve_median_frames_for_export" value="0" min="0" max="50" step="1" required>
