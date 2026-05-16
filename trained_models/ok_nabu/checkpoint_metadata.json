@@ -1,0 +1,23 @@
+{
+  "step": 25500,
+  "threshold": 0.46290202969909444,
+  "recall_at_target_fp": 0.8917748917748918,
+  "fp_per_hour": 0.4912755697237004,
+  "recall_at_0_5": 0.8528138528138528,
+  "fp_per_hour_at_0_5": 0.21054667273872874,
+  "positive_median_score": 0.7584397792816162,
+  "positive_p10_score": 0.45251500606536865,
+  "curve_recall": 0.6103896103896104,
+  "curve_median_peak": 0.8258453011512756,
+  "curve_p10_peak": 0.023677509278059006,
+  "curve_median_frames": 2.0,
+  "curve_median_span_ms": 160.0,
+  "curve_confirmation_rate": 0.268398255109787,
+  "tablet_curve_recall": 0.2597402597402597,
+  "tablet_curve_median_peak": 0.22540782392024994,
+  "tablet_curve_p10_peak": 0.020289793610572815,
+  "tablet_curve_median_frames": 0.0,
+  "tablet_curve_median_span_ms": 0.0,
+  "tablet_curve_confirmation_rate": 0.08225107938051224,
+  "salvaged_after_gate_adjustment": true
+}
